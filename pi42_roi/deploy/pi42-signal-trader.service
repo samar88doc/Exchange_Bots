@@ -1,0 +1,18 @@
+# Optional systemd user service for PAPER mode ONLY.
+# Install: copy to ~/.config/systemd/user/, edit WorkingDirectory, then
+#   systemctl --user daemon-reload && systemctl --user enable --now pi42-signal-trader
+# Do not point this unit at REAL mode: REAL requires an interactive TTY and is refused here.
+[Unit]
+Description=Pi42 signal trader (PAPER)
+After=network-online.target
+
+[Service]
+WorkingDirectory=/home/user/pi42-signal-trader
+Environment=TRADING_MODE=PAPER
+Environment=ENABLE_REAL_TRADING=false
+ExecStart=/home/user/pi42-signal-trader/.venv/bin/python -m app.main run
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=default.target

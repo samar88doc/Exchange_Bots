@@ -10,7 +10,10 @@ Automated Telegram signal parser and execution bot for Mudrex with paper and liv
 ### 2. [mudrex_roi](./mudrex_roi)
 Mudrex trading bot variant enhanced with custom ROI tracking and target monitoring.
 
-### 3. [Shark_Automate](./Shark_Automate)
+### 3. [pi42_roi](./pi42_roi)
+Pi42 (INR/USDT perpetual futures) equivalent of `mudrex_roi`: Telegram signals executed as LIMIT entries carrying an ROI take-profit, PAPER-first with guarded REAL mode, and no stop-loss. Includes a dependency-free web dashboard and a Tamil user guide.
+
+### 4. [Shark_Automate](./Shark_Automate)
 Full-stack trading automation platform featuring:
 - **Backend:** FastAPI, automated order execution, paper/live trading pipelines, risk management, and Telegram listener.
 - **Frontend:** Next.js dashboard for positions, sentiment monitoring, and system settings.
