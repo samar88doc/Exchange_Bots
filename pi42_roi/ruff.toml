@@ -1,0 +1,12 @@
+# A deliberately small, high-signal rule set: real errors and whitespace, plus
+# import ordering. The style families inherited from the reference project
+# (FURB/UP/PLR/...) are not enabled, so the port stays readable next to
+# mudrex_roi. Run: python -m ruff check .
+line-length = 110
+target-version = "py311"
+
+[lint]
+select = ["E4", "E7", "E9", "F", "W", "I"]
+
+[lint.per-file-ignores]
+"tests/*" = ["E402"]
