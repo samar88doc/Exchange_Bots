@@ -1,0 +1,39 @@
+மேலும் GitHub browser-ல் repository refresh செய்தால் உங்கள் backend, frontend, docs, README.md எல்லாம் தெரியும்.
+
+இனிமேல் code மாற்றினால்:
+
+git add .
+git commit -m "Update"
+git push
+
+போதும்.
+
+
+(.venv) shasha@shasha-Predator-PH317-53:~/Desktop/Shark_Automate/backend$ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+
+shasha@shasha-Predator-PH317-53:~/Desktop/Shark_Automate/frontend$ npm run dev
+
+> tv-shark-terminal@1.0.0 dev
+> next dev -p 3000 -H 0.0.0.0
+
+  ▲ Next.js 14.2.15
+  - Local:        http://localhost:3000
+  - Network:      http://0.0.0.0:3000
+
+
+  cd ~/Desktop/Shark_Automate && ./start.sh
+  cd ~/Desktop/Shark_Automate && ./stop.sh
+
+
+Webhook Alert message format
+
+  {
+  "symbol": "{{ticker}}",
+  "action": "COMBINED_4H",
+  "price": "{{close}}",
+  "secret": "demo-webhook-secret-12345"
+}
+
+

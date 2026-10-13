@@ -1,0 +1,1786 @@
+//@version=5
+// ============================================================================
+indicator("ASZEIC_Crypto_Scalp_v3", overlay = true, max_bars_back = 2000, max_boxes_count = 500, max_labels_count = 500, max_lines_count = 500)
+// ############################################################################
+// ############################  PART 1 : ASZE  ##############################
+// ############################################################################
+
+// ----------------------------------------------------------------------------
+// Constants: lifecycle states, support classes, invalidation mode strings
+// ----------------------------------------------------------------------------
+const int ZT_ACTIVE   = 0
+const int ZT_BROKEN   = 1
+const int ZT_REVERSED = 2
+
+const int CLS_WEAK   = 0
+const int CLS_NORMAL = 1
+const int CLS_STRONG = 2
+const int CLS_MAJOR  = 3
+
+// Internal score weights (sum = 100 when volume is enabled)
+const float W_TOUCH   = 25.0
+const float W_REJ     = 20.0
+const float W_HOLD    = 15.0
+const float W_BOUNCE  = 10.0
+const float W_CONSIST = 10.0
+const float W_SPACE   = 5.0
+const float W_AGE     = 5.0
+const float W_VOL     = 10.0
+
+const string INV_A = "A · Close below zone"
+const string INV_B = "B · ATR breach"
+const string INV_C = "C · Consecutive closes"
+const string INV_D = "D · Combination"
+
+// ============================================================================
+// USER INPUTS (grouped A..P)
+// ============================================================================
+
+// ---- A · Pivot Detection
+int in_pL = input.int(5, "Pivot left bars", minval = 2, maxval = 30, group = "A · Pivot Detection", tooltip = "Bars to the left that must have higher lows. Higher = stronger, rarer swings.")
+int in_pR = input.int(5, "Pivot right bars", minval = 2, maxval = 30, group = "A · Pivot Detection", tooltip = "Bars to the right required to confirm a pivot. A pivot is acted on only after confirmation (non-repainting).")
+int in_maxPiv = input.int(60, "Max pivots stored", minval = 10, maxval = 200, group = "A · Pivot Detection", tooltip = "Performance cap of the pivot memory ring.")
+int in_pivLookback = input.int(200, "Cluster pivot lookback (bars)", minval = 30, maxval = 1000, group = "A · Pivot Detection", tooltip = "Pivots older than this can no longer join a new cluster.")
+
+// ---- B · Zone Clustering
+int in_atrLen = input.int(14, "ATR length", minval = 5, maxval = 100, group = "B · Zone Clustering")
+float in_atrMult = input.float(1.0, "Cluster tolerance (× ATR)", minval = 0.1, maxval = 5.0, step = 0.1, group = "B · Zone Clustering", tooltip = "Pivot lows within ATR × this (plus the % tolerance) are clustered into one support area.")
+float in_pctTol = input.float(0.05, "Cluster tolerance (+ % of price)", minval = 0.0, maxval = 2.0, step = 0.01, group = "B · Zone Clustering", tooltip = "Additive percentage tolerance. Keeps clustering working on very low-volatility symbols.")
+float in_mergeTol = input.float(0.75, "Zone merge tolerance (× ATR)", minval = 0.1, maxval = 3.0, step = 0.05, group = "B · Zone Clustering", tooltip = "Zones whose midpoints are closer than this (and whose ranges are near) are merged into one stronger zone.")
+int in_maxZones = input.int(8, "Max simultaneous zones", minval = 1, maxval = 20, group = "B · Zone Clustering", tooltip = "Soft cap on total tracked zones (prevents box clutter).")
+
+// ---- C · Touch Validation
+int in_minTouches = input.int(3, "Min touches to form a zone", minval = 2, maxval = 10, group = "C · Touch Validation", tooltip = "A zone is born only from multiple meaningful tests of the same area.")
+int in_touchGap = input.int(6, "Min bars between touches", minval = 1, maxval = 50, group = "C · Touch Validation", tooltip = "Prevents consecutive candles around one low from inflating the touch count.")
+bool in_probe = input.bool(true, "Count wick-probe touches", group = "C · Touch Validation", tooltip = "A fresh dip that wicks into the zone and closes back out counts as a touch even without a full pivot.")
+float in_probeDepth = input.float(1.0, "Max probe penetration (× ATR)", minval = 0.1, maxval = 3.0, step = 0.1, group = "C · Touch Validation", tooltip = "Probes deeper than this are treated as breaks, not touches.")
+
+// ---- D · Zone Strength
+int in_minScore = input.int(50, "Min score to display (0-100)", minval = 0, maxval = 100, group = "D · Zone Strength", tooltip = "Zones below this score are tracked silently as candidates and only drawn once they have earned enough evidence.")
+
+// ---- E · Rejection Detection
+float in_minWick = input.float(0.4, "Full-credit lower-wick share (0-1)", minval = 0.05, maxval = 1.0, step = 0.05, group = "E · Rejection Detection", tooltip = "A lower wick at least this fraction of the candle range gets full wick-quality credit. Rejection quality is a score factor, never a hard requirement — touches of any candle type are structurally valid.")
+
+// ---- F · Zone Invalidation
+string in_invMode = input.string(INV_A, "Invalidation mode", options = [INV_A, INV_B, INV_C, INV_D], group = "F · Zone Invalidation", tooltip = "How a zone is judged broken. D = meaningful ATR-scaled breach OR several consecutive closes below.")
+float in_breachAtr = input.float(1.0, "ATR breach depth (× ATR)", minval = 0.2, maxval = 5.0, step = 0.1, group = "F · Zone Invalidation")
+int in_consCloses = input.int(3, "Consecutive closes below (mode C/D)", minval = 1, maxval = 10, group = "F · Zone Invalidation")
+int in_staleBars = input.int(0, "Stop extending after N idle bars (0 = off)", minval = 0, maxval = 2000, group = "F · Zone Invalidation", tooltip = "A zone untouched for this long stops extending. It revives if tested again.")
+
+// ---- G · Bounce Detection
+bool in_bounce = input.bool(true, "Enable bounce detection", group = "G · Bounce Detection")
+int in_bounceWin = input.int(6, "Touch recency window (bars)", minval = 1, maxval = 30, group = "G · Bounce Detection")
+float in_bounceAtr = input.float(0.5, "Min bounce distance (× ATR)", minval = 0.1, maxval = 3.0, step = 0.1, group = "G · Bounce Detection")
+bool in_bounceStrong = input.bool(false, "Strong confirmation (close above zone top + bullish candle)", group = "G · Bounce Detection")
+int in_bounceCd = input.int(20, "Bounce cooldown (bars)", minval = 2, maxval = 200, group = "G · Bounce Detection")
+
+// ---- H · False Break / Spring
+bool in_spring = input.bool(true, "Enable spring / false-break detection", group = "H · False Break / Spring")
+float in_springMin = input.float(0.15, "Min penetration (× ATR)", minval = 0.0, maxval = 1.0, step = 0.05, group = "H · False Break / Spring", tooltip = "Ignores trivial wicks: a false break must penetrate at least this much.")
+float in_springDepth = input.float(1.0, "Max penetration (× ATR)", minval = 0.2, maxval = 5.0, step = 0.1, group = "H · False Break / Spring")
+int in_springRet = input.int(3, "Max bars to recover", minval = 1, maxval = 10, group = "H · False Break / Spring")
+
+// ---- I · Consolidation
+bool in_cons = input.bool(true, "Enable consolidation detection", group = "I · Consolidation")
+int in_consWin = input.int(30, "Window (bars)", minval = 10, maxval = 120, group = "I · Consolidation")
+float in_consNear = input.float(0.6, "Min fraction of bars near zone", minval = 0.1, maxval = 1.0, step = 0.05, group = "I · Consolidation")
+float in_consRange = input.float(2.5, "Max window range (× ATR)", minval = 0.5, maxval = 10.0, step = 0.1, group = "I · Consolidation")
+float in_consAtrC = input.float(0.9, "ATR contraction factor", minval = 0.5, maxval = 1.5, step = 0.05, group = "I · Consolidation")
+
+// ---- J · Breakout
+bool in_brk = input.bool(true, "Enable breakout detection", group = "J · Breakout")
+float in_brkAtr = input.float(1.2, "Min ATR expansion (×)", minval = 1.0, maxval = 3.0, step = 0.05, group = "J · Breakout")
+bool in_brkVol = input.bool(false, "Require volume expansion", group = "J · Breakout")
+
+// ---- K · Volume
+bool in_vol = input.bool(true, "Use volume confirmation (auto-off when volume is unavailable)", group = "K · Volume")
+float in_volMult = input.float(1.5, "Volume spike (× SMA20)", minval = 1.1, maxval = 5.0, step = 0.1, group = "K · Volume")
+
+// ---- L · Multi-Timeframe
+string in_htf = input.string("60", "Higher timeframe (blank = off)", options = ["", "15", "30", "60", "120", "240", "D", "W"], group = "L · Multi-Timeframe")
+int in_htfPivL = input.int(5, "HTF pivot left bars", minval = 2, maxval = 30, group = "L · Multi-Timeframe")
+int in_htfPivR = input.int(5, "HTF pivot right bars", minval = 2, maxval = 30, group = "L · Multi-Timeframe")
+float in_htfAtrMult = input.float(1.5, "HTF cluster tolerance (× HTF ATR)", minval = 0.3, maxval = 5.0, step = 0.1, group = "L · Multi-Timeframe")
+int in_htfBonus = input.int(10, "HTF confluence score bonus (0-20)", minval = 0, maxval = 20, group = "L · Multi-Timeframe")
+int in_htfInv = input.int(3, "HTF zone stops after N closes below", minval = 1, maxval = 10, group = "L · Multi-Timeframe")
+
+// ---- M · Visuals
+int in_transp = input.int(78, "Fill transparency (%)", minval = 0, maxval = 95, group = "M · Visuals")
+int in_bw = input.int(1, "Border width", minval = 1, maxval = 5, group = "M · Visuals")
+bool in_border = input.bool(false, "Show zone border", group = "M · Visuals")
+bool in_mid = input.bool(true, "Show midpoint line (strong/major zones)", group = "M · Visuals")
+bool in_tag = input.bool(true, "Show score tag on zones", group = "M · Visuals")
+bool in_showBroken = input.bool(true, "Keep broken-zone boxes", group = "M · Visuals")
+int in_brokenRetain = input.int(300, "Broken-zone retention (bars, 0 = forever)", minval = 0, maxval = 2000, group = "M · Visuals")
+bool in_table = input.bool(true, "Show scoring panel", group = "M · Visuals")
+color in_colorWeak = input.color(color.gray, "Weak zone color", group = "M · Visuals")
+color in_colorNormal = input.color(color.teal, "Normal zone color", group = "M · Visuals")
+color in_colorStrong = input.color(color.green, "Strong zone color", group = "M · Visuals")
+color in_colorMajor = input.color(color.yellow, "Major zone color", group = "M · Visuals")
+color in_colorHtf = input.color(color.purple, "HTF zone color", group = "M · Visuals")
+color in_colorBroken = input.color(color.red, "Broken zone color", group = "M · Visuals")
+
+// ---- N · Labels
+bool in_labels = input.bool(true, "Master label switch", group = "N · Labels")
+string in_lblSize = input.string("Small", "Label size", options = ["Tiny", "Small", "Normal"], group = "N · Labels")
+bool in_lblBounce = input.bool(true, "Support bounce labels", group = "N · Labels")
+bool in_lblSpring = input.bool(true, "False break / spring labels", group = "N · Labels")
+bool in_lblCons = input.bool(true, "Consolidation labels", group = "N · Labels")
+bool in_lblOut = input.bool(true, "Breakout labels", group = "N · Labels")
+bool in_lblBroken = input.bool(true, "Broken-support labels", group = "N · Labels")
+bool in_lblRev = input.bool(true, "S → R reversal labels", group = "N · Labels")
+
+// ---- O · Alerts
+bool in_alerts = input.bool(true, "Enable dynamic alert() messages", group = "O · Alerts")
+
+// ---- P · Performance
+int in_minBars = input.int(50, "Min bars before detection", minval = 10, maxval = 500, group = "P · Performance")
+bool in_perfMode = input.bool(false, "Performance mode (skip probes, consolidation, HTF visuals)", group = "P · Performance")
+
+// ============================================================================
+// USER TYPES
+// ============================================================================
+type SPivot
+    float price   // pivot low price
+    float o       // pivot bar open
+    float c       // pivot bar close
+    float hi      // pivot bar high
+    float lo      // pivot bar low
+    int   bar     // bar_index of the pivot bar
+    float wickQ   // lower-wick dominance 0..1 at the pivot bar
+    bool  volHit  // volume spike at the pivot bar (if volume enabled)
+
+type SZone
+    // geometry / identity
+    int startBar        // earliest meaningful touch (box left edge)
+    int bornBar          // bar the zone was created
+    int lastTouchBar      // latest valid touch
+    float zLow           // supportLow
+    float zHigh           // supportHigh
+    float zMid            // midpoint
+    float pivotLo          // lowest clustered pivot price
+    float pivotHi          // highest clustered pivot price
+    // touch & reaction statistics
+    int touches
+    int bounces
+    int holds
+    int absorbed
+    int volHits
+    int rejCnt
+    int gapCnt
+    int gapSum
+    float rejSum
+    // scoring & state
+    int status
+    int cls
+    float score
+    bool shown
+    bool htfCon
+    // event trackers
+    int lastBounceBar
+    int lastSpringBar
+    int lastConsBar
+    int lastOutBar
+    int lastBreakBar
+    float lastScoreShown
+    int consecBelow
+    int brkBar
+    float brkPrice
+    bool revDone
+    bool consOn
+    bool prevCons
+    // visuals
+    box zBox
+    line midLn
+    label tag
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+f_lblSize(s) =>
+    s == "Tiny" ? size.tiny : s == "Normal" ? size.normal : size.small
+
+// v5: f_lblSize() is a pure function of a FIXED input (in_lblSize never
+// changes while the script runs). It was being called up to ~7x per bar
+// (once per label/tag). Cached once here and reused everywhere below —
+// identical value, less repeated function-call overhead.
+var string lblSizeVal = f_lblSize(in_lblSize)
+
+f_clsColor(c) =>
+    c == CLS_WEAK ? in_colorWeak : c == CLS_NORMAL ? in_colorNormal : c == CLS_STRONG ? in_colorStrong : in_colorMajor
+
+f_clsName(c) =>
+    c == CLS_WEAK ? "WEAK" : c == CLS_NORMAL ? "NORMAL" : c == CLS_STRONG ? "STRONG" : "MAJOR"
+
+f_classOf(s) =>
+    s >= 80.0 ? CLS_MAJOR : s >= 60.0 ? CLS_STRONG : s >= 40.0 ? CLS_NORMAL : CLS_WEAK
+
+f_tagText(z) =>
+    f_clsName(z.cls) + " SUPPORT " + str.tostring(z.touches) + "T · " + str.tostring(math.round(z.score))
+
+f_clampBar(b) =>
+    math.max(b, bar_index - 9900)
+
+var float f_wSumConst     = W_TOUCH + W_REJ + W_HOLD + W_BOUNCE + W_CONSIST + W_SPACE + W_AGE + (in_vol ? W_VOL : 0.0)
+var float f_idealGapConst = math.max(in_touchGap * 3.0, 10.0)
+
+f_score(z, a) =>
+    float wSum = f_wSumConst
+    float fT = math.min(z.touches / math.max(in_minTouches * 2.0, 4.0), 1.0)
+    float fR = z.rejCnt > 0 ? math.min(z.rejSum / z.rejCnt / 0.85, 1.0) : 0.0
+    float fH = math.min((z.holds + z.absorbed) / math.max(2.0, in_minTouches), 1.0)
+    float fB = math.min(z.bounces / 2.0, 1.0)
+    float disp = math.max(z.pivotHi - z.pivotLo, 0.0)
+    float fC = a > 0 ? math.min(math.max(1.0 - disp / (a * 2.0), 0.0), 1.0) : 0.5
+    float idealGap = f_idealGapConst
+    float fS = z.gapCnt > 0 ? math.min(math.max(1.0 - math.abs(z.gapSum / z.gapCnt - idealGap) / idealGap, 0.0), 1.0) : 0.5
+    float fA = math.min((bar_index - z.bornBar) / 60.0, 1.0)
+    float fV = math.min(z.volHits / 3.0, 1.0)
+    float s = 100.0 * (W_TOUCH * fT + W_REJ * fR + W_HOLD * fH + W_BOUNCE * fB + W_CONSIST * fC + W_SPACE * fS + W_AGE * fA + (in_vol ? W_VOL * fV : 0.0)) / math.max(wSum, 1.0)
+    if z.htfCon
+        s := s + in_htfBonus
+    math.min(math.max(s, 0.0), 100.0)
+
+f_newZone(cLo, cHi, cCnt, cFirst, cRej, cHolds, cVol, a) =>
+    float zLo = cLo - a * 0.3
+    float zHi = math.max(cHi + a * 0.3, zLo + a * 1.0)
+    zHi := math.max(zHi, zLo + syminfo.mintick * 5)
+    SZone.new(cFirst, bar_index, bar_index, zLo, zHi, (zLo + zHi) / 2, cLo, cHi, cCnt, 0, cHolds, 0, cVol, cCnt, 0, 0, cRej, ZT_ACTIVE, CLS_WEAK, 0.0, false, false, 0, 0, 0, 0, 0, 0, 0, 0, na, false, false, false, na, na, na)
+
+f_addTouch(z, p, cBar, a) =>
+    if z.touches >= 1
+        int gap = cBar - z.lastTouchBar
+        if gap >= in_touchGap
+            z.gapSum += gap
+            z.gapCnt += 1
+    z.touches += 1
+    z.lastTouchBar := cBar
+    if p.price < z.zLow
+        z.zLow := p.price - a * 0.15
+    z.pivotLo := math.min(z.pivotLo, p.price)
+    z.pivotHi := math.max(z.pivotHi, p.price)
+    if z.zHigh - z.zLow < a * 1.0
+        z.zHigh := z.zLow + a * 1.0
+    z.zMid := (z.zLow + z.zHigh) / 2
+    float rng = math.max(p.hi - p.lo, syminfo.mintick)
+    float lwk = math.max(0.0, math.min(p.o, p.c) - p.lo)
+    float wickDom = lwk / rng
+    float closeF = p.c >= z.zHigh ? 1.0 : p.c >= z.zMid ? 0.75 : p.c >= z.zLow ? 0.5 : 0.25
+    float q = 0.5 * math.min(wickDom / math.max(in_minWick, 0.05), 1.0) + 0.5 * closeF
+    z.rejSum += q
+    z.rejCnt += 1
+    if p.c >= z.zMid
+        z.holds += 1
+    if p.volHit
+        z.volHits += 1
+    z.score := f_score(z, a)
+    z
+
+f_zoneKill(z) =>
+    if not na(z.zBox)
+        box.delete(z.zBox)
+    if not na(z.midLn)
+        line.delete(z.midLn)
+    if not na(z.tag)
+        label.delete(z.tag)
+    z.zBox := na
+    z.midLn := na
+    z.tag := na
+    z
+
+f_makeVisuals(z) =>
+    color col = f_clsColor(z.cls)
+    int lb = f_clampBar(z.startBar)
+    z.zBox := box.new(lb, z.zHigh, bar_index, z.zLow, border_color = color.new(col, 15), border_width = in_border ? in_bw : 0, bgcolor = color.new(col, in_transp))
+    if in_mid and (z.cls == CLS_STRONG or z.cls == CLS_MAJOR)
+        z.midLn := line.new(lb, z.zMid, bar_index, z.zMid, color = color.new(col, 25), style = line.style_dashed, width = 1)
+    if in_tag
+        z.tag := label.new(lb, z.zHigh, f_tagText(z), style = label.style_label_upper_left, color = col, textcolor = color.black, size = lblSizeVal)
+    z
+
+f_restyle(z) =>
+    color col = f_clsColor(z.cls)
+    if not na(z.zBox)
+        box.set_bgcolor(z.zBox, color.new(col, in_transp))
+        box.set_border_color(z.zBox, color.new(col, 15))
+    if not na(z.midLn)
+        line.set_color(z.midLn, color.new(col, 25))
+    if not na(z.tag)
+        label.set_color(z.tag, col)
+        label.set_text(z.tag, f_tagText(z))
+    z
+
+f_restyleBroken(z) =>
+    if not na(z.zBox)
+        box.set_bgcolor(z.zBox, color.new(in_colorBroken, math.min(in_transp + 12, 95)))
+        box.set_border_color(z.zBox, color.new(in_colorBroken, 10))
+        box.set_border_style(z.zBox, line.style_dotted)
+    if not na(z.midLn)
+        line.delete(z.midLn)
+        z.midLn := na
+    if not na(z.tag)
+        label.delete(z.tag)
+        z.tag := na
+    z
+
+// ============================================================================
+// PERSISTENT STATE
+// ============================================================================
+var array<SPivot> pivots = array.new<SPivot>()
+var array<SZone> zones = array.new<SZone>()
+var int totalBounces = 0
+var int totalBreaks = 0
+var int totalBreakouts = 0
+var int totalSprings = 0
+var int totalRevs = 0
+var int totalTouches = 0
+var box htfBox = na
+var string htfKeyPrev = ""
+var int htfConsecBelow = 0
+var bool htfStopped = false
+var table panel = na
+
+// ============================================================================
+// PER-BAR ENGINE
+// ============================================================================
+bool evNew = false
+bool evStrong = false
+bool evMajor = false
+bool evTouch = false
+bool evBounce = false
+bool evSpring = false
+bool evOut = false
+bool evBreak = false
+bool evRev = false
+
+float atr = nz(ta.atr(in_atrLen), nz(high - low, syminfo.mintick))
+float priceRef = nz(close, open)
+float clusterTol = atr * in_atrMult + priceRef * in_pctTol / 100.0
+float mergeTol = atr * in_mergeTol
+float volSma = nz(ta.sma(volume, 20), 0.0)
+bool volOK = volSma > 0 and nz(volume, 0) > 0
+
+// ============================================================================
+// MULTI-TIMEFRAME SUPPORT (non-repainting)
+// ============================================================================
+string htfTf = in_htf == "" ? timeframe.period : in_htf
+[hAtrR, hP1, hT1, hP2, hT2, hLowN] = request.security(syminfo.tickerid, htfTf, [ta.atr(in_atrLen)[1], ta.valuewhen(not na(ta.pivotlow(low, in_htfPivL, in_htfPivR)), low[in_htfPivR], 1)[1], ta.valuewhen(not na(ta.pivotlow(low, in_htfPivL, in_htfPivR)), time[in_htfPivR], 1)[1], ta.valuewhen(not na(ta.pivotlow(low, in_htfPivL, in_htfPivR)), low[in_htfPivR], 2)[1], ta.valuewhen(not na(ta.pivotlow(low, in_htfPivL, in_htfPivR)), time[in_htfPivR], 2)[1], ta.lowest(low, 20)[1]], lookahead = barmerge.lookahead_on)
+
+bool htfOn = in_htf != "" and not in_perfMode
+float hzLo = na
+float hzHi = na
+string hzKey = ""
+int hzStart = bar_index
+if htfOn
+    if not na(hP1) and not na(hP2)
+        if math.abs(hP1 - hP2) <= nz(hAtrR) * in_htfAtrMult
+            float zLoH = math.min(hP1, hP2) - nz(hAtrR) * 0.3
+            float zHiH = math.max(hP1, hP2) + nz(hAtrR) * 0.7
+            zHiH := math.max(zHiH, zLoH + nz(hAtrR))
+            hzLo := zLoH
+            hzHi := zHiH
+            hzKey := str.tostring(hT1) + "_" + str.tostring(hT2)
+            int htfOff = nz(ta.barssince(time < hT1), 999999) - 1
+            hzStart := math.max(0, bar_index - htfOff)
+
+if htfOn and hzKey != ""
+    if hzKey != htfKeyPrev
+        if not na(htfBox)
+            box.delete(htfBox)
+        htfStopped := false
+        htfConsecBelow := 0
+        htfBox := box.new(f_clampBar(hzStart), hzHi, bar_index, hzLo, border_color = color.new(in_colorHtf, 10), border_width = in_border ? in_bw : 0, border_style = line.style_dashed, bgcolor = color.new(in_colorHtf, math.min(in_transp + 8, 95)))
+        htfKeyPrev := hzKey
+    else if not htfStopped
+        htfConsecBelow := close < hzLo ? htfConsecBelow + 1 : 0
+        if htfConsecBelow >= in_htfInv
+            htfStopped := true
+        else
+            box.set_right(htfBox, bar_index)
+            box.set_top(htfBox, hzHi)
+            box.set_bottom(htfBox, hzLo)
+else if htfOn and not na(htfBox)
+    htfStopped := true
+
+// ============================================================================
+// detectPivotLows + updatePivotArray + findSupportClusters
+// ============================================================================
+float pl = ta.pivotlow(low, in_pL, in_pR)
+if not na(pl) and bar_index >= in_minBars
+    int pBar = bar_index - in_pR
+    float pPrice = pl
+    int lastIdx = array.size(pivots) - 1
+    bool dup = lastIdx >= 0 ? (bar_index - array.get(pivots, lastIdx).bar <= in_pR * 2 and math.abs(array.get(pivots, lastIdx).price - pPrice) <= atr * 0.25) : false
+    if not dup
+        float wickQ = math.max(0.0, math.min(open[in_pR], close[in_pR]) - low[in_pR]) / math.max(high[in_pR] - low[in_pR], syminfo.mintick)
+        bool vHit = in_vol and volOK and volume[in_pR] > volSma * in_volMult
+        array.push(pivots, SPivot.new(pPrice, open[in_pR], close[in_pR], high[in_pR], low[in_pR], pBar, wickQ, vHit))
+        if array.size(pivots) > in_maxPiv
+            array.remove(pivots, 0)
+
+        int covIdx = -1
+        if array.size(zones) > 0
+            for i = 0 to array.size(zones) - 1
+                SZone zq = array.get(zones, i)
+                if zq.status == ZT_ACTIVE and pPrice >= zq.zLow - clusterTol and pPrice <= zq.zHigh + clusterTol
+                    covIdx := i
+        if covIdx >= 0
+            SZone zc = array.get(zones, covIdx)
+            if bar_index - zc.lastTouchBar >= in_touchGap
+                zc := f_addTouch(zc, array.get(pivots, array.size(pivots) - 1), bar_index, atr)
+                array.set(zones, covIdx, zc)
+                evTouch := true
+                totalTouches += 1
+        else
+            float cLo = pPrice
+            float cHi = pPrice
+            int cCnt = 1
+            int cFirst = pBar
+            float cRej = 0.0
+            int cHolds = 0
+            int cVol = 0
+            if array.size(pivots) > 0
+                for i = 0 to array.size(pivots) - 1
+                    SPivot pi = array.get(pivots, i)
+                    if pi.bar != pBar and pi.bar >= bar_index - in_pivLookback and math.abs(pi.price - pPrice) <= clusterTol
+                        cLo := math.min(cLo, pi.price)
+                        cHi := math.max(cHi, pi.price)
+                        cCnt += 1
+                        cFirst := math.min(cFirst, pi.bar)
+                        cRej += pi.wickQ
+                        if pi.c >= pPrice
+                            cHolds += 1
+                        if pi.volHit
+                            cVol += 1
+            if cCnt >= in_minTouches
+                float midC = (cLo + cHi) / 2
+                bool overlap = false
+                if array.size(zones) > 0
+                    for i = 0 to array.size(zones) - 1
+                        SZone zq2 = array.get(zones, i)
+                        if math.abs(midC - (zq2.zLow + zq2.zHigh) / 2) <= mergeTol + clusterTol
+                            overlap := true
+                            break  // v5: pure boolean OR — safe early-exit, order-independent
+                if not overlap
+                    SZone nz = f_newZone(cLo, cHi, cCnt, cFirst, cRej, cHolds, cVol, atr)
+                    nz.score := f_score(nz, atr)
+                    nz.cls := f_classOf(nz.score)
+                    if nz.score >= in_minScore and nz.status == ZT_ACTIVE
+                        nz.shown := true
+                        nz := f_makeVisuals(nz)
+                        evNew := true
+                        if nz.cls == CLS_STRONG
+                            evStrong := true
+                        if nz.cls == CLS_MAJOR
+                            evMajor := true
+                    array.push(zones, nz)
+
+// ============================================================================
+// mergeNearbyZones
+// ============================================================================
+bool mergedThisBar = false
+if array.size(zones) > 0
+    for i = 0 to array.size(zones) - 1
+        if mergedThisBar
+            break
+        SZone za = array.get(zones, i)
+        if za.status != ZT_ACTIVE
+            continue
+        if i + 1 <= array.size(zones) - 1
+            for j = i + 1 to array.size(zones) - 1
+                SZone zb = array.get(zones, j)
+                if zb.status != ZT_ACTIVE
+                    continue
+                float midA = (za.zLow + za.zHigh) / 2
+                float midB = (zb.zLow + zb.zHigh) / 2
+                if math.abs(midA - midB) <= mergeTol + clusterTol and za.zLow <= zb.zHigh + mergeTol and zb.zLow <= za.zHigh + mergeTol
+                    int keepIdx = za.bornBar <= zb.bornBar ? i : j
+                    int absIdx = keepIdx == i ? j : i
+                    SZone k = array.get(zones, keepIdx)
+                    SZone m = array.get(zones, absIdx)
+                    k.zLow := math.min(k.zLow, m.zLow)
+                    k.zHigh := math.max(k.zHigh, m.zHigh)
+                    k.zMid := (k.zLow + k.zHigh) / 2
+                    k.pivotLo := math.min(k.pivotLo, m.pivotLo)
+                    k.pivotHi := math.max(k.pivotHi, m.pivotHi)
+                    k.touches += m.touches
+                    k.bounces += m.bounces
+                    k.holds += m.holds
+                    k.absorbed += m.absorbed
+                    k.volHits += m.volHits
+                    k.rejCnt += m.rejCnt
+                    k.gapCnt += m.gapCnt
+                    k.gapSum += m.gapSum
+                    k.rejSum += m.rejSum
+                    k.startBar := math.min(k.startBar, m.startBar)
+                    k.lastTouchBar := math.max(k.lastTouchBar, m.lastTouchBar)
+                    k.htfCon := k.htfCon or m.htfCon
+                    k.shown := k.shown or m.shown
+                    k.score := f_score(k, atr)
+                    k.cls := f_classOf(k.score)
+                    f_zoneKill(m)
+                    if k.shown and not na(k.zBox)
+                        box.set_left(k.zBox, f_clampBar(k.startBar))
+                        box.set_right(k.zBox, bar_index)
+                        box.set_top(k.zBox, k.zHigh)
+                        box.set_bottom(k.zBox, k.zLow)
+                    if not na(k.midLn)
+                        line.set_xy1(k.midLn, f_clampBar(k.startBar), k.zMid)
+                        line.set_xy2(k.midLn, bar_index, k.zMid)
+                    array.set(zones, keepIdx, k)
+                    array.remove(zones, absIdx)
+                    mergedThisBar := true
+                    break
+
+// ============================================================================
+// updateActiveZones
+// ============================================================================
+if array.size(zones) > 0
+    for i = 0 to array.size(zones) - 1
+        SZone z = array.get(zones, i)
+        z.zMid := (z.zLow + z.zHigh) / 2
+
+        if htfOn
+            bool conf = false
+            if not na(hzLo) and not na(hzHi)
+                conf := z.zLow <= hzHi and z.zHigh >= hzLo
+            if not na(hP1) and math.abs(z.zMid - hP1) <= nz(hAtrR) * in_htfAtrMult * 2.0
+                conf := true
+            z.htfCon := conf
+
+        z.score := f_score(z, atr)
+        int nCls = f_classOf(z.score)
+
+        if z.consecBelow > 0 and close > z.zHigh
+            z.absorbed += 1
+
+        if z.status == ZT_ACTIVE
+            bool below = close < z.zLow
+            z.consecBelow := below ? z.consecBelow + 1 : 0
+            bool invA = below
+            bool invB = close < z.zLow - atr * in_breachAtr
+            bool invC = z.consecBelow >= in_consCloses
+            bool invD = (below and (z.zLow - close) > atr * 0.5) or (z.consecBelow >= in_consCloses)
+            bool isInv = in_invMode == INV_A ? invA : in_invMode == INV_B ? invB : in_invMode == INV_C ? invC : invD
+            if isInv
+                z.status := ZT_BROKEN
+                z.lastBreakBar := bar_index
+                evBreak := true
+                totalBreaks += 1
+                if in_showBroken
+                    z := f_restyleBroken(z)
+                else
+                    z := f_zoneKill(z)
+                if in_labels and in_lblBroken
+                    label.new(bar_index, z.zLow, "BRK", style = label.style_label_lower_left, color = color.new(in_colorBroken, 5), textcolor = color.white, size = lblSizeVal)
+
+        if z.status == ZT_BROKEN and not z.revDone
+            if bar_index - z.lastBreakBar >= in_pR and high >= z.zLow and close < z.zMid
+                z.status := ZT_REVERSED
+                z.revDone := true
+                evRev := true
+                totalRevs += 1
+                if not na(z.zBox)
+                    box.set_border_color(z.zBox, color.new(color.orange, 10))
+                    box.set_bgcolor(z.zBox, color.new(color.orange, in_transp))
+                    box.set_border_style(z.zBox, line.style_dashed)
+                if in_labels and in_lblRev
+                    label.new(bar_index, z.zHigh, "S → R", style = label.style_label_upper_left, color = color.new(color.orange, 0), textcolor = color.white, size = lblSizeVal)
+
+        if z.status == ZT_ACTIVE and in_probe and not in_perfMode and bar_index - z.lastTouchBar >= in_touchGap
+            bool fresh = ta.lowest(low[1], in_touchGap) > z.zHigh + atr * 0.05
+            if fresh and low <= z.zHigh and low >= z.zLow - atr * in_probeDepth and close >= z.zLow
+                float prng = math.max(high - low, syminfo.mintick)
+                float plwk = math.max(0.0, math.min(open, close) - low)
+                if plwk / prng >= 0.4
+                    SPivot pv = SPivot.new(low, open, close, high, low, bar_index, plwk / prng, in_vol and volOK and volume > volSma * in_volMult)
+                    z := f_addTouch(z, pv, bar_index, atr)
+                    evTouch := true
+                    totalTouches += 1
+
+        if in_bounce and z.status == ZT_ACTIVE and bar_index - z.lastBounceBar >= in_bounceCd
+            bool recentT = bar_index - z.lastTouchBar <= in_bounceWin
+            bool aboveC = in_bounceStrong ? close > z.zHigh : close > z.zMid
+            bool bull = close >= open
+            bool distOk = close - low >= atr * in_bounceAtr
+            if recentT and aboveC and (bull or not in_bounceStrong) and distOk
+                z.bounces += 1
+                z.lastBounceBar := bar_index
+                z.score := f_score(z, atr)
+                evBounce := true
+                totalBounces += 1
+                if z.shown and in_labels and in_lblBounce
+                    label.new(bar_index, low, "BOUNCE", style = label.style_label_lower_left, color = color.new(in_colorStrong, 0), textcolor = color.white, size = lblSizeVal)
+
+        if in_spring and z.status == ZT_ACTIVE
+            if close < z.zLow and z.brkBar == 0
+                float depth = z.zLow - close
+                if depth >= atr * in_springMin and depth <= atr * in_springDepth
+                    z.brkBar := bar_index
+                    z.brkPrice := close
+            if z.brkBar > 0
+                int since = bar_index - z.brkBar
+                if since >= 1 and since <= in_springRet and close > z.zMid and close > z.brkPrice and bar_index - z.lastSpringBar >= 30
+                    int sBar = z.brkBar
+                    z.brkBar := 0
+                    z.brkPrice := na
+                    z.holds += 1
+                    z.volHits += 1
+                    z.lastSpringBar := bar_index
+                    z.score := f_score(z, atr)
+                    evSpring := true
+                    totalSprings += 1
+                    if z.shown and in_labels and in_lblSpring
+                        label.new(sBar, low[math.min(since, in_springRet)], "SPRING", style = label.style_label_lower_left, color = color.new(color.fuchsia, 0), textcolor = color.white, size = lblSizeVal)
+
+        if in_cons and z.status == ZT_ACTIVE and not in_perfMode
+            bool prevCons = z.consOn
+            int nearCnt = 0
+            for k = 1 to in_consWin
+                if low[k - 1] >= z.zLow - atr * 0.5 and high[k - 1] <= z.zHigh + atr * 2.5
+                    nearCnt += 1
+            float cRange = ta.highest(high, in_consWin) - ta.lowest(low, in_consWin)
+            float atrAvg = nz(ta.sma(ta.atr(in_atrLen), in_consWin), atr)
+            bool consNow = nearCnt / in_consWin >= in_consNear and cRange <= atr * in_consRange and atr < atrAvg * in_consAtrC
+            z.prevCons := prevCons
+            z.consOn := consNow
+            if consNow and not prevCons and bar_index - z.lastConsBar >= 60
+                z.lastConsBar := bar_index
+                if z.shown and in_labels and in_lblCons
+                    label.new(bar_index, z.zHigh, "CONS", style = label.style_label_upper_left, color = color.new(color.blue, 0), textcolor = color.white, size = lblSizeVal)
+
+        if in_brk and z.status == ZT_ACTIVE and z.prevCons and close > ta.highest(high, in_consWin)[1]
+            bool atrExp = atr >= nz(atr[1], atr) * in_brkAtr
+            bool volOkB = not in_brkVol or (volOK and volume > volSma * in_volMult)
+            if atrExp and volOkB and bar_index - z.lastOutBar >= in_consWin
+                z.lastOutBar := bar_index
+                evOut := true
+                totalBreakouts += 1
+                if z.shown and in_labels and in_lblOut
+                    label.new(bar_index, high, "BOUT", style = label.style_label_upper_left, color = color.new(color.lime, 0), textcolor = color.black, size = lblSizeVal)
+
+        if not z.shown and z.status == ZT_ACTIVE and z.score >= in_minScore
+            z.shown := true
+            z.cls := nCls
+            evNew := true
+            if nCls == CLS_STRONG
+                evStrong := true
+            if nCls == CLS_MAJOR
+                evMajor := true
+        if z.shown and nCls > z.cls
+            z.cls := nCls
+            z := f_restyle(z)
+            if nCls == CLS_STRONG
+                evStrong := true
+            if nCls == CLS_MAJOR
+                evMajor := true
+        if z.shown and na(z.zBox)
+            z := f_makeVisuals(z)
+
+        if z.shown and not na(z.zBox)
+            box.set_left(z.zBox, f_clampBar(z.startBar))
+            box.set_top(z.zBox, z.zHigh)
+            box.set_bottom(z.zBox, z.zLow)
+
+        if z.shown and not na(z.midLn)
+            line.set_xy1(z.midLn, f_clampBar(z.startBar), z.zMid)
+            line.set_xy2(z.midLn, bar_index, z.zMid)
+
+        if z.shown and not na(z.tag)
+            label.set_xy(z.tag, f_clampBar(z.startBar), z.zHigh)
+
+        bool canExt = z.status == ZT_ACTIVE and (in_staleBars == 0 or bar_index - z.lastTouchBar <= in_staleBars)
+        if z.status == ZT_REVERSED
+            canExt := close <= z.zHigh + atr * 0.2
+
+        if z.shown and not na(z.zBox) and canExt
+            box.set_right(z.zBox, bar_index)
+
+        if z.shown and not na(z.midLn) and canExt
+            line.set_x2(z.midLn, bar_index)
+            line.set_y2(z.midLn, z.zMid)
+
+        if z.shown and not na(z.tag) and math.round(z.score) != z.lastScoreShown
+            z.lastScoreShown := math.round(z.score)
+            label.set_text(z.tag, f_tagText(z))
+
+        array.set(zones, i, z)
+
+// ============================================================================
+// cleanupOldZones
+// ============================================================================
+if array.size(zones) > 0
+    int cleanIdx = array.size(zones) - 1
+    while cleanIdx >= 0
+        SZone zb = array.get(zones, cleanIdx)
+        if zb.status != ZT_ACTIVE and in_brokenRetain > 0 and bar_index - zb.lastBreakBar > in_brokenRetain
+            zb := f_zoneKill(zb)
+            array.remove(zones, cleanIdx)
+        cleanIdx -= 1
+
+if array.size(zones) > in_maxZones
+    int jBad = -1
+    float pBad = 999999.0
+    for i = 0 to array.size(zones) - 1
+        SZone zi = array.get(zones, i)
+        float prio = zi.status == ZT_ACTIVE ? zi.score - 300.0 : zi.score
+        if prio < pBad
+            pBad := prio
+            jBad := i
+    if jBad >= 0
+        SZone zj = array.get(zones, jBad)
+        zj := f_zoneKill(zj)
+        array.remove(zones, jBad)
+
+// ============================================================================
+// STRONGEST ACTIVE ZONE -> data window series, panel, alerts
+// ============================================================================
+int strongIdx = -1
+float strongScore = -1.0
+bool sHtfCon = false   // v4.1: HTF flag of the strongest zone — set safely inside the loop below
+if array.size(zones) > 0
+    for i = 0 to array.size(zones) - 1
+        SZone zs = array.get(zones, i)
+        if zs.status == ZT_ACTIVE and zs.shown and zs.score > strongScore
+            strongScore := zs.score
+            strongIdx := i
+            sHtfCon := zs.htfCon
+
+float sLow = na
+float sHigh = na
+float sMid = na
+float sScore = na
+int   sTouches = na
+float sActive = 0.0
+float sStrength = 0.0
+float sDistPct = na
+if strongIdx >= 0
+    SZone sZoneRef = array.get(zones, strongIdx)
+    sLow := sZoneRef.zLow
+    sHigh := sZoneRef.zHigh
+    sMid := sZoneRef.zMid
+    sScore := sZoneRef.score
+    sTouches := sZoneRef.touches
+    sActive := 1.0
+    sStrength := sZoneRef.cls + 1.0
+    sDistPct := (close - sMid) / close * 100.0
+
+if barstate.islast
+    if in_table
+        if na(panel)
+            panel := table.new(position.top_right, 2, 12, bgcolor = color.new(color.black, 55), frame_color = color.new(color.gray, 40), frame_width = 1, border_color = color.new(color.gray, 70), border_width = 1)
+        if strongIdx >= 0
+            SZone pz = array.get(zones, strongIdx)
+            float tDist = (close - pz.zMid) / close * 100.0
+            float tAtrD = atr > 0 ? (close - pz.zMid) / atr : na
+            string tStat = pz.status == ZT_ACTIVE ? (in_staleBars > 0 and bar_index - pz.lastTouchBar > in_staleBars ? "STALE" : "ACTIVE") : pz.status == ZT_BROKEN ? "BROKEN" : "S → R"
+            table.cell(panel, 0, 0, "STRONGEST ZONE", text_color = color.yellow, text_size = size.normal)
+            table.cell(panel, 1, 0, f_clsName(pz.cls) + " · " + tStat, text_color = color.yellow, text_size = size.normal)
+            table.cell(panel, 0, 1, "Zone High", text_color = color.silver, text_size = size.small)
+            table.cell(panel, 1, 1, str.tostring(pz.zHigh, format.mintick), text_color = color.yellow, text_size = size.small)
+            table.cell(panel, 0, 2, "Zone Low", text_color = color.silver, text_size = size.small)
+            table.cell(panel, 1, 2, str.tostring(pz.zLow, format.mintick), text_color = color.yellow, text_size = size.small)
+            table.cell(panel, 0, 3, "Midpoint", text_color = color.silver, text_size = size.small)
+            table.cell(panel, 1, 3, str.tostring(pz.zMid, format.mintick), text_color = color.yellow, text_size = size.small)
+            table.cell(panel, 0, 4, "Touches", text_color = color.silver, text_size = size.small)
+            table.cell(panel, 1, 4, str.tostring(pz.touches), text_color = color.yellow, text_size = size.small)
+            table.cell(panel, 0, 5, "Score", text_color = color.silver, text_size = size.small)
+            table.cell(panel, 1, 5, str.tostring(math.round(pz.score)) + " / 100", text_color = color.yellow, text_size = size.small)
+            table.cell(panel, 0, 6, "Zone Age", text_color = color.silver, text_size = size.small)
+            table.cell(panel, 1, 6, str.tostring(bar_index - pz.bornBar) + " bars", text_color = color.yellow, text_size = size.small)
+            table.cell(panel, 0, 7, "Dist (price)", text_color = color.silver, text_size = size.small)
+            table.cell(panel, 1, 7, str.tostring(tDist, "#.##") + " %", text_color = color.yellow, text_size = size.small)
+            table.cell(panel, 0, 8, "Dist (ATR)", text_color = color.silver, text_size = size.small)
+            table.cell(panel, 1, 8, str.tostring(tAtrD, "#.##") + " × ATR", text_color = color.yellow, text_size = size.small)
+            table.cell(panel, 0, 9, "Bounces", text_color = color.silver, text_size = size.small)
+            table.cell(panel, 1, 9, str.tostring(pz.bounces), text_color = color.yellow, text_size = size.small)
+            table.cell(panel, 0, 10, "Failed breaks", text_color = color.silver, text_size = size.small)
+            table.cell(panel, 1, 10, str.tostring(pz.absorbed), text_color = color.yellow, text_size = size.small)
+            table.cell(panel, 0, 11, "HTF confluence", text_color = color.silver, text_size = size.small)
+            table.cell(panel, 1, 11, pz.htfCon ? "YES" : "no", text_color = pz.htfCon ? color.aqua : color.silver, text_size = size.small)
+        else
+            table.cell(panel, 0, 0, "STRONGEST ZONE", text_color = color.silver, text_size = size.normal)
+            table.cell(panel, 1, 0, "no active zone", text_color = color.silver, text_size = size.normal)
+    else if not na(panel)
+        table.delete(panel)
+        panel := na
+
+// ----------------------------------------------------------------------------
+// Dynamic alert messages
+// ----------------------------------------------------------------------------
+if in_alerts
+    if evNew
+        alert("ASZE " + syminfo.ticker + ": NEW support zone confirmed — price " + str.tostring(close, format.mintick) + ". A box was drawn; see panel for range/score.", alert.freq_once_per_bar_close)
+    if evStrong
+        alert("ASZE " + syminfo.ticker + ": STRONG support confirmed (score ≥ 60) — high-probability reaction area.", alert.freq_once_per_bar_close)
+    if evMajor
+        alert("ASZE " + syminfo.ticker + ": MAJOR support confirmed (score ≥ 80) — strongest zone on chart.", alert.freq_once_per_bar_close)
+    if evTouch
+        alert("ASZE " + syminfo.ticker + ": valid support touch counted on an active zone.", alert.freq_once_per_bar_close)
+    if evBounce
+        alert("ASZE " + syminfo.ticker + ": SUPPORT BOUNCE — price rejected from support and closed back above it.", alert.freq_once_per_bar_close)
+    if evSpring
+        alert("ASZE " + syminfo.ticker + ": FALSE BREAK / SPRING — support briefly broken, then reclaimed (Wyckoff-style).", alert.freq_once_per_bar_close)
+    if evOut
+        alert("ASZE " + syminfo.ticker + ": SUPPORT BREAKOUT — bullish breakout from a support consolidation.", alert.freq_once_per_bar_close)
+    if evBreak
+        alert("ASZE " + syminfo.ticker + ": SUPPORT BREAKDOWN — a support zone was decisively broken at " + str.tostring(close, format.mintick) + ".", alert.freq_once_per_bar_close)
+    if evRev
+        alert("ASZE " + syminfo.ticker + ": ROLE REVERSAL — broken support now rejecting price as resistance (S → R).", alert.freq_once_per_bar_close)
+
+// ============================================================================
+// DATA WINDOW / SCREENER-FRIENDLY OUTPUTS (hidden plots)
+// ============================================================================
+plot(sMid, "supportMid", color = color.new(color.yellow, 0), style = plot.style_line, display = display.none)
+plot(sScore, "supportScore", display = display.none)
+plot(sTouches, "supportTouches", display = display.none)
+plot(sActive, "supportActive", display = display.none)
+plot(totalBounces, "supportBounce", display = display.none)
+plot(evBreak ? 1.0 : 0.0, "supportBreak", display = display.none)
+plot(sStrength, "supportStrength", display = display.none)
+plot(sDistPct, "supportDistancePct", display = display.none)
+
+// ============================================================================
+// ALERT CONDITIONS
+// ============================================================================
+bool aNew = in_alerts and evNew
+bool aStrong = in_alerts and evStrong
+bool aMajor = in_alerts and evMajor
+bool aTouch = in_alerts and evTouch
+bool aBounce = in_alerts and evBounce
+bool aSpring = in_alerts and evSpring
+bool aOut = in_alerts and evOut
+bool aBreak = in_alerts and evBreak
+bool aRev = in_alerts and evRev
+bool aAny = in_alerts and (aNew or aStrong or aMajor or aTouch or aBounce or aSpring or aOut or aBreak or aRev)
+
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EMA INPUTS
+// ═══════════════════════════════════════════════════════════════════════════
+groupEMA = "EMA Lines"
+
+ema20_length  = input.int(20, title="EMA 20 Length", group=groupEMA)
+ema50_length  = input.int(50, title="EMA 50 Length", group=groupEMA)
+ema200_length = input.int(200, title="EMA 200 Length", group=groupEMA)
+
+ema20_source  = input.source(close, title="EMA 20 Source", group=groupEMA)
+ema50_source  = input.source(close, title="EMA 50 Source", group=groupEMA)
+ema200_source = input.source(close, title="EMA 200 Source", group=groupEMA)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// KERNEL REGRESSION INPUTS
+// ═══════════════════════════════════════════════════════════════════════════
+groupKernel = "🔮 Kernel Regression"
+
+krSrc       = input.source(close, "Source", group=groupKernel)
+krH         = input.float(8.0, "Lookback Window", group=groupKernel, minval=3)
+krR         = input.float(8.0, "Relative Weight", group=groupKernel)
+krX0        = input.int(25, "Start Regression At Bar", group=groupKernel)
+krLag       = input.int(5, "Lag (smoothing)", group=groupKernel, minval=1)
+krWindow    = input.int(50, "Kernel Window", group=groupKernel)
+krSmooth    = input.bool(true, "Smooth Colors", group=groupKernel)
+
+krBullColor = input.color(#3AFF17, "Bullish Color", group=groupKernel)
+krBearColor = input.color(#FD1707, "Bearish Color", group=groupKernel)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CROSSOVER FILTER INPUTS
+// ═══════════════════════════════════════════════════════════════════════════
+groupCross = "📈 Crossover Filter"
+
+crossLookback = input.int(20, "Crossover Lookback (Candles)", minval=1, group=groupCross)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TOP / RESISTANCE FILTER INPUTS
+// ═══════════════════════════════════════════════════════════════════════════
+groupTop = "🚫 Top / Resistance Filter"
+
+topFilterEnabled = input.bool(true, "Enable Top Filter", group=groupTop)
+topLookback = input.int(20, "Top Detection Lookback", minval=2, group=groupTop)
+topDistancePct = input.float(0.50, "Minimum Distance From Recent High (%)", minval=0.0, step=0.10, group=groupTop)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LINE POSITION INFO INPUTS — TOP CENTRE PANEL
+// ═══════════════════════════════════════════════════════════════════════════
+groupLineInfo = "📊 Line Position Info (Top Centre)"
+
+showLineInfo         = input.bool(true,  "Show Kernel / EMA % Position Panel", group=groupLineInfo)
+lineInfoOnlyOnSignal = input.bool(false, "Only Show When A Signal Fires (KERNEL / EMA200 / EMAKER / KMAKER / INTMAKER)", group=groupLineInfo)
+lineInfoUseRange     = input.bool(false, "Use Full Candle Range Instead Of Body For % Calc", group=groupLineInfo)
+lineInfoShowEma200   = input.bool(true,  "Include EMA 200", group=groupLineInfo)
+lineInfoShowPrice    = input.bool(true,  "Show Line Price Along With %", group=groupLineInfo)
+lineInfoShowMacd     = input.bool(false, "Include MACD Histogram Status", group=groupLineInfo)
+lineInfoShowScore    = input.bool(true,  "Include Total Score", group=groupLineInfo)
+
+lineInfoVOffset   = input.int(1, "Vertical Offset — Steps Below Top Edge", options=[0, 1, 2, 3, 4], group=groupLineInfo)
+lineInfoOffsetPad = input.bool(false, "Offset As Padding (box stays at top, text moves down)", group=groupLineInfo)
+
+lineInfoBold         = input.bool(false, "BOLD Text (Unicode) — switch OFF if you see ▯ boxes", group=groupLineInfo)
+lineInfoTextSize     = input.string("Large", "Text Size", options=["Normal", "Large", "Huge"], group=groupLineInfo)
+lineInfoTextColor    = input.color(color.new(#FFEB3B, 0),  "Text Colour (Yellow)",           group=groupLineInfo)
+lineInfoHighlight    = input.bool(false, "Dim Lines That Sit OUTSIDE The Candle", group=groupLineInfo)
+lineInfoInsideColor  = input.color(color.new(#FFEB3B, 0),  "Inside-Candle Colour",           group=groupLineInfo)
+lineInfoOutsideColor = input.color(color.new(#FFEB3B, 60), "Outside-Candle Colour (dimmed)", group=groupLineInfo)
+lineInfoBgColor      = input.color(color.new(#000000, 35), "Panel Background",               group=groupLineInfo)
+
+liMacdFast           = input.int(12, "MACD Fast Length",   minval=1, group=groupLineInfo)
+liMacdSlow           = input.int(26, "MACD Slow Length",   minval=1, group=groupLineInfo)
+liMacdSig            = input.int(9,  "MACD Signal Length", minval=1, group=groupLineInfo)
+lineInfoDecimals     = input.string("#.0", "Decimal Format", options=["#", "#.0", "#.00"], group=groupLineInfo)
+
+int liCols = 3 + (lineInfoShowEma200 ? 1 : 0) + (lineInfoShowMacd ? 1 : 0) + (lineInfoShowScore ? 1 : 0)
+
+string liTextSize = lineInfoTextSize == "Huge" ? size.huge : lineInfoTextSize == "Normal" ? size.normal : size.large
+
+int liRows = 1 + lineInfoVOffset
+
+// ═══════════════════════════════════════════════════════════════════════════
+// KTOUCHER FILTER INPUTS
+// ═══════════════════════════════════════════════════════════════════════════
+groupKtoucher = "🎯 KTOUCHER Filter"
+
+ktoucherMinBodyRatio = input.float(85.0, "Min Body Ratio % — RED Touching Candle (Body/Range)", minval=50.0, maxval=100.0, step=1.0, group=groupKtoucher, tooltip="For RED touching candles: the candle's own BODY must make up at least this % of its total range (i.e. the WICK is small — roughly 10-15%). This describes the candle's SHAPE/ANATOMY, NOT how far it dips below the Kernel Regression line. GREEN candles are not subject to this filter.")
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 🏆 SCORE SYSTEM INPUTS
+// ═══════════════════════════════════════════════════════════════════════════
+groupScore = "🏆 Score System"
+
+scoreAlertThreshold = input.float(4, "Alert When Total Score >=", minval=0, step=0.5, group=groupScore)
+
+float maxPossibleScore = 12
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EMA CALCULATIONS
+// ═══════════════════════════════════════════════════════════════════════════
+ema20 = ta.ema(ema20_source, ema20_length)
+ema50 = ta.ema(ema50_source, ema50_length)
+ema200 = ta.ema(ema200_source, ema200_length)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// KERNEL REGRESSION
+// ═══════════════════════════════════════════════════════════════════════════
+int krN = krWindow + krX0
+float krH2 = krH - krLag
+
+var float[] krW1 = array.new_float(0)
+var float[] krW2 = array.new_float(0)
+var float krDen1 = 0.0
+var float krDen2 = 0.0
+
+if barstate.isfirst
+    for i = 0 to krN
+        float w1 = math.pow(1 + (i * i) / (2 * krH * krH * krR), -krR)
+        float w2 = math.pow(1 + (i * i) / (2 * krH2 * krH2 * krR), -krR)
+        array.push(krW1, w1)
+        array.push(krW2, w2)
+        krDen1 += w1
+        krDen2 += w2
+
+float krNum1 = 0.0
+float krNum2 = 0.0
+
+for i = 0 to krN
+    float s = krSrc[i]
+    krNum1 += s * array.get(krW1, i)
+    krNum2 += s * array.get(krW2, i)
+
+float yhat1 = krNum1 / krDen1
+float yhat2 = krNum2 / krDen2
+
+// ═══════════════════════════════════════════════════════════════════════════
+// KERNEL COLOR LOGIC
+// ═══════════════════════════════════════════════════════════════════════════
+bool krIsBullish = yhat1 > yhat1[1]
+
+color krPlotColor = krSmooth ? (yhat2 > yhat1 ? krBullColor : krBearColor) : (krIsBullish ? krBullColor : krBearColor)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CANDLE CALCULATIONS
+// ═══════════════════════════════════════════════════════════════════════════
+float candleRange = high - low
+float candleBody = math.abs(close - open)
+float bodyRatio = candleRange > 0 ? (candleBody / candleRange) * 100 : 0
+
+// ═══════════════════════════════════════════════════════════════════════════
+// KERNEL CANDLE PATTERN A — 90% STRONG CANDLE
+// ═══════════════════════════════════════════════════════════════════════════
+bool bullishCandle = close > open
+bool body90 = bodyRatio >= 90.0
+bool openEqualsLow = open == low
+
+bool kernelPattern90 = bullishCandle and body90 and openEqualsLow
+
+// ═══════════════════════════════════════════════════════════════════════════
+// KERNEL CANDLE PATTERN B — 80% FLEXIBLE CANDLE
+// ═══════════════════════════════════════════════════════════════════════════
+bool body80to90 = bodyRatio >= 70.0 and bodyRatio < 90.0
+
+bool kernelPattern80 = bullishCandle and body80to90
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FINAL KERNEL CANDLE CONDITION
+// ═══════════════════════════════════════════════════════════════════════════
+bool kernelCandleCondition = kernelPattern90 or kernelPattern80
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PRICE / KERNEL / EMA STRUCTURE
+// ═══════════════════════════════════════════════════════════════════════════
+bool candleAboveKernel = low > yhat1
+
+bool kernelEmaStructure = yhat1 > ema20 and ema20 > ema50 and ema50 > ema200
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BULLISH CROSSOVER DETECTION
+// ═══════════════════════════════════════════════════════════════════════════
+bool kernelCrossEma20 = ta.crossover(yhat1, ema20)
+bool ema20CrossEma50 = ta.crossover(ema20, ema50)
+bool ema50CrossEma200 = ta.crossover(ema50, ema200)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CROSSOVER RECENCY
+// ═══════════════════════════════════════════════════════════════════════════
+int barsSinceKernelCross = ta.barssince(kernelCrossEma20)
+int barsSinceEMA20Cross = ta.barssince(ema20CrossEma50)
+int barsSinceEMA50Cross = ta.barssince(ema50CrossEma200)
+
+bool kernelCrossRecent = not na(barsSinceKernelCross) and barsSinceKernelCross <= crossLookback
+bool ema20CrossRecent = not na(barsSinceEMA20Cross) and barsSinceEMA20Cross <= crossLookback
+bool ema50CrossRecent = not na(barsSinceEMA50Cross) and barsSinceEMA50Cross <= crossLookback
+
+bool allCrossoversRecent = kernelCrossRecent and ema20CrossRecent and ema50CrossRecent
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TOP / RESISTANCE FILTER
+// ═══════════════════════════════════════════════════════════════════════════
+float recentHigh = ta.highest(high, topLookback)
+
+float distanceFromTopPct = recentHigh > 0 ? ((recentHigh - close) / recentHigh) * 100 : 0
+
+bool nearRecentTop = distanceFromTopPct < topDistancePct
+
+bool topFilterPassed = not topFilterEnabled or not nearRecentTop
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FINAL KERNEL SIGNAL — LIVE / INTRABAR
+// ═══════════════════════════════════════════════════════════════════════════
+bool kernelSignal = kernelCandleCondition and candleAboveKernel and kernelEmaStructure and allCrossoversRecent and topFilterPassed
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EMA 200 BULLISH CROSS CLOSE LOGIC — LIVE / INTRABAR
+// ═══════════════════════════════════════════════════════════════════════════
+bool ema200OpenBelow = open < ema200
+bool ema200CloseAbove = close > ema200
+bool ema200BullishCandle = close > open
+
+bool ema200Signal = ema200BullishCandle and ema200OpenBelow and ema200CloseAbove
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EMAKER LOGIC
+// ═══════════════════════════════════════════════════════════════════════════
+float currentBodyLow = math.min(open, close)
+
+bool bodyLowAboveKernelRegression = currentBodyLow > yhat1
+
+bool emaMakerSignal = ema200Signal and bodyLowAboveKernelRegression
+
+// ═══════════════════════════════════════════════════════════════════════════
+// KMAKER LOGIC
+// ═══════════════════════════════════════════════════════════════════════════
+bool kmakerBullishCandle = close > open
+
+bool kmakerLowAboveEma20   = low > ema20
+bool kmakerLowAboveKernel  = low > yhat1
+
+bool kmakerOpenAboveEma20  = open > ema20
+bool kmakerOpenAboveKernel = open > yhat1
+
+bool kmakerEma20AboveKernel =  yhat1 >= ema20
+
+bool kmakerBodyRatio80 = bodyRatio >= 80.0
+
+bool kmakerSignal = kmakerBullishCandle and kmakerLowAboveEma20 and kmakerLowAboveKernel and kmakerOpenAboveEma20 and kmakerOpenAboveKernel and kmakerEma20AboveKernel and kmakerBodyRatio80
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MACD (shared by INTMAKER logic + Line Info Panel + Score)
+// ═══════════════════════════════════════════════════════════════════════════
+[liMacdLine, liMacdSignalLine, liMacdHist] = ta.macd(close, liMacdFast, liMacdSlow, liMacdSig)
+
+float rsi14 = ta.rsi(close, 14)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INTMAKER LOGIC
+// ═══════════════════════════════════════════════════════════════════════════
+bool intMakerKernelEmaStack = yhat1 > ema20 and ema20 > ema50 and ema50 > ema200
+
+bool intMakerMacdHistGreen = liMacdHist > 0
+
+bool intMakerMacdLineAboveHist = liMacdLine > liMacdHist
+
+bool intMakerSignal = kmakerSignal and intMakerKernelEmaStack and intMakerMacdHistGreen and intMakerMacdLineAboveHist and rsi14 > 70
+
+bool kmakerOnlySignal = kmakerSignal and not intMakerSignal
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INTMAKER DAILY TRIGGER COUNT + ONE-SHOT TRIGGERS FOR EVERY OTHER LABEL
+// ═══════════════════════════════════════════════════════════════════════════
+var int  lastBarIndexForTrigger   = -1
+var bool triggeredThisBar         = false
+var bool kernelTriggeredThisBar   = false
+var bool ema200TriggeredThisBar   = false
+var bool emakerTriggeredThisBar   = false
+var bool kmakerTriggeredThisBar   = false
+var bool ktoucherTriggeredThisBar = false
+
+if bar_index != lastBarIndexForTrigger
+    triggeredThisBar         := false
+    kernelTriggeredThisBar   := false
+    ema200TriggeredThisBar   := false
+    emakerTriggeredThisBar   := false
+    kmakerTriggeredThisBar   := false
+    ktoucherTriggeredThisBar := false
+    lastBarIndexForTrigger   := bar_index
+
+bool intMakerTrigger = intMakerSignal and not intMakerSignal[1] and not triggeredThisBar
+
+if intMakerTrigger
+    triggeredThisBar := true
+
+bool kernelTrigger = kernelSignal and not kernelSignal[1] and not kernelTriggeredThisBar
+if kernelTrigger
+    kernelTriggeredThisBar := true
+
+bool ema200Trigger = ema200Signal and not ema200Signal[1] and not ema200TriggeredThisBar
+if ema200Trigger
+    ema200TriggeredThisBar := true
+
+bool emakerTrigger = emaMakerSignal and not emaMakerSignal[1] and not emakerTriggeredThisBar
+if emakerTrigger
+    emakerTriggeredThisBar := true
+
+bool kmakerTrigger = kmakerSignal and not kmakerSignal[1] and not kmakerTriggeredThisBar
+if kmakerTrigger
+    kmakerTriggeredThisBar := true
+
+var int intMakerDayCount = 0
+
+bool newDay = ta.change(time("D")) != 0
+
+if newDay
+    intMakerDayCount := 0
+
+if intMakerTrigger
+    intMakerDayCount += 1
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INTMAKER ALERT LIMIT — ONLY FIRST 2 TRIGGERS PER DAY
+// ═══════════════════════════════════════════════════════════════════════════
+bool intMakerAlertLimited = intMakerTrigger and intMakerDayCount <= 2
+
+// ═══════════════════════════════════════════════════════════════════════════
+// KTOUCHER LOGIC
+// ═══════════════════════════════════════════════════════════════════════════
+var bool  ktoucherArmed         = false
+var float ktoucherKmakerClose   = na
+var int   ktoucherArmedBarIndex = na
+
+if kmakerSignal
+    ktoucherArmed         := true
+    ktoucherKmakerClose   := close
+    ktoucherArmedBarIndex := bar_index
+
+bool ktoucherIsRedCandle     = close < open
+bool ktoucherTouchesKernel   = low <= yhat1
+bool ktoucherClosesAbove     = close > yhat1
+bool ktoucherBodyAboveKernel = math.min(open, close) > yhat1
+
+bool ktoucherRedValid = ktoucherIsRedCandle and ktoucherTouchesKernel and ktoucherClosesAbove and ktoucherBodyAboveKernel and bodyRatio >= ktoucherMinBodyRatio
+
+bool ktoucherGreenValid = (not ktoucherIsRedCandle) and ktoucherTouchesKernel and ktoucherClosesAbove
+
+bool ktoucherValidCandle = ktoucherRedValid or ktoucherGreenValid
+
+bool ktoucherIsUpcomingBar = na(ktoucherArmedBarIndex) ? false : bar_index > ktoucherArmedBarIndex
+
+bool ktoucherSignal = ktoucherArmed and ktoucherIsUpcomingBar and ktoucherValidCandle
+
+if ktoucherSignal
+    ktoucherArmed := false
+
+bool ktoucherTrigger = ktoucherSignal and not ktoucherSignal[1] and not ktoucherTriggeredThisBar
+if ktoucherTrigger
+    ktoucherTriggeredThisBar := true
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 🏆 SCORE CALCULATIONS  ·  v10 calculation fix
+// Detection, labels, zones, alerts and every non-score input are unchanged.
+//
+// Old total was 12 overlapping +1 flags. Several cannot be true together,
+// several were the same fact counted twice, and MACD>0 + RSI>50 added +2 on
+// ordinary trend bars. Percentage and the ">= 5" gate were therefore biased.
+//
+// New total is still 0-12, and 12 is reachable. Buckets:
+//   SIGNAL    0-4    one payment per nested family, weighted by strictness
+//   MOMENTUM  0-2    only when a setup is on the bar
+//   LOCATION  0-3    live zone score + HTF, and only together with a signal
+//   REACTION  0-3    spring / breakout / bounce, same move not stacked
+// The component plots are the points actually added. They sum to Total Score.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// --- SIGNAL (max 4) -------------------------------------------------------
+// INTMAKER (3) already contains KMAKER, so KMAKER is not added again.
+// EMAKER (2) already contains the EMA200 cross; bare EMA200 is 1 only.
+// KERNEL is 2 alone, or +1 when it confirms KMAKER/INTMAKER (second system).
+// KTOUCHER is 2. It cannot coexist with KERNEL / KMAKER / INTMAKER.
+float scoreIntmaker = intMakerSignal ? 3.0 : 0.0
+float scoreKmaker   = kmakerOnlySignal ? 2.0 : 0.0
+float scoreKernel   = kernelSignal ? ((intMakerSignal or kmakerSignal) ? 1.0 : 2.0) : 0.0
+float scoreEmaker   = emaMakerSignal ? 2.0 : 0.0
+float scoreEma200   = (ema200Signal and not emaMakerSignal) ? 1.0 : 0.0
+float scoreKtoucher = ktoucherSignal ? 2.0 : 0.0
+
+// --- REACTION (max 3) -----------------------------------------------------
+// Spring is the higher-quality reclaim, so a same-bar bounce is not added.
+// Breakout beside a spring is +1, not a second full event.
+float scoreSpring   = evSpring ? 2.0 : 0.0
+float scoreBreakout = evOut ? (evSpring ? 1.0 : 2.0) : 0.0
+float scoreBounce   = (evBounce and not evSpring and not evOut) ? 1.0 : 0.0
+
+// Kept exactly — later V6/V7 alerts read this flag. Do not reorder or rename.
+bool intmakerAnySignal = kernelSignal or ema200Signal or emaMakerSignal or kmakerSignal or intMakerSignal or ktoucherSignal
+
+bool zoneOverlap = sActive > 0 and not na(sLow) and not na(sHigh) and low <= sHigh and high >= sLow and close >= sLow
+bool zoneStrongLive = zoneOverlap and not na(sScore) and sScore >= 60.0
+bool zoneMajorLive  = zoneOverlap and not na(sScore) and sScore >= 80.0
+float scoreConfluence = 0.0
+if intmakerAnySignal and zoneStrongLive
+    scoreConfluence := 1.0
+if intmakerAnySignal and zoneMajorLive
+    scoreConfluence := 2.0
+if intmakerAnySignal and zoneStrongLive and sHtfCon
+    scoreConfluence := math.min(scoreConfluence + 1.0, 3.0)
+
+bool scoreSetup = intmakerAnySignal or evBounce or evSpring or evOut
+// History refs stay outside the branch so Pine's series buffer is stable.
+bool macdBull   = not na(liMacdHist) and liMacdHist > 0
+bool macdRising = macdBull and not na(liMacdHist[1]) and liMacdHist > liMacdHist[1]
+bool rsiBull    = not na(rsi14) and rsi14 > 50
+bool rsiRising  = not na(rsi14) and not na(rsi14[1]) and rsi14 > rsi14[1]
+float scoreMacd = 0.0
+float scoreRsi  = 0.0
+if scoreSetup
+    if intMakerSignal
+        scoreMacd := macdRising ? 1.0 : 0.0
+        scoreRsi  := rsiRising ? 1.0 : 0.0
+    else
+        scoreMacd := macdBull ? 1.0 : 0.0
+        scoreRsi  := rsiBull ? 1.0 : 0.0
+
+float totalScore = scoreKernel + scoreEma200 + scoreEmaker + scoreKmaker + scoreIntmaker + scoreKtoucher + scoreBounce + scoreSpring + scoreBreakout + scoreConfluence + scoreMacd + scoreRsi
+totalScore := math.min(math.max(totalScore, 0.0), maxPossibleScore)
+float totalScorePct = maxPossibleScore > 0 ? totalScore / maxPossibleScore * 100.0 : na
+
+var float dailyScoreTotal = 0.0
+var float dayKmFamilyPaid = 0.0
+var float dayEmaFamilyPaid = 0.0
+
+if newDay
+    dailyScoreTotal := 0.0
+    dayKmFamilyPaid := 0.0
+    dayEmaFamilyPaid := 0.0
+
+if kernelTrigger
+    dailyScoreTotal += scoreKernel
+if ktoucherTrigger
+    dailyScoreTotal += scoreKtoucher
+
+float kmFamilyNow = scoreIntmaker + scoreKmaker
+if (kmakerTrigger or intMakerTrigger) and kmFamilyNow > dayKmFamilyPaid
+    dailyScoreTotal += kmFamilyNow - dayKmFamilyPaid
+    dayKmFamilyPaid := kmFamilyNow
+
+float emaFamilyNow = scoreEmaker + scoreEma200
+if (ema200Trigger or emakerTrigger) and emaFamilyNow > dayEmaFamilyPaid
+    dailyScoreTotal += emaFamilyNow - dayEmaFamilyPaid
+    dayEmaFamilyPaid := emaFamilyNow
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LINE POSITION %  —  KERNEL / EMA20 / EMA50 / EMA200
+// ═══════════════════════════════════════════════════════════════════════════
+f_pctInZone(float _line, float _lo, float _hi) =>
+    float _pct = _hi > _lo ? (_line - _lo) / (_hi - _lo) * 100.0 : na
+    _pct
+
+f_bold(string _s) =>
+    string _out = _s
+    _out := str.replace_all(_out, "A", "𝗔")
+    _out := str.replace_all(_out, "C", "𝗖")
+    _out := str.replace_all(_out, "D", "𝗗")
+    _out := str.replace_all(_out, "E", "𝗘")
+    _out := str.replace_all(_out, "K", "𝗞")
+    _out := str.replace_all(_out, "M", "𝗠")
+    _out := str.replace_all(_out, "S", "𝗦")
+    _out := str.replace_all(_out, "O", "𝗢")
+    _out := str.replace_all(_out, "R", "𝗥")
+    _out := str.replace_all(_out, "n", "𝗻")
+    _out := str.replace_all(_out, "a", "𝗮")
+    _out := str.replace_all(_out, "0", "𝟬")
+    _out := str.replace_all(_out, "1", "𝟭")
+    _out := str.replace_all(_out, "2", "𝟮")
+    _out := str.replace_all(_out, "3", "𝟯")
+    _out := str.replace_all(_out, "4", "𝟰")
+    _out := str.replace_all(_out, "5", "𝟱")
+    _out := str.replace_all(_out, "6", "𝟲")
+    _out := str.replace_all(_out, "7", "𝟳")
+    _out := str.replace_all(_out, "8", "𝟴")
+    _out := str.replace_all(_out, "9", "𝟵")
+    _out
+
+f_liText(string _name, float _pct, float _price) =>
+    string _s = _name + " " + (na(_pct) ? "n/a" : str.tostring(_pct, lineInfoDecimals) + "%")
+    if lineInfoShowPrice
+        _s := _s + "  |  " + (na(_price) ? "n/a" : str.tostring(_price, format.mintick))
+    lineInfoBold ? f_bold(_s) : _s
+
+f_liColor(float _pct) =>
+    not lineInfoHighlight ? lineInfoTextColor : (not na(_pct) and _pct >= 0.0 and _pct <= 100.0 ? lineInfoInsideColor : lineInfoOutsideColor)
+
+float liBodyHigh = math.max(open, close)
+float liZoneLo   = lineInfoUseRange ? low  : currentBodyLow
+float liZoneHi   = lineInfoUseRange ? high : liBodyHigh
+
+float liKernelPct = f_pctInZone(yhat1, liZoneLo, liZoneHi)
+float liEma20Pct  = f_pctInZone(ema20, liZoneLo, liZoneHi)
+float liEma50Pct  = f_pctInZone(ema50, liZoneLo, liZoneHi)
+float liEma200Pct = f_pctInZone(ema200, liZoneLo, liZoneHi)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TOP CENTRE PANEL
+// ═══════════════════════════════════════════════════════════════════════════
+var table lineInfoTable = na
+
+bool liShowNow = showLineInfo and (not lineInfoOnlyOnSignal or (kernelSignal or ema200Signal or emaMakerSignal or kmakerSignal or intMakerSignal))
+
+if barstate.islast and liShowNow
+    int liRow = lineInfoVOffset
+
+    if na(lineInfoTable)
+        lineInfoTable := table.new(position.top_center, liCols, liRows,
+             bgcolor      = lineInfoOffsetPad ? lineInfoBgColor          : na,
+             border_color = lineInfoOffsetPad ? color.new(color.gray, 50) : na,
+             border_width = lineInfoOffsetPad ? 1                         : 0,
+             frame_color  = lineInfoOffsetPad ? color.new(color.gray, 30) : na,
+             frame_width  = lineInfoOffsetPad ? 1                         : 0)
+
+        if lineInfoVOffset > 0
+            for r = 0 to lineInfoVOffset - 1
+                table.cell(lineInfoTable, 0, r, " ", text_size=size.tiny, bgcolor=na)
+
+    table.cell(lineInfoTable, 0, liRow, f_liText("K",    liKernelPct, yhat1), text_color=f_liColor(liKernelPct), text_size=liTextSize, text_halign=text.align_center, bgcolor=lineInfoBgColor)
+    table.cell(lineInfoTable, 1, liRow, f_liText("E20",  liEma20Pct,  ema20), text_color=f_liColor(liEma20Pct),  text_size=liTextSize, text_halign=text.align_center, bgcolor=lineInfoBgColor)
+    table.cell(lineInfoTable, 2, liRow, f_liText("E50",  liEma50Pct,  ema50), text_color=f_liColor(liEma50Pct),  text_size=liTextSize, text_halign=text.align_center, bgcolor=lineInfoBgColor)
+
+    if lineInfoShowEma200
+        table.cell(lineInfoTable, 3, liRow, f_liText("E200", liEma200Pct, ema200), text_color=f_liColor(liEma200Pct), text_size=liTextSize, text_halign=text.align_center, bgcolor=lineInfoBgColor)
+
+    if lineInfoShowMacd
+        string liMacdTxt = "MACD " + str.tostring(liMacdHist, "#.###") + (liMacdHist > 0 ? " 🟢" : " 🔴") + (liMacdHist > liMacdHist[1] ? " ↑" : " ↓")
+        table.cell(lineInfoTable, lineInfoShowEma200 ? 4 : 3, liRow, lineInfoBold ? f_bold(liMacdTxt) : liMacdTxt,
+             text_color=liMacdHist > 0 ? color.new(#00E676, 0) : color.new(#FF1744, 0),
+             text_size=liTextSize, text_halign=text.align_center, bgcolor=lineInfoBgColor)
+
+    if lineInfoShowScore
+        int scoreColIndex = 3 + (lineInfoShowEma200 ? 1 : 0) + (lineInfoShowMacd ? 1 : 0)
+        string liScoreTxt = "SCORE " + str.tostring(totalScore, "#") + "/" + str.tostring(maxPossibleScore, "#")
+        color liScoreColor = totalScore >= scoreAlertThreshold ? color.new(#00E676, 0) : lineInfoTextColor
+        table.cell(lineInfoTable, scoreColIndex, liRow, lineInfoBold ? f_bold(liScoreTxt) : liScoreTxt,
+             text_color=liScoreColor, text_size=liTextSize, text_halign=text.align_center, bgcolor=lineInfoBgColor)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PLOTS — CHART LINES
+// ═══════════════════════════════════════════════════════════════════════════
+plot(ema20, title="EMA 20", color=color.new(color.blue, 0), linewidth=2)
+plot(ema50, title="EMA 50", color=color.new(color.orange, 0), linewidth=2)
+plot(ema200, title="EMA 200", color=color.new(color.red, 0), linewidth=3)
+plot(yhat1, title="Kernel Regression", color=krPlotColor, linewidth=2)
+
+var array<int>   dc24hTimeArr  = array.new_int()
+var array<float> dc24hPriceArr = array.new_float()
+
+array.push(dc24hTimeArr, time)
+array.push(dc24hPriceArr, close)
+
+// Keep only ~48h of history (safety buffer) so the array stays small on any timeframe
+while array.size(dc24hTimeArr) > 1 and time - array.get(dc24hTimeArr, 0) > 172800000
+    array.shift(dc24hTimeArr)
+    array.shift(dc24hPriceArr)
+
+int   dc24hTarget      = time - 86400000
+float previousDayClose = na
+if array.size(dc24hTimeArr) > 0
+    for i = array.size(dc24hTimeArr) - 1 to 0
+        if array.get(dc24hTimeArr, i) <= dc24hTarget
+            previousDayClose := array.get(dc24hPriceArr, i)
+            break
+
+float dayChangePct = (not na(previousDayClose) and previousDayClose != 0) ? ((close - previousDayClose) / previousDayClose) * 100 : na
+
+plot(dayChangePct, title="Day Change %", display=display.data_window, precision=2)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INTMAKER DAY COUNT — DATA WINDOW / SCREENER COLUMN ONLY
+// ═══════════════════════════════════════════════════════════════════════════
+plot(intMakerDayCount, title="INTMAKER Day Count", display=display.data_window)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 🏆 SCORE PLOTS — DATA WINDOW / SCREENER COLUMNS ONLY
+// ═══════════════════════════════════════════════════════════════════════════
+plot(totalScore,      title="Total Score",       display=display.data_window)
+plot(totalScorePct,   title="Total Score %",     display=display.data_window, precision=1)
+plot(dailyScoreTotal, title="Daily Score Total", display=display.data_window)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 🏷️ INDIVIDUAL LABEL SIGNAL PLOTS — DATA WINDOW / SCREENER COLUMNS
+// ═══════════════════════════════════════════════════════════════════════════
+plot(kernelSignal     ? 1 : 0, title="KERNEL Signal",      display=display.data_window)
+plot(ema200Signal     ? 1 : 0, title="EMA200 Signal",      display=display.data_window)
+plot(emaMakerSignal   ? 1 : 0, title="EMAKER Signal",      display=display.data_window)
+plot(kmakerSignal     ? 1 : 0, title="KMAKER Signal",      display=display.data_window)
+plot(kmakerOnlySignal ? 1 : 0, title="KMAKER Only Signal", display=display.data_window)
+plot(intMakerSignal   ? 1 : 0, title="INTMAKER Signal",    display=display.data_window)
+plot(intMakerTrigger  ? 1 : 0, title="INTMAKER Trigger",   display=display.data_window)
+plot(ktoucherSignal   ? 1 : 0, title="KTOUCHER Signal",    display=display.data_window)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 🏷️ PER-LABEL EVENT SCORE PLOTS — DATA WINDOW / SCREENER COLUMNS
+// ═══════════════════════════════════════════════════════════════════════════
+plot(scoreKernel,     title="KERNEL Score",         display=display.data_window)
+plot(scoreEma200,     title="EMA200 Score",         display=display.data_window)
+plot(scoreEmaker,     title="EMAKER Score",         display=display.data_window)
+plot(scoreKmaker,     title="KMAKER Score",         display=display.data_window)
+plot(scoreIntmaker,   title="INTMAKER Score",       display=display.data_window)
+plot(scoreKtoucher,   title="KTOUCHER Score",       display=display.data_window)
+plot(scoreBounce,     title="ASZE Bounce Score",    display=display.data_window)
+plot(scoreSpring,     title="ASZE Spring Score",    display=display.data_window)
+plot(scoreBreakout,   title="ASZE Breakout Score",  display=display.data_window)
+plot(scoreConfluence, title="Confluence Bonus Score", display=display.data_window)
+plot(scoreMacd,       title="MACD Bullish Score",   display=display.data_window)
+plot(scoreRsi,        title="RSI Bullish Score",    display=display.data_window)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// KERNEL LABEL  (1 point)
+// ═══════════════════════════════════════════════════════════════════════════
+if kernelSignal
+    label.new(x=bar_index, y=na, text="KERN", yloc=yloc.belowbar, style=label.style_label_up, color=color.new(color.green, 0), textcolor=color.white, size=size.small)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EMA 200 LABEL  (1 point)
+// ═══════════════════════════════════════════════════════════════════════════
+if ema200Signal
+    label.new(x=bar_index, y=na, text="E200", yloc=yloc.belowbar, style=label.style_label_up, color=color.new(color.blue, 0), textcolor=color.white, size=size.small)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EMAKER LABEL  (1 point)
+// ═══════════════════════════════════════════════════════════════════════════
+if emaMakerSignal
+    label.new(x=bar_index, y=na, text="EMAKR", yloc=yloc.belowbar, style=label.style_label_up, color=color.new(color.purple, 0), textcolor=color.white, size=size.small)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// KMAKER / INTMAKER LABELS
+// ═══════════════════════════════════════════════════════════════════════════
+if kmakerOnlySignal
+    label.new(x=bar_index, y=na, text="KMAKR", yloc=yloc.belowbar, style=label.style_label_up, color=color.new(color.teal, 0), textcolor=color.white, size=size.small)
+
+if intMakerTrigger
+    label.new(x=bar_index, y=na, text="INT " + str.tostring(intMakerDayCount), yloc=yloc.belowbar, style=label.style_label_up, color=color.new(color.maroon, 0), textcolor=color.white, size=size.small)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// KTOUCHER LABEL  (1 point)
+// ═══════════════════════════════════════════════════════════════════════════
+if ktoucherSignal
+    label.new(x=bar_index, y=na, text="KTOUCH", yloc=yloc.abovebar, style=label.style_label_down, color=color.new(color.fuchsia, 0), textcolor=color.white, size=size.small)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ALERTS
+// ═══════════════════════════════════════════════════════════════════════════
+bool combined = kernelSignal or ema200Signal or emaMakerSignal or kmakerSignal or intMakerSignal or ktoucherSignal
+
+
+bool threshold_idea = totalScore >= scoreAlertThreshold
+
+
+bool masterAnySignal = aAny or (kernelSignal or ema200Signal or emaMakerSignal or kmakerSignal or intMakerSignal or ktoucherSignal)
+
+
+
+// ── V4 user inputs ─────────────────────────────────────────────────────────
+groupCustom = "🔔 V4 · Midpoint Touch Alert"
+midAlertMinClass = input.string("STRONG+", "Midpoint-touch alert · minimum zone class", options = ["NORMAL+", "STRONG+", "MAJOR only"], group = groupCustom, tooltip = "Alert fires only when the STRONGEST active zone (the one in the top-right panel) is at least this class. NORMAL+ = 2+, STRONG+ = 3+ (STRONG or MAJOR), MAJOR only = 4 (MAJOR only).")
+midAlertNeedHTF  = input.bool(false, "Midpoint-touch alert · require HTF confluence (YES)", group = groupCustom, tooltip = "ON = alert only when the strongest zone also has HTF confluence (YES in panel).")
+
+groupSniper = "🎯 V4 · A+ Sniper Alert"
+sniperMinScore     = input.float(5.0,  "A+ minimum Total Score (0-12)", minval=0, maxval=12, step=0.5, group=groupSniper, tooltip="Total Score (the panel SCORE x/12) must be at least this value on the alert bar.")
+sniperMinZoneScr   = input.float(80.0, "A+ minimum Zone Score (80 = MAJOR)", minval=0, maxval=100, step=5, group=groupSniper, tooltip="The strongest active zone's 0-100 score must be at least this. 80 = MAJOR class.")
+sniperSpringWindow = input.int(0,      "Spring fired within N bars (0 = same bar only)", minval=0, maxval=10, group=groupSniper, tooltip="0 = pure sniper: spring and ALL other conditions must be on the SAME candle. 1-2 = the spring may have fired 1-2 bars ago; alert still fires while other conditions line up (useful for retest entries).")
+sniperBgHighlight  = input.bool(true,  "Highlight A+ bars (aqua background)", group=groupSniper, tooltip="Paints an aqua background on every bar where the A+ condition is true — easy to verify in Bar Replay / history.")
+
+float midMinCls    = midAlertMinClass == "NORMAL+" ? 2.0 : midAlertMinClass == "STRONG+" ? 3.0 : 4.0
+bool  midTouchRaw  = sActive > 0 and not na(sMid) and low <= sMid and low[1] > sMid and low >= sLow
+bool  midTouchAlert = midTouchRaw and sStrength >= midMinCls and (not midAlertNeedHTF or sHtfCon)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ALERT 2 · SPRING QUALITY (existing false-break/spring + RSI momentum gate)
+// ═══════════════════════════════════════════════════════════════════════════
+bool springQuality = aSpring and rsi14 > 50
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ALERT 3 · A+ SNIPER = SPRING + MAJOR(80+) zone + HTF YES + Total Score ≥ N
+// ═══════════════════════════════════════════════════════════════════════════
+int  springSince  = ta.barssince(evSpring)
+bool springReady  = sniperSpringWindow <= 0 ? evSpring : (evSpring or (not na(springSince) and springSince <= sniperSpringWindow))
+bool aPlusSetup   = springReady and sActive > 0 and not na(sScore) and sScore >= sniperMinZoneScr and sHtfCon and totalScore >= sniperMinScore
+
+// ── V4 alertcondition entries (appear in the alert dropdown) ──────────────
+
+// ── V4 dynamic alert() with full price details ─────────────────────────────
+// (to receive these, create the alert with condition = "Any alert() function call")
+if in_alerts and midTouchAlert
+    alert("MID-TOUCH " + syminfo.ticker + ": zone " + str.tostring(sLow, format.mintick) + " – " + str.tostring(sHigh, format.mintick) + " | MID " + str.tostring(sMid, format.mintick) + " tested @ " + str.tostring(low, format.mintick) + ". Watch for bounce/spring confirm.", alert.freq_once_per_bar_close)
+
+if in_alerts and aPlusSetup
+    alert("🎯 A+ " + syminfo.ticker + " @ " + str.tostring(close, format.mintick) + " | Zone " + str.tostring(sLow, format.mintick) + "-" + str.tostring(sHigh, format.mintick) + " (zone score " + str.tostring(sScore, "#") + ") | TotalScore " + str.tostring(totalScore, "#") + "/12 | SPRING+MAJOR+HTF ✔", alert.freq_once_per_bar_close)
+
+// ── V4 visual proof + data-window exports (for Bar Replay verification) ───
+bgcolor(sniperBgHighlight and aPlusSetup ? color.new(color.aqua, 65) : na, title = "V4 · A+ Setup bar")
+//plot(midTouchAlert ? 1.0 : 0.0, title = "V4 Midpoint Touch",  display = display.data_window)
+//plot(springQuality ? 1.0 : 0.0, title = "V4 SPRING Quality",  display = display.data_window)
+//plot(aPlusSetup ? 1.0 : 0.0,    title = "V4 A+ Setup Signal", display = display.data_window)
+
+float htfBoxTop    = not na(htfBox) ? box.get_top(htfBox)    : na
+float htfBoxBot    = not na(htfBox) ? box.get_bottom(htfBox) : na
+bool  htfZoneActive = htfOn and not htfStopped and not na(htfBoxTop) and not na(htfBoxBot)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ALERT 4 · Any candle whose range overlaps the HTF zone box
+// ═══════════════════════════════════════════════════════════════════════════
+bool htfCandleInside = htfZoneActive and low <= htfBoxTop and high >= htfBoxBot
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ALERT 5 · Candle inside the HTF zone box AND any combined Intmaker signal
+//   fires on the same bar (reuses the existing `intmakerAnySignal` flag —
+//   the same one already used for the Confluence Bonus score component).
+// ═══════════════════════════════════════════════════════════════════════════
+bool htfInsideAndCombined = htfCandleInside and intmakerAnySignal
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ALERT 6 · Candle overlaps the HTF zone box AND closes ABOVE the zone top
+//   (a bullish reaction/breakout signature from inside the HTF zone).
+// ═══════════════════════════════════════════════════════════════════════════
+bool htfInsideCloseAbove = htfCandleInside and close > htfBoxTop
+
+// ── V6 alertcondition entries (appear in the alert dropdown) ──────────────
+// FIXED BUG: Was (htfInsideCloseAbove or htfInsideAndCombined or htfInsideCloseAbove) - duplicate htfInsideCloseAbove, missing htfCandleInside
+// ── V6 dynamic alert() with full price details ─────────────────────────────
+// (to receive these, create the alert with condition = "Any alert() function call")
+if in_alerts and htfCandleInside
+    alert("HTF ZONE TOUCH " + syminfo.ticker + ": candle inside HTF zone " + str.tostring(htfBoxBot, format.mintick) + " – " + str.tostring(htfBoxTop, format.mintick) + " @ " + str.tostring(close, format.mintick) + ".", alert.freq_once_per_bar_close)
+
+if in_alerts and htfInsideAndCombined
+    alert("HTF ZONE + SIGNAL " + syminfo.ticker + ": candle inside HTF zone @ " + str.tostring(close, format.mintick) + " with a combined Intmaker signal (KERNEL/EMA200/EMAKER/KMAKER/INTMAKER/KTOUCHER) on the same bar.", alert.freq_once_per_bar_close)
+
+if in_alerts and htfInsideCloseAbove
+    alert("HTF ZONE BREAKOUT " + syminfo.ticker + ": candle inside HTF zone closed ABOVE zone top (" + str.tostring(htfBoxTop, format.mintick) + ") @ " + str.tostring(close, format.mintick) + ".", alert.freq_once_per_bar_close)
+
+// ── V6 data-window exports (for Bar Replay / screener verification) ───────
+plot(htfCandleInside      ? 1.0 : 0.0, title = "V6 HTF Zone Candle Inside",     display = display.data_window)
+plot(htfInsideAndCombined ? 1.0 : 0.0, title = "V6 HTF Zone + Combined Signal", display = display.data_window)
+plot(htfInsideCloseAbove  ? 1.0 : 0.0, title = "V6 HTF Zone Close Above Top",   display = display.data_window)
+
+
+
+groupZoneInside = "🔔 V7 · Strong/Major Zone Inside Alert"
+zoneInsideMinClass = input.string("STRONG+", "Zone-inside alert · minimum zone class", options = ["STRONG+", "MAJOR only"], group = groupZoneInside, tooltip = "Fires when the CURRENT CANDLE'S RANGE overlaps the STRONGEST ACTIVE zone (same zone shown in the top-right panel), and that zone is at least this class. STRONG+ = STRONG or MAJOR (score >= 60). MAJOR only = score >= 80.")
+zoneInsideBgHighlight = input.bool(false, "Highlight bars where candle is inside STRONG/MAJOR zone (orange background)", group = groupZoneInside)
+
+// ── V7 helper: minimum class threshold + full candle-range overlap test ────
+float zoneInsideMinCls      = zoneInsideMinClass == "MAJOR only" ? 4.0 : 3.0
+bool  zoneCandleOverlap     = sActive > 0 and not na(sLow) and not na(sHigh) and low <= sHigh and high >= sLow
+bool  zoneStrongMajorInside = zoneCandleOverlap and sStrength >= zoneInsideMinCls
+
+// ── V7 alertcondition entry (appears in the alert dropdown) ───────────────
+bool zoneStrongMajorhtfInsideCombined = (zoneStrongMajorInside or htfCandleInside) and intmakerAnySignal
+bool zoneStrongMajorhtfInsideCombinedprev = ((zoneStrongMajorInside[1] or htfCandleInside[1]) and intmakerAnySignal[1]) or  ((zoneStrongMajorInside[2] or htfCandleInside[2]) and intmakerAnySignal[2])
+
+// ── V7 dynamic alert() with full price/class detail ────────────────────────
+// (to receive this, create the alert with condition = "Any alert() function call")
+if in_alerts and zoneStrongMajorInside
+    alert("ZONE INSIDE " + syminfo.ticker + ": candle inside " + (sStrength >= 4.0 ? "MAJOR" : "STRONG") + " support zone " + str.tostring(sLow, format.mintick) + " – " + str.tostring(sHigh, format.mintick) + " (zone score " + str.tostring(sScore, "#") + ") @ " + str.tostring(close, format.mintick) + ".", alert.freq_once_per_bar_close)
+
+// ── V7 visual proof + data-window export (for Bar Replay verification) ────
+bgcolor(zoneInsideBgHighlight and zoneStrongMajorInside ? color.new(color.orange, 70) : na, title = "V7 · Strong/Major Zone Inside bar")
+//plot(zoneStrongMajorhtfInsideCombined ? 1.0 : 0.0, title = "V7 Zone Inside STRONG/MAJOR/HTF_COMBINED", display = display.data_window)
+//plot(htfInsideAndCombined ? 1.0 : 0.0, title = "V6 HTF Zone + Combined Signal", display = display.data_window)
+
+groupSlope = "🔔 V8 · Slope Alignment Alert"
+slopeMaxStreakBars = input.int(3, "Fire only on 1st…Nth consecutive bar of setup", minval = 1, maxval = 10, group = groupSlope, tooltip = "Once the raw SLOPE condition has been true for MORE than this many consecutive bars, the alert stops firing — prevents repeated alerts on a long-running trend. Resets the moment the condition goes false again.")
+slopeBgHighlight = input.bool(false, "Highlight bars where SLOPE alignment is true (lime background)", group = groupSlope)
+
+// ── V8 helper conditions (raw, unfiltered) ─────────────────────────────────
+bool slopeKernelGreen   = krPlotColor == krBullColor                                   // Kernel line currently plotted bullish (green)
+bool slopeStackAligned  = yhat1 > ema20 and ema20 > ema50 and ema50 > ema200            // stacked bullish order (same math as kernelEmaStructure)
+bool slopeKernelRising  = yhat1  > yhat1[1]
+bool slopeEma20Rising   = ema20  > ema20[1]
+bool slopeEma50Rising   = ema50  > ema50[1]
+bool slopeEma200Rising  = ema200 > ema200[1]
+bool slopeAllRising     = slopeKernelRising and slopeEma20Rising and slopeEma50Rising and slopeEma200Rising
+
+bool slopeSignalRaw = slopeKernelGreen and slopeStackAligned and slopeAllRising
+
+// ── V8 streak counter: track consecutive TRUE bars, reset on any FALSE bar ─
+var int slopeStreakCount = 0
+if slopeSignalRaw
+    slopeStreakCount := nz(slopeStreakCount[1]) + 1
+else
+    slopeStreakCount := 0
+
+// ── V8 final gated signal: only bars 1..N of a fresh streak ───────────────
+bool slopeSignal = slopeSignalRaw and slopeStreakCount <= slopeMaxStreakBars
+
+// ── V8 alertcondition entry (appears in the alert dropdown) ───────────────
+
+// ── V8 dynamic alert() with full line-value + streak detail ────────────────
+// (to receive this, create the alert with condition = "Any alert() function call")
+//if in_alerts and slopeSignal
+//    alert("SLOPE " + syminfo.ticker + " [bar " + str.tostring(slopeStreakCount) + " of setup]: Kernel " + str.tostring(yhat1, format.mintick) + " > EMA20 " + str.tostring(ema20, format.mintick) + " > EMA50 " + str.tostring(ema50, format.mintick) + " > EMA200 " + str.tostring(ema200, format.mintick) + " — all rising @ " + str.tostring(close, format.mintick) + ".", alert.freq_once_per_bar_close)
+
+// ── V8 visual proof + data-window exports (for Bar Replay verification) ───
+bgcolor(slopeBgHighlight and slopeSignal ? color.new(color.lime, 70) : na, title = "V8 · Slope Alignment bar")
+plot(slopeSignal ? 1.0 : 0.0,     title = "V8 Slope Alignment Signal (limited)", display = display.data_window)
+//plot(slopeSignalRaw ? 1.0 : 0.0,  title = "V8 Slope Alignment Signal (raw)",     display = display.data_window)
+//plot(slopeStreakCount,            title = "V8 Slope Streak Count",               display = display.data_window)
+
+bool zoneStrongMajorhtfInsideCombinedSlope = zoneStrongMajorhtfInsideCombined and slopeSignal
+if slopeSignal
+    label.new(bar_index, low,"SLOPE", style = label.style_label_up, color = color.lime, textcolor = color.black, size = size.small)
+
+
+bool slopeSignalMajorZoneWickOpen = slopeSignal and zoneStrongMajorInside and ((low >= sLow and low <= sHigh) or (open >= sLow and open <= sHigh))
+
+
+// ============================================================================
+// NEW · 3RD CONSECUTIVE SLOPE CANDLE
+// Fires ONLY on the 3rd consecutive raw SLOPE candle
+// ============================================================================
+
+bool slopeThirdCandle = slopeSignalRaw and slopeStreakCount == 3
+
+if slopeThirdCandle
+    label.new(bar_index, low, "SLP3", style = label.style_label_up, color = color.lime, textcolor = color.black, size = size.small)
+    // TradingView alert condition — ONLY the 3rd consecutive slope candle
+
+bool slope_idea = slopeSignalMajorZoneWickOpen or slopeThirdCandle
+
+bool overall = threshold_idea and (slope_idea or combined or zoneStrongMajorInside)
+
+
+// ============================================================================
+// ================== ALL ALERT CONDITIONS - CONSOLIDATED AT END ==============
+// Each alert has 1-line explanation directly above it
+// FIXED: Live/Prev HTF Zone bug corrected
+// ============================================================================
+
+// --- ASZE CORE (10) ---
+// 1. New support zone born: 3+ pivots clustered, score>=50, new box drawn
+//alertcondition(aNew, "New support zone detected", "ASZE: a new support zone was confirmed on {{ticker}} at {{close}} — a repeated-rejection support area has formed.")
+// 2. Zone upgraded to STRONG: internal score >=60 (touches, rejections, holds, bounces, volume, age)
+//alertcondition(aStrong, "Strong support detected", "ASZE: STRONG support confirmed on {{ticker}} at {{close}} (score >= 60).")
+// 3. Zone upgraded to MAJOR: score >=80 - strongest zone on chart, many validations
+//alertcondition(aMajor, "Major support detected", "ASZE: MAJOR support confirmed on {{ticker}} at {{close}} (score >= 80).")
+// 4. Valid touch counted: new pivot or wick-probe retested active zone after gap
+//alertcondition(aTouch, "Support touch", "ASZE: a valid touch/test was counted on an active support zone of {{ticker}}.")
+// 5. Bounce: price rejected from support, closed back above mid/high after recent touch
+//alertcondition(aBounce, "Support bounce", "ASZE: support bounce on {{ticker}} — price rejected from a support zone and closed back above it.")
+// 6. Spring / False break: closed below zone then reclaimed above mid within 3 bars (Wyckoff trap)
+//alertcondition(aSpring, "False break / spring", "ASZE: false break (spring) on {{ticker}} — support was briefly broken and reclaimed.")
+// 7. Support breakout: was consolidating near zone then broke above consolidation high with ATR expansion
+//alertcondition(aOut, "Support breakout", "ASZE: support breakout on {{ticker}} — bullish breakout from a support consolidation.")
+// 8. Breakdown: zone invalidated - close below zone / ATR breach / consecutive closes below per invMode
+//alertcondition(aBreak, "Support breakdown", "ASZE: support breakdown on {{ticker}} at {{close}} — a support zone was decisively broken.")
+// 9. S->R reversal: broken support now acting as resistance (high retested zone, close below mid)
+//alertcondition(aRev, "Support becomes resistance", "ASZE: role reversal on {{ticker}} — broken support is now acting as resistance (S to R).")
+// 10. Any ASZE event: catch-all for any of the 9 above
+//alertcondition(aAny, "Any support event", "ASZE: a support-zone event occurred on {{ticker}} (new zone, touch, bounce, spring, breakout, break or reversal).")
+
+// --- COMBINED INTMAKER ENGINE (2) ---
+// 11. Combined live: any KERNEL / EMA200 / EMAKER / KMAKER / INTMAKER / KTOUCHER signal on current bar
+//alertcondition(combined, title="Combined", message="KERNEL / EMA200 / EMAKER / KMAKER / INTMAKER / KTOUCHER Signal on {{ticker}} at {{close}} - Main entry engine")
+// 12. Combined prev bar: same as Combined but on previous closed bar [1] - for confirmed non-repaint alerts (DISABLED - uncomment to use)
+//alertcondition(kernelSignal[1] or ema200Signal[1] or emaMakerSignal[1] or kmakerSignal[1] or intMakerSignal[1] or ktoucherSignal[1], title="Combined Prev", message="KERNEL / EMA200 / EMAKER / KMAKER / INTMAKER Signal PREV BAR on {{ticker}} at {{close}}")
+
+// --- SCORE SYSTEM (3) ---
+// 13. Score threshold reached: total score 0-12 >= threshold (default 4) - live every bar above threshold
+//alertcondition(threshold_idea, title="Score Threshold Reached", message="Total Score {{ticker}} reached >= threshold at {{close}} - Score: check panel")
+// 14. Score threshold crossover: fires ONLY once when score crosses UP through threshold - less spam (DISABLED)
+//alertcondition(ta.crossover(totalScore, scoreAlertThreshold), title="Score Threshold Crossover", message="Total Score just crossed above alert threshold on {{ticker}} at {{close}}")
+// 15. Master any engine: ASZE any event OR Intmaker combined - ultimate catch-all (DISABLED)
+//alertcondition(masterAnySignal, title="MASTER · Any Engine Signal", message="MASTER ALERT: a signal fired from ASZE and/or Intmaker on {{ticker}} at {{close}}.")
+
+// --- V4 MIDPOINT & SNIPER (3) ---
+// 16. V4 Midpoint touch: current low crossed below strongest zone midpoint for first time + class filter + optional HTF (DISABLED)
+///alertcondition(midTouchAlert, title="🔔 V4 · Zone Midpoint Touch", message="MIDPOINT TOUCH on {{ticker}} at {{close}} — fresh candle tested strongest zone's midpoint. Watch for bounce/spring!")
+// 17. V4 Spring quality: ASZE spring + RSI>50 momentum filter - high-quality reclaim
+//alertcondition(springQuality, title="🔔 V4 · SPRING Quality (RSI>50)", message="SPRING + RSI>50 on {{ticker}} at {{close}} — high-quality false-break reclaim setup. Run checklist!")
+// 18. V4 A+ Sniper: Spring + MAJOR zone 80+ + HTF confluence YES + TotalScore>=5 (or your setting) - best setup
+//alertcondition(aPlusSetup, title="🎯 V4 · A+ SNIPER (SPRING+MAJOR+HTF+SCORE)", message="🎯 A+ SETUP on {{ticker}} at {{close}} — SPRING reclaim inside MAJOR (80+) support + HTF confluence + Score gate passed. Execute plan!")
+
+// --- V6 HTF ZONE (5) ---
+// 19. V6 HTF Candle Inside: current candle range overlaps HTF box (W default) - simple HTF touch (DISABLED)
+//alertcondition(htfCandleInside, title="🔷 V6 · HTF Zone · Candle Inside", message="HTF ZONE TOUCH on {{ticker}} at {{close}} — candle is inside higher-timeframe support zone.")
+// 20. V6 HTF Inside + Combined Signal: HTF touch AND any Intmaker signal same bar - confluence (DISABLED)
+//alertcondition(htfInsideAndCombined, title="🔷 V6 · HTF Zone Inside + Combined Signal", message="HTF ZONE + SIGNAL on {{ticker}} at {{close}} — HTF zone + KERNEL/EMA200/EMAKER/KMAKER/INTMAKER/KTOUCHER confluence!")
+// 21. V6 HTF Inside + Close Above Top: was inside HTF zone and closed above top - bullish breakout from HTF demand (DISABLED)
+//alertcondition(htfInsideCloseAbove, title="🔷 V6 · HTF Zone Inside + Close Above Top", message="HTF ZONE BREAKOUT on {{ticker}} at {{close}} — candle overlapped HTF zone and closed ABOVE top.")
+// 22. Live HTF Zone ALL-IN-ONE: FIXED BUG - was duplicate, now htfCandleInside OR htfInsideAndCombined OR htfInsideCloseAbove - any HTF activity live
+//alertcondition(htfCandleInside or htfInsideAndCombined or htfInsideCloseAbove, title="Live HTF Zone", message="HTF ZONE All categories on {{ticker}} at {{close}} — candle overlapped HTF zone (touch, signal confluence, or close above top).")
+// 23. Prev HTF Zone ALL-IN-ONE: same as Live but previous bar [1] - for confirmed close - FIXED BUG same as above
+//alertcondition(htfCandleInside[1] or htfInsideAndCombined[1] or htfInsideCloseAbove[1], title="Prev HTF Zone", message="HTF ZONE All categories PREV BAR on {{ticker}} at {{close}} — previous candle overlapped HTF zone. Confirmation.")
+
+// --- V7 STRONG/MAJOR ZONE INSIDE (3) ---
+// 24. V7 Candle Inside STRONG/MAJOR: current candle overlaps strongest active zone (panel) AND that zone >= STRONG (60+) or MAJOR (80+)
+//alertcondition(zoneStrongMajorInside, title="🔔 V7 · Candle Inside STRONG/MAJOR Zone", message="ZONE INSIDE on {{ticker}} at {{close}} — candle is inside a STRONG/MAJOR support zone.")
+// 25. V7 Inside + Signal: (STRONG/MAJOR OR HTF) zone overlap + any Intmaker signal same bar - location+signal confluence (DISABLED)
+//alertcondition(zoneStrongMajorhtfInsideCombined, title="🔔 V7 · Candle InsideAnySignal", message="ZONE + SIGNAL on {{ticker}} at {{close}} — candle inside STRONG/MAJOR/HTF zone + signal fired.")
+// 26. V7 Inside + Signal Prev: same as 25 but allows 1-2 bar delay - checks [1] and [2] for delayed confirmation (DISABLED)
+//alertcondition(zoneStrongMajorhtfInsideCombinedprev, title="🔔 V7 · Candle InsideAnySignal Prev", message="ZONE + SIGNAL PREV on {{ticker}} at {{close}} — delayed confirmation inside zone.")
+
+// --- V8 SLOPE ALIGNMENT (6) ---
+// 27. V8 Slope Alignment: Kernel green AND yhat1>EMA20>EMA50>EMA200 stacked AND all 4 rising vs prev bar - early trend first N bars (DISABLED - uses streak limiter)
+//alertcondition(slopeSignal, title="🔔 V8 · SLOPE · Kernel>EMA20>EMA50>EMA200 (All Rising)", message="SLOPE ALIGNMENT on {{ticker}} at {{close}} — Kernel(green) > EMA20 > EMA50 > EMA200, all rising. Early setup.")
+// 28. V7 Slope + InsideCombined: slope alignment + (STRONG/MAJOR/HTF inside + signal) - slope with location (DISABLED - redundant)
+//alertcondition(slopeSignal or zoneStrongMajorhtfInsideCombinedSlope, title="🔔 V7 ·Slope", message="SLOPE + ZONE COMBO on {{ticker}} at {{close}} — slope inside strong/major zone.")
+// 29. Slope in Major Zone Wick/Open Inside: slope aligned AND inside STRONG/MAJOR AND (low or open inside zone) - precise open-inside-demand entry (DISABLED)
+//alertcondition(slopeSignalMajorZoneWickOpen, title="🔔 Slope in Major Zone · Wick/Open Inside", message="Slope in Major Zone — wick or open inside STRONG/MAJOR support on {{ticker}} at {{close}}.")
+// 30. Slope 3rd Consecutive Candle: raw slope true for exactly 3 bars in a row - momentum entry on 3rd bar (DISABLED)
+//alertcondition(slopeThirdCandle, title="🔔 SLOPE · 3rd Consecutive Candle", message="3rd consecutive SLOPE candle on {{ticker}} at {{close}}.")
+// 31. Slope WICKS: Combines 29 + 30 - (Wick/Open inside major with slope) OR (3rd consecutive slope) - 2 high-prob slope patterns
+//alertcondition(slope_idea, title="🔔 SLOPE _ WICKS", message="SLOPE WICKS on {{ticker}} at {{close}} — Wick/Open inside MAJOR with slope OR 3rd consecutive slope candle.")
+
+// --- FINAL OVERALL (1) ---
+// 32. OVERALLS: FINAL quality gate - Score>=threshold AND (Slope_Wicks OR Combined OR Inside Strong/Major) - eliminates noise
+//alertcondition(overall, title="OVERALLS", message="OVERALLS on {{ticker}} at {{close}} — Score gate passed + (Slope or Signal or Strong Zone). High-quality filtered alert.")
+
+// ============================================================================
+// ================== NEW ALERT CONDITIONS (ACTIVE) ===========================
+// Old alerts above are now COMMENTED as requested
+// ============================================================================
+
+// NEW 1 · (Strong OR Major support inside) + Score Threshold + (Kernel/Kmaker/Intmaker/Ktoucher/Slope)
+// Logic: Strong/Major zone inside AND totalScore>=threshold AND any high-quality signal
+
+bool priceInsideStrongMajor =  sActive > 0 and  not na(sLow) and  not na(sHigh) and  close >= sLow and  close <= sHigh and  sScore >= 60.0
+
+bool newAlert1_core =  priceInsideStrongMajor and   threshold_idea and   (kernelSignal or kmakerSignal or intMakerSignal or ktoucherSignal or slopeSignal)
+
+alertcondition( newAlert1_core,  title="NEW 1 · PRICE INSIDE STRONG/MAJOR + SCORE + SIGNAL",  message="NEW 1 on {{ticker}} at {{close}} — Price inside STRONG/MAJOR support + Score>=threshold + signal confluence!")

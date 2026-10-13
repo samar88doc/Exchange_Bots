@@ -1,0 +1,2558 @@
+//@version=5
+// Revision: SLOPE / SLOPE 3RD ported from ASZEIC (Intmaker kernel yhat1B).
+// Existing signal math is unchanged. Safe weight cuts only:
+//   • MACD rising-streak loop stops at the first failure (same true/false)
+//   • kernel-buy high line extends on the last bar only (same final segment)
+//   • Auto-SR draw loops cache array.size (same levels)
+indicator("Shasha_ORIG + SLOPE_v1", overlay=true, max_lines_count=500, max_labels_count=500, explicit_plot_zorder=true)
+
+max_bars_back(time, 4950)
+max_bars_back(open, 2000)
+max_bars_back(high, 2000)
+max_bars_back(low, 2000)
+max_bars_back(close, 2000)
+max_bars_back(volume, 2000)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 1 — SHARED INPUTS (byte-identical in both originals)
+// ─────────────────────────────────────────────────────────────────────────────
+ema20_length  = input.int(20,  title="EMA 20 Length",  group="EMA Lines")
+ema50_length  = input.int(50,  title="EMA 50 Length",  group="EMA Lines")
+ema200_length = input.int(200, title="EMA 200 Length", group="EMA Lines")
+ema20_source  = input.source(close, title="EMA 20 Source",  group="EMA Lines")
+ema50_source  = input.source(close, title="EMA 50 Source",  group="EMA Lines")
+ema200_source = input.source(close, title="EMA 200 Source", group="EMA Lines")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 2 — SHARED CALCULATIONS (identical in both originals; computed once)
+// ─────────────────────────────────────────────────────────────────────────────
+ema20  = ta.ema(ema20_source, ema20_length)
+ema50  = ta.ema(ema50_source, ema50_length)
+ema200 = ta.ema(ema200_source, ema200_length)
+max_bars_back(ema20, 20)
+max_bars_back(ema50, 20)
+max_bars_back(ema200, 20)
+
+float candleRange = high - low            // [S1] candleRange = [S2] candleRange
+bool  candleGreen = close > open          // [S1] curCandleGreen/isGreenCandle = [S2] bullishCandle/ema200BullishCandle/kmakerBullishCandle
+float bodyLow     = math.min(open, close) // [S1] curBodyLow = [S2] currentBodyLow (+ KTOUCHER inline min)
+float bodyHigh    = math.max(open, close) // [S1] curBodyHigh = [S2] liBodyHigh
+float bodyAbs     = math.abs(close - open)// [S1] curAbsBody = [S2] candleBody
+
+bool crossEma20_50 = ta.crossover(ema20, ema50)                       // [S2] ema20CrossEma50 = [S1] inline
+int  barsSinceEma20_50Cross = ta.barssince(crossEma20_50)             // [S1] barsSinceEma2050Cross = [S2] barsSinceEMA20Cross
+
+f_pctInZone(_line, _lo, _hi) =>
+    float _pct = _hi > _lo ? (_line - _lo) / (_hi - _lo) * 100.0 : na
+    _pct
+
+// ─── SECTION 2 INPUTS : MACD ──────────────────────────────────────────────────
+fastLen   = input.int(12, "MACD Fast",   group="MACD Scanner")
+slowLen   = input.int(26, "MACD Slow",   group="MACD Scanner")
+signalLen = input.int(9,  "MACD Signal", group="MACD Scanner")
+emaLen    = input.int(200, "EMA Length", group="MACD Scanner")
+
+// ─── SECTION 3 INPUTS : VOLUME ────────────────────────────────────────────────
+volSmaLen        = input.int(20, title="Volume SMA Length", group="Volume Settings")
+volSpikeMulti    = input.float(1.5, title="Volume Spike Multiplier", group="Volume Settings", step=0.1, minval=1.0)
+volUltraConfirm  = input.bool(false, title="Require Volume Spike for ULTRA BUY", group="Volume Settings")
+showVolBars      = input.bool(false, title="Show Volume Bars", group="Volume Settings")
+showVolSmaLine   = input.bool(false, title="Show Volume SMA Line", group="Volume Settings")
+volHeightPct     = input.float(8.0, title="Volume Bar Max Height % of Chart", group="Volume Settings", step=1.0, minval=2.0, maxval=20.0)
+volBullColor     = input.color(color.new(color.teal, 10), title="Volume Bull Color", group="Volume Settings")
+volBearColor     = input.color(color.new(color.red, 10), title="Volume Bear Color", group="Volume Settings")
+volSpikeColor    = input.color(color.new(color.fuchsia, 0), title="Volume Spike Color", group="Volume Settings")
+volSmaColor      = input.color(color.new(color.yellow, 0), title="Volume SMA Color", group="Volume Settings")
+
+// ─── SECTION 5 INPUTS : CPR ───────────────────────────────────────────────────
+grpCPR = "Central Pivot Range (CPR)"
+showCPR = input.bool(true, title="Show CPR Lines (TC, CP, BC)", group=grpCPR)
+showFill = input.bool(false, title="Show CPR Zone Fill", group=grpCPR)
+colorTC = input.color(color.new(#00E676, 0), title="TC Color", group=grpCPR)
+colorCP = input.color(color.new(#FFD700, 0), title="CP Color", group=grpCPR)
+colorBC = input.color(color.new(#FF4444, 0), title="BC Color", group=grpCPR)
+useNormalizedCprForSignals = input.bool(false, title="Use Normalized TC/BC In Signal Logic (May Change Results)", tooltip="OFF preserves the original raw TC/BC formulas used by v2. The chart display is normalized either way. ON also makes signal logic use max(rawTC, rawBC) as TC and min(rawTC, rawBC) as BC.", group=grpCPR)
+grpRes = "Resistance Levels"
+showRes = input.bool(false, title="Show Resistance Levels (R1, R2, R3)", group=grpRes)
+colorR1 = input.color(color.new(#f30505, 5), title="R1 Color", group=grpRes)
+colorR2 = input.color(color.new(#f30505, 5), title="R2 Color", group=grpRes)
+colorR3 = input.color(color.new(#f30505, 5), title="R3 Color", group=grpRes)
+grpSup = "Support Levels"
+showSup = input.bool(false, title="Show Support Levels (S1, S2, S3)", group=grpSup)
+colorS1 = input.color(color.new(#00E676, 0), title="S1 Color", group=grpSup)
+colorS2 = input.color(color.new(#00E676, 0), title="S2 Color", group=grpSup)
+colorS3 = input.color(color.new(#00E676, 0), title="S3 Color", group=grpSup)
+grpPDHL = "PDH / PDL Lines"
+showPDHL = input.bool(false, title="Show PDH / PDL Lines", group=grpPDHL)
+colorPDH = input.color(color.new(#A9A9A9, 0), title="PDH Color", group=grpPDHL)
+colorPDL = input.color(color.new(#A9A9A9, 0), title="PDL Color", group=grpPDHL)
+grpStyle = "Line Style"
+lineWidth = input.int(2, title="Line Width", minval=1, maxval=4, group=grpStyle)
+lineStyle = input.string("Dotted", title="Projection/Object Line Style", options=["Solid", "Dashed", "Dotted"], tooltip="TradingView plot() has no true dashed/dotted line style. Historical CPR/R/S/PDH/PDL levels therefore use aligned step lines. This setting controls line objects such as tomorrow's projection.", group=grpStyle)
+
+// ─── SECTION 6 INPUTS : NARROW CPR ───────────────────────────────────────────
+grpNarrow = "Narrow CPR Alert Settings"
+enableNarrowAlert = input.bool(true, title="Enable Narrow CPR Alert", group=grpNarrow)
+lookbackBars = input.int(20, title="Lookback Sessions (for Adaptive Width)", group=grpNarrow, minval=5, maxval=60)
+pctExtreme = input.int(5, title="Extremely Narrow — Percentile Rank ≤ (%)", group=grpNarrow, minval=1, maxval=30)
+pctNarrow = input.int(25, title="Narrow — Percentile Rank ≤ (%)", group=grpNarrow, minval=5, maxval=49)
+pctWide = input.int(75, title="Wide — Percentile Rank ≥ (%)", group=grpNarrow, minval=51, maxval=99)
+minTicksForNarrow = input.int(2, title="Minimum Ticks to Qualify as Narrow", group=grpNarrow, minval=1, maxval=20)
+pastBarsLookback = input.int(374, title="Prev Signal Past Bars Limit", group=grpNarrow, minval=1, maxval=375)
+useTrueHtfSessionPercentiles = input.bool(false, title="Use True HTF-Session Percentile History (May Change EN Results)", tooltip="OFF preserves the original v2 result stream. ON fixes the legacy [i] indexing issue on intraday charts by storing one CPR sample per HTF session; this can change isExtremelyNarrow and every dependent signal.", group=grpNarrow)
+
+// ─── SECTION 7 INPUTS : EXTREMELY NARROW LAYERS ──────────────────────────────
+grpEN = "🔬 Extremely Narrow — Advanced Tightening"
+useLayer1 = input.bool(true, title="Layer 1 — Dual Percentile Confirmation", group=grpEN)
+shortLookback = input.int(10, title="L1: Short Lookback Window (sessions)", group=grpEN, minval=3, maxval=20)
+useLayer2 = input.bool(true, title="Layer 2 — Absolute Width% Cap", group=grpEN)
+absWidthPctCap = input.float(0.15, title="L2: Max Absolute CPR Width% Allowed", group=grpEN, minval=0.01, maxval=1.0, step=0.01)
+useLayer3 = input.bool(true, title="Layer 3 — Prior Session Compression", group=grpEN)
+priorSessionMaxRank = input.int(60, title="L3: Prior Session Max Percentile Rank", group=grpEN, minval=10, maxval=90, step=5)
+useLayer4 = input.bool(true, title="Layer 4 — CPR/ATR Compression Ratio", group=grpEN)
+atrLength = input.int(14, title="L4: ATR Length", group=grpEN, minval=5, maxval=50)
+cprAtrRatioMax = input.float(0.08, title="L4: Max CPR/ATR Ratio Allowed", group=grpEN, minval=0.01, maxval=0.50, step=0.01)
+useLayer5 = input.bool(true, title="Layer 5 — Prior Range Contraction", group=grpEN)
+rangeContractionPct = input.int(70, title="L5: Prior Range Percentile Rank ≤ (%)", group=grpEN, minval=10, maxval=90, step=5)
+minLayersRequired = input.int(4, title="Minimum Active Layers That Must Pass", group=grpEN, minval=1, maxval=5)
+
+// ─── SECTION 8 INPUTS : TOMORROW CPR ─────────────────────────────────────────
+grpTomorrow = "Tomorrow's CPR (EOD Projection)"
+showTomCPR = input.bool(true, title="Show Tomorrow's CPR Projection Lines", group=grpTomorrow)
+tomLineExtend = input.int(15, title="Projection Width (bars into future)", group=grpTomorrow, minval=5, maxval=50)
+colorTomTC = input.color(color.new(#00E676, 0), title="Next TC Color", group=grpTomorrow)
+colorTomCP = input.color(color.new(#FFD700, 0), title="Next CP Color", group=grpTomorrow)
+colorTomBC = input.color(color.new(#FF4444, 0), title="Next BC Color", group=grpTomorrow)
+tomCombineLabels = input.bool(true, title="Combine Next TC/CP/BC Labels (prevents overlap)", group=grpTomorrow)
+
+// ─── SECTION 9 INPUTS : DAILY % CHANGE ───────────────────────────────────────
+grpDayChange = "📊 Daily % Change"
+showDayChange = input.bool(true, title="Show Daily % Change in Data Window", group=grpDayChange)
+strongMoveThreshold = input.float(1.0, title="Strong Move Threshold (%)", group=grpDayChange, minval=0.1, maxval=10.0, step=0.1)
+
+// ─── SECTION 10 INPUTS : CPR BREAKOUT ────────────────────────────────────────
+grpBreakout = "🚀 CPR Breakout Pattern (v8)"
+showBreakout = input.bool(true, title="Show CPR Breakout Signals", group=grpBreakout)
+consolidationBars = input.int(5, title="Consolidation Lookback Bars", group=grpBreakout, minval=3, maxval=20)
+consolidationRangePct = input.float(6.0, title="Max Consolidation Range % (Tight Range Cap)", group=grpBreakout, minval=0.5, maxval=20.0, step=0.5)
+breakoutBodyPct = input.float(0.5, title="Min Breakout Body Ratio (0.0–1.0)", group=grpBreakout, minval=0.1, maxval=1.0, step=0.05)
+breakoutVolMult = input.float(1.2, title="Breakout Volume Multiplier", group=grpBreakout, minval=1.0, maxval=5.0, step=0.1)
+ema200ProximityPct = input.float(15.0, title="Max Distance from EMA200 (%) for Breakout", group=grpBreakout, minval=0.5, maxval=50.0, step=0.5)
+cprProximityPct = input.float(3.0, title="CPR Zone Proximity %", group=grpBreakout, minval=0.1, maxval=10.0, step=0.1)
+emaLookbackCross = input.int(10, title="EMA20/50 Cross Lookback (bars)", group=grpBreakout, minval=1, maxval=50)
+showNarrowBreakout = input.bool(true, title="Show Narrow CPR Breakout Signal (Separate)", group=grpBreakout)
+narrowBreakoutBodyPct = input.float(0.5, title="Narrow Breakout: Min Body Ratio", group=grpBreakout, minval=0.1, maxval=1.0, step=0.05)
+
+// ─── SECTION 11 INPUTS : EST ─────────────────────────────────────────────────
+grpEST = "🎯 Entry / Stop Loss / Target (v9)"
+showEST = input.bool(false, title="Show Entry, SL & Target Lines", group=grpEST)
+showESTLabels = input.bool(false, title="Show Entry/SL/Target Price Labels", group=grpEST)
+showESTInfo = input.bool(false, title="Show Info Label (RR, Risk%, Targets)", group=grpEST)
+estLineLookFwd = input.int(20, title="Line Extend (bars forward)", group=grpEST, minval=5, maxval=100, step=5)
+slMethod = input.string("Candle Low", title="Stop Loss Method", options=["Candle Low", "BC (CPR Bottom)", "EMA 20", "ATR Based"], group=grpEST)
+slAtrMult = input.float(1.5, title="SL ATR Multiplier (if ATR Based)", group=grpEST, minval=0.5, maxval=5.0, step=0.1)
+slBufferPct = input.float(0.2, title="SL Buffer % (below SL level)", group=grpEST, minval=0.0, maxval=2.0, step=0.1)
+tgtMethod = input.string("Risk:Reward", title="Target Method", options=["Risk:Reward", "R1 Level", "R2 Level", "R3 Level", "ATR Based"], group=grpEST)
+rrRatio1 = input.float(1.5, title="Target 1 — Risk:Reward Ratio", group=grpEST, minval=0.5, maxval=10.0, step=0.5)
+rrRatio2 = input.float(2.5, title="Target 2 — Risk:Reward Ratio", group=grpEST, minval=0.5, maxval=10.0, step=0.5)
+rrRatio3 = input.float(4.0, title="Target 3 — Risk:Reward Ratio", group=grpEST, minval=0.5, maxval=10.0, step=0.5)
+tgtAtrMult1 = input.float(2.0, title="Target 1 ATR Multiplier", group=grpEST, minval=0.5, maxval=10.0, step=0.5)
+tgtAtrMult2 = input.float(3.0, title="Target 2 ATR Multiplier", group=grpEST, minval=0.5, maxval=10.0, step=0.5)
+tgtAtrMult3 = input.float(5.0, title="Target 3 ATR Multiplier", group=grpEST, minval=0.5, maxval=10.0, step=0.5)
+colorEntry = input.color(color.new(#00E5FF, 0), title="Entry Line Color", group=grpEST)
+colorSL = input.color(color.new(#FF1744, 0), title="Stop Loss Line Color", group=grpEST)
+colorTgt1 = input.color(color.new(#00E676, 0), title="Target 1 Color", group=grpEST)
+colorTgt2 = input.color(color.new(#69F0AE, 0), title="Target 2 Color", group=grpEST)
+colorTgt3 = input.color(color.new(#B9F6CA, 0), title="Target 3 Color", group=grpEST)
+estSource = input.string("All Signals", title="Apply EST to Which Signal?", options=["All Signals", "Super Narrow Bullish", "CPR Breakout", "Narrow CPR Breakout", "MTF Confluence", "Kernel Buy"], group=grpEST)
+
+grpMTF = "🌐 MTF CPR Breakout Confluence (v10)"
+showMTFConfluence = input.bool(true, title="Show MTF Confluence Signal", group=grpMTF)
+mtfHigherTF = input.string("15", title="Higher Timeframe (chart TF)", options=["5", "10", "15", "30", "60", "D"], group=grpMTF)
+mtfMidTF = input.string("5", title="Mid Timeframe", options=["1", "3", "5", "10", "15"], group=grpMTF)
+mtfLowTF = input.string("1", title="Low Timeframe", options=["1", "2", "3", "5"], group=grpMTF)
+mtfMidLookback = input.int(3, title="Mid TF Lookback Candles", group=grpMTF, minval=1, maxval=10)
+mtfLowLookback = input.int(15, title="Low TF Lookback Candles", group=grpMTF, minval=1, maxval=30)
+useConfiguredMtfLookbacks = input.bool(false, title="Use Configured MTF Lookbacks (May Change Results)", tooltip="OFF preserves legacy fixed windows: Mid=10 and Low=15. ON makes the two lookback inputs above control the request calculations.", group=grpMTF)
+mtfVolMult = input.float(1.2, title="MTF Breakout Volume Multiplier", group=grpMTF, minval=1.0, maxval=5.0, step=0.1)
+mtfBodyPct = input.float(0.4, title="MTF Breakout Min Body Ratio", group=grpMTF, minval=0.1, maxval=1.0, step=0.05)
+mtfConsolidationPct = input.float(6.0, title="MTF Consolidation Max Range %", group=grpMTF, minval=0.5, maxval=20.0, step=0.5)
+mtfConsoloBars = input.int(5, title="MTF Consolidation Lookback Bars", group=grpMTF, minval=2, maxval=15)
+requireAllThree = input.bool(true, title="Require ALL 3 TF Confluence (else 2/3)", group=grpMTF)
+showMTFTable = input.bool(true, title="Show MTF Status Table", group=grpMTF)
+tablePos = input.string("Bottom Right", title="Table Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Middle Right"], group=grpMTF)
+
+// ─── SECTION 13 INPUTS : KERNEL ──────────────────────────────────────────────
+grpKernel = "🔮 Kernel Regression"
+krSrc = input.source(close, "Source", group=grpKernel)
+krH = input.float(8.0, "Lookback Window", group=grpKernel, minval=3)
+krR = input.float(8.0, "Relative Weight", group=grpKernel, minval=0.001)
+krX0 = input.int(25, "Start Regression At Bar", group=grpKernel, minval=0, maxval=1000)
+krLag = input.int(5, "Lag (smoothing)", group=grpKernel, minval=1, maxval=1000)
+krWindow = input.int(50, "Kernel Window", group=grpKernel, minval=1, maxval=1000)
+krSmooth = input.bool(true, "Smooth Colors", group=grpKernel)
+krBullColor = input.color(#3AFF17, "Bullish Color", group=grpKernel)
+krBearColor = input.color(#FD1707, "Bearish Color", group=grpKernel)
+showKernel = input.bool(true, "Show Kernel Regression Line", group=grpKernel)
+showKernelSignals = input.bool(true, "Show Kernel Buy/Sell Signals", group=grpKernel)
+useKernelFilter = input.bool(false, "Filter CPR Signals by Kernel Trend", group=grpKernel)
+// krSrc[i] is indexed with the kernel loop counter (i ≤ krN = min(krWindow + krX0, 1999)),
+// i.e. a runtime offset — declare its buffer instead of relying on autodetection.
+max_bars_back(krSrc, 2000)
+
+// ─── SECTION 14 INPUTS : PERF BUY ────────────────────────────────────────────
+grpPerfBuy = "🏆 PERF BUY Settings"
+showPerfBuy = input.bool(true, title="Show PERF BUY Signal", group=grpPerfBuy)
+perfBuyColor = input.color(color.new(#FF6B00, 0), title="PERF BUY Label Color", group=grpPerfBuy)
+showKernelHighLine = input.bool(true, title="Show Kernel Buy High Reference Line", group=grpPerfBuy)
+kernelHighLineColor = input.color(color.new(#3AFF17, 70), title="Kernel High Line Color", group=grpPerfBuy)
+perfBuyMaxBars = input.int(50, title="Max Bars to Watch After Kernel Buy", group=grpPerfBuy, minval=5, maxval=200)
+
+// ─── SECTION 15 INPUTS : ANG ─────────────────────────────────────────────────
+grpAng = "📐 ANG Logic (Slope Angles) + A++ Breakout"
+useAngFilterForBrk = input.bool(true, title="Require ANG (Slope) for A++ Breakout", group=grpAng)
+useKernelFilter_ANG = input.bool(true, title="Filter A++ CPR Breakout by Kernel Trend", group=grpAng)
+showKernelAng = input.bool(true, title="Show KERNEL ANG Label", group=grpAng)
+kernelAngAngle = input.float(20.0, title="Kernel Minimum Angle (Degrees)", group=grpAng)
+showEma20Ang = input.bool(true, title="Show EMA 20 ANG Label", group=grpAng)
+ema20AngAngle = input.float(20.0, title="EMA 20 Minimum Angle (Degrees)", group=grpAng)
+showEma50Ang = input.bool(true, title="Show EMA 50 ANG Label", group=grpAng)
+ema50AngAngle = input.float(15.0, title="EMA 50 Minimum Angle (Degrees)", group=grpAng)
+showEma200Ang = input.bool(true, title="Show EMA 200 ANG Label", group=grpAng)
+ema200AngAngle = input.float(10.0, title="EMA 200 Minimum Angle (Degrees)", group=grpAng)
+
+// ─── CORE CALCULATIONS ───────────────────────────────────────────────────────
+ema200_scanner = ta.ema(close, emaLen)
+[macdLine, macdSignalLine, hist] = ta.macd(close, fastLen, slowLen, signalLen)
+volSma = ta.sma(volume, volSmaLen)
+isVolSpike = volume > volSma * volSpikeMulti
+float candleBody = close - open
+bool rangeOk = candleRange > 0
+
+// ─── KERNEL REGRESSION: weights precomputed once ─────────────────────────────
+int krN = math.min(krWindow + krX0, 1999)
+float krH2Safe = math.max(math.abs(krH - krLag), 0.000001)
+var float[] krW1 = array.new_float(0)
+var float[] krW2 = array.new_float(0)
+var float krDen1 = 0.0
+var float krDen2 = 0.0
+if barstate.isfirst
+    for i = 0 to krN
+        float w1 = math.pow(1 + (i * i) / (2 * krH * krH * krR), -krR)
+        float w2 = math.pow(1 + (i * i) / (2 * krH2Safe * krH2Safe * krR), -krR)
+        array.push(krW1, w1)
+        array.push(krW2, w2)
+        krDen1 += w1
+        krDen2 += w2
+float krNum1 = 0.0
+float krNum2 = 0.0
+for i = 0 to krN
+    float s = krSrc[i]
+    krNum1 += s * array.get(krW1, i)
+    krNum2 += s * array.get(krW2, i)
+float yhat1 = krDen1 != 0 ? krNum1 / krDen1 : na
+float yhat2 = krDen2 != 0 ? krNum2 / krDen2 : na
+max_bars_back(yhat1, 20)  // indexed through f_strongLineFloor(off)'s parameter
+bool krIsBullish = yhat1 > yhat1[1]
+color krPlotColor = krSmooth ? (yhat2 > yhat1 ? krBullColor : krBearColor) : (krIsBullish ? krBullColor : krBearColor)
+bool kernelBullish = krPlotColor == krBullColor
+bool kernelBuy = kernelBullish and krPlotColor[1] == krBearColor
+
+// ─── ULTRA BUY / ULTRA BREAK ─────────────────────────────────────────────────
+emaRising = ema200_scanner >= ema200_scanner[1]
+bullSignal = ta.crossover(hist, 0) and emaRising
+ultraBuyBase = bullSignal and ema200_scanner >= low and ema200_scanner <= high
+ultraBuy = volUltraConfirm ? ultraBuyBase and isVolSpike : ultraBuyBase
+var float markedHigh = na
+var line hLine = na
+var bool waitingBreak = false
+if ultraBuy
+    if not na(hLine)
+        line.delete(hLine)
+    markedHigh := high
+    waitingBreak := true
+    hLine := line.new(bar_index, markedHigh, bar_index + 1, markedHigh, xloc=xloc.bar_index, color=color.fuchsia, width=3, style=line.style_dashed, extend=extend.right)
+if waitingBreak and not ultraBuy and close > markedHigh and candleGreen
+    if not na(hLine)
+        line.delete(hLine)
+    markedHigh := na
+    hLine := na
+    waitingBreak := false
+
+plot(ema20, title="EMA 20", color=color.blue, linewidth=2)
+plot(ema50, title="EMA 50", color=color.orange, linewidth=2)
+plot(ema200, title="EMA 200", color=color.red, linewidth=3)
+plot(showKernel ? yhat1 : na, title="Kernel Regression", color=krPlotColor, linewidth=2)
+bool ema20AboveEma50 = ema20 > ema50
+// ─── AUTO SUPPORT & RESISTANCE: PIVOT CLUSTER ENGINE ─────────────────────────
+grpAutoSR = "📍 Auto Support & Resistance"
+enableAutoSR = input.bool(true, "Enable Automatic S/R", group=grpAutoSR)
+showAutoSupport = input.bool(true, "Show Auto Support", group=grpAutoSR)
+showAutoResistance = input.bool(true, "Show Auto Resistance", group=grpAutoSR)
+srPivotLen = input.int(5, "Pivot Strength (Left / Right)", minval=2, maxval=50, group=grpAutoSR)
+srTolerancePct = input.float(0.35, "Merge Tolerance (%)", minval=0.05, maxval=5.0, step=0.05, group=grpAutoSR)
+srAtrLen = input.int(14, "ATR Length for Merge", minval=1, maxval=100, group=grpAutoSR)
+srAtrMult = input.float(0.15, "ATR Merge Multiplier", minval=0.0, maxval=2.0, step=0.05, group=grpAutoSR)
+srMinTouches = input.int(4, "Minimum Touches", minval=1, maxval=20, group=grpAutoSR)
+srMaxSupport = input.int(1, "Maximum Support Levels", minval=1, maxval=10, group=grpAutoSR)
+srMaxResistance = input.int(1, "Maximum Resistance Levels", minval=1, maxval=10, group=grpAutoSR)
+srExtendBars = input.int(120, "Line Extension (bars)", minval=10, maxval=500, group=grpAutoSR)
+srLineWidth = input.int(1, "S/R Line Width", minval=1, maxval=4, group=grpAutoSR)
+srLineStyleStr = input.string("Solid", "S/R Line Style", options=["Solid", "Dashed", "Dotted"], group=grpAutoSR)
+srSupportColor = input.color(color.new(#00E676, 0), "Auto Support Color", group=grpAutoSR)
+srResistanceColor = input.color(color.new(#FF1744, 0), "Auto Resistance Color", group=grpAutoSR)
+srShowLabels = input.bool(true, "Show S/R Labels", group=grpAutoSR)
+srLabelSizeStr = input.string("Small", "Label Size", options=["Tiny", "Small", "Normal"], group=grpAutoSR)
+srRemoveBroken = input.bool(false, "Remove Broken Levels", group=grpAutoSR)
+srBreakBufferPct = input.float(0.15, "Break Buffer (%)", minval=0.01, maxval=5.0, step=0.05, group=grpAutoSR)
+srLineStyle = srLineStyleStr == "Dashed" ? line.style_dashed : srLineStyleStr == "Dotted" ? line.style_dotted : line.style_solid
+srLabelSize = srLabelSizeStr == "Tiny" ? size.tiny : srLabelSizeStr == "Normal" ? size.normal : size.small
+srPivotHigh = ta.pivothigh(high, srPivotLen, srPivotLen)
+srPivotLow = ta.pivotlow(low, srPivotLen, srPivotLen)
+float srAtrValue = ta.atr(srAtrLen)
+max_bars_back(srAtrValue, 60)  // srAtrValue[srPivotLen], srPivotLen ≤ 50
+var float[] srSupportPrices = array.new_float()
+var int[] srSupportTouches = array.new_int()
+var int[] srSupportLastBar = array.new_int()
+var float[] srResistancePrices = array.new_float()
+var int[] srResistanceTouches = array.new_int()
+var int[] srResistanceLastBar = array.new_int()
+var line[] srSupportLines = array.new_line()
+var label[] srSupportLabels = array.new_label()
+var line[] srResistanceLines = array.new_line()
+var label[] srResistanceLabels = array.new_label()
+f_srTolerance(float price, float pivotAtr) =>
+    float pctTol = price * srTolerancePct / 100.0
+    float atrTol = na(pivotAtr) ? 0.0 : pivotAtr * srAtrMult
+    math.max(pctTol, atrTol)
+if enableAutoSR and not na(srPivotLow)
+    float srPrice = srPivotLow
+    int srBar = bar_index - srPivotLen
+    float srPivotAtr = srAtrValue[srPivotLen]
+    float srTol = f_srTolerance(srPrice, srPivotAtr)
+    bool srMerged = false
+    int srSupSize = array.size(srSupportPrices)
+    if srSupSize > 0
+        for i = 0 to srSupSize - 1
+            float oldPrice = array.get(srSupportPrices, i)
+            if math.abs(oldPrice - srPrice) <= srTol
+                int oldTouches = array.get(srSupportTouches, i)
+                array.set(srSupportPrices, i, (oldPrice * oldTouches + srPrice) / (oldTouches + 1))
+                array.set(srSupportTouches, i, oldTouches + 1)
+                array.set(srSupportLastBar, i, srBar)
+                srMerged := true
+                break
+    if not srMerged
+        array.push(srSupportPrices, srPrice)
+        array.push(srSupportTouches, 1)
+        array.push(srSupportLastBar, srBar)
+if enableAutoSR and not na(srPivotHigh)
+    float srPrice = srPivotHigh
+    int srBar = bar_index - srPivotLen
+    float srPivotAtr = srAtrValue[srPivotLen]
+    float srTol = f_srTolerance(srPrice, srPivotAtr)
+    bool srMerged = false
+    int srResSize = array.size(srResistancePrices)
+    if srResSize > 0
+        for i = 0 to srResSize - 1
+            float oldPrice = array.get(srResistancePrices, i)
+            if math.abs(oldPrice - srPrice) <= srTol
+                int oldTouches = array.get(srResistanceTouches, i)
+                array.set(srResistancePrices, i, (oldPrice * oldTouches + srPrice) / (oldTouches + 1))
+                array.set(srResistanceTouches, i, oldTouches + 1)
+                array.set(srResistanceLastBar, i, srBar)
+                srMerged := true
+                break
+    if not srMerged
+        array.push(srResistancePrices, srPrice)
+        array.push(srResistanceTouches, 1)
+        array.push(srResistanceLastBar, srBar)
+int srMaxStore = 200
+while array.size(srSupportPrices) > srMaxStore
+    array.shift(srSupportPrices)
+    array.shift(srSupportTouches)
+    array.shift(srSupportLastBar)
+while array.size(srResistancePrices) > srMaxStore
+    array.shift(srResistancePrices)
+    array.shift(srResistanceTouches)
+    array.shift(srResistanceLastBar)
+if enableAutoSR and srRemoveBroken and array.size(srSupportPrices) > 0
+    int initialSupSize = array.size(srSupportPrices)
+    for n = 0 to initialSupSize - 1
+        int i = initialSupSize - 1 - n
+        float srLevel = array.get(srSupportPrices, i)
+        if close < srLevel * (1.0 - srBreakBufferPct / 100.0)
+            array.remove(srSupportPrices, i)
+            array.remove(srSupportTouches, i)
+            array.remove(srSupportLastBar, i)
+if enableAutoSR and srRemoveBroken and array.size(srResistancePrices) > 0
+    int initialResSize = array.size(srResistancePrices)
+    for n = 0 to initialResSize - 1
+        int i = initialResSize - 1 - n
+        float srLevel = array.get(srResistancePrices, i)
+        if close > srLevel * (1.0 + srBreakBufferPct / 100.0)
+            array.remove(srResistancePrices, i)
+            array.remove(srResistanceTouches, i)
+            array.remove(srResistanceLastBar, i)
+
+var int[]   selectedSup     = array.new_int()
+var float[] selectedSupDist = array.new_float()
+var int[]   selectedRes     = array.new_int()
+var float[] selectedResDist = array.new_float()
+if barstate.islast
+    array.clear(selectedSup)
+    array.clear(selectedSupDist)
+    if enableAutoSR and showAutoSupport and array.size(srSupportPrices) > 0
+        int srSupDrawSize = array.size(srSupportPrices)
+        for i = 0 to srSupDrawSize - 1
+            float lvl = array.get(srSupportPrices, i)
+            int touches = array.get(srSupportTouches, i)
+            if touches >= srMinTouches and lvl <= close
+                float dist = close - lvl
+                int insertAt = array.size(selectedSupDist)
+                int selSupN = array.size(selectedSupDist)
+                if selSupN > 0
+                    for j = 0 to selSupN - 1
+                        if dist < array.get(selectedSupDist, j)
+                            insertAt := j
+                            break
+                array.insert(selectedSupDist, insertAt, dist)
+                array.insert(selectedSup, insertAt, i)
+                if array.size(selectedSup) > srMaxSupport
+                    array.pop(selectedSup)
+                    array.pop(selectedSupDist)
+    int wantedSup = array.size(selectedSup)
+    while array.size(srSupportLines) > wantedSup
+        line.delete(array.pop(srSupportLines))
+    while array.size(srSupportLines) < wantedSup
+        array.push(srSupportLines, line.new(bar_index, close, bar_index + 1, close, xloc=xloc.bar_index))
+    if wantedSup > 0
+        for slot = 0 to wantedSup - 1
+            int idx = array.get(selectedSup, slot)
+            float lvl = array.get(srSupportPrices, idx)
+            int touches = array.get(srSupportTouches, idx)
+            int safeStartBar = math.max(array.get(srSupportLastBar, idx), bar_index - 4900)
+            color levelColor = touches >= 4 ? color.new(srSupportColor, 0) : color.new(srSupportColor, 20)
+            int levelWidth = touches >= 4 ? math.min(srLineWidth + 1, 4) : srLineWidth
+            line l = array.get(srSupportLines, slot)
+            line.set_xy1(l, safeStartBar, lvl)
+            line.set_xy2(l, bar_index + srExtendBars, lvl)
+            line.set_color(l, levelColor)
+            line.set_width(l, levelWidth)
+            line.set_style(l, srLineStyle)
+            line.set_extend(l, extend.none)
+    if not srShowLabels
+        while array.size(srSupportLabels) > 0
+            label.delete(array.pop(srSupportLabels))
+    else
+        while array.size(srSupportLabels) > wantedSup
+            label.delete(array.pop(srSupportLabels))
+        while array.size(srSupportLabels) < wantedSup
+            array.push(srSupportLabels, label.new(bar_index, close, "", xloc=xloc.bar_index, style=label.style_label_left))
+        if wantedSup > 0
+            for slot = 0 to wantedSup - 1
+                int idx = array.get(selectedSup, slot)
+                float lvl = array.get(srSupportPrices, idx)
+                int touches = array.get(srSupportTouches, idx)
+                color levelColor = touches >= 4 ? color.new(srSupportColor, 0) : color.new(srSupportColor, 20)
+                label lb = array.get(srSupportLabels, slot)
+                label.set_xy(lb, bar_index + srExtendBars, lvl)
+                label.set_text(lb, "AUTO SUPPORT • " + str.tostring(touches) + "x • " + str.tostring(lvl, format.mintick))
+                label.set_color(lb, levelColor)
+                label.set_textcolor(lb, color.black)
+                label.set_size(lb, srLabelSize)
+                label.set_style(lb, label.style_label_left)
+
+    array.clear(selectedRes)
+    array.clear(selectedResDist)
+    if enableAutoSR and showAutoResistance and array.size(srResistancePrices) > 0
+        int srResDrawSize = array.size(srResistancePrices)
+        for i = 0 to srResDrawSize - 1
+            float lvl = array.get(srResistancePrices, i)
+            int touches = array.get(srResistanceTouches, i)
+            if touches >= srMinTouches and lvl >= close
+                float dist = lvl - close
+                int insertAt = array.size(selectedResDist)
+                int selResN = array.size(selectedResDist)
+                if selResN > 0
+                    for j = 0 to selResN - 1
+                        if dist < array.get(selectedResDist, j)
+                            insertAt := j
+                            break
+                array.insert(selectedResDist, insertAt, dist)
+                array.insert(selectedRes, insertAt, i)
+                if array.size(selectedRes) > srMaxResistance
+                    array.pop(selectedRes)
+                    array.pop(selectedResDist)
+    int wantedRes = array.size(selectedRes)
+    while array.size(srResistanceLines) > wantedRes
+        line.delete(array.pop(srResistanceLines))
+    while array.size(srResistanceLines) < wantedRes
+        array.push(srResistanceLines, line.new(bar_index, close, bar_index + 1, close, xloc=xloc.bar_index))
+    if wantedRes > 0
+        for slot = 0 to wantedRes - 1
+            int idx = array.get(selectedRes, slot)
+            float lvl = array.get(srResistancePrices, idx)
+            int touches = array.get(srResistanceTouches, idx)
+            int safeStartBar = math.max(array.get(srResistanceLastBar, idx), bar_index - 4900)
+            color levelColor = touches >= 4 ? color.new(srResistanceColor, 0) : color.new(srResistanceColor, 20)
+            int levelWidth = touches >= 4 ? math.min(srLineWidth + 1, 4) : srLineWidth
+            line l = array.get(srResistanceLines, slot)
+            line.set_xy1(l, safeStartBar, lvl)
+            line.set_xy2(l, bar_index + srExtendBars, lvl)
+            line.set_color(l, levelColor)
+            line.set_width(l, levelWidth)
+            line.set_style(l, srLineStyle)
+            line.set_extend(l, extend.none)
+    if not srShowLabels
+        while array.size(srResistanceLabels) > 0
+            label.delete(array.pop(srResistanceLabels))
+    else
+        while array.size(srResistanceLabels) > wantedRes
+            label.delete(array.pop(srResistanceLabels))
+        while array.size(srResistanceLabels) < wantedRes
+            array.push(srResistanceLabels, label.new(bar_index, close, "", xloc=xloc.bar_index, style=label.style_label_left))
+        if wantedRes > 0
+            for slot = 0 to wantedRes - 1
+                int idx = array.get(selectedRes, slot)
+                float lvl = array.get(srResistancePrices, idx)
+                int touches = array.get(srResistanceTouches, idx)
+                color levelColor = touches >= 4 ? color.new(srResistanceColor, 0) : color.new(srResistanceColor, 20)
+                label lb = array.get(srResistanceLabels, slot)
+                label.set_xy(lb, bar_index + srExtendBars, lvl)
+                label.set_text(lb, "AUTO RESISTANCE • " + str.tostring(touches) + "x • " + str.tostring(lvl, format.mintick))
+                label.set_color(lb, levelColor)
+                label.set_textcolor(lb, color.white)
+                label.set_size(lb, srLabelSize)
+                label.set_style(lb, label.style_label_left)
+
+tomLineStyle = lineStyle == "Dotted" ? line.style_dotted : lineStyle == "Dashed" ? line.style_dashed : line.style_solid
+f_getAutoTF() =>
+    int tfSeconds = timeframe.in_seconds()
+    int tfMins = na(tfSeconds) ? 1 : int(tfSeconds / 60)
+    string result = "D"
+    if tfMins <= 74
+        result := "D"
+    else if tfMins <= 1439
+        result := "W"
+    else
+        result := "M"
+    result
+string autoTF = f_getAutoTF()
+
+[htfHigh, htfLow, htfClose, tomSrcHigh, tomSrcLow, tomSrcClose, htfCurrentSessionTime] = request.security(syminfo.tickerid, autoTF, [high[1], low[1], close[1], high, low, close, time], lookahead=barmerge.lookahead_on, gaps=barmerge.gaps_off)
+max_bars_back(htfHigh, 100)
+max_bars_back(htfLow, 100)
+max_bars_back(htfClose, 100)
+float exactPrevDayClose = request.security(syminfo.tickerid, "1D", close[1], lookahead=barmerge.lookahead_on, gaps=barmerge.gaps_off)
+float pdHigh = htfHigh
+float pdLow = htfLow
+float pdClose = htfClose
+float CP = (pdHigh + pdLow + pdClose) / 3
+float cprRawBC = (pdHigh + pdLow) / 2
+float cprRawTC = (CP - cprRawBC) + CP
+float cprDisplayTC = math.max(cprRawTC, cprRawBC)
+float cprDisplayBC = math.min(cprRawTC, cprRawBC)
+// Compatibility defaults preserve every v2 signal; display stays correctly ordered.
+float TC = useNormalizedCprForSignals ? cprDisplayTC : cprRawTC
+float BC = useNormalizedCprForSignals ? cprDisplayBC : cprRawBC
+float cprWidth = math.abs(TC - BC)
+float cprWidthPct = CP > 0 ? cprWidth / CP * 100 : 0.0
+float R1 = 2 * CP - pdLow
+float R2 = CP + (pdHigh - pdLow)
+float R3 = R1 + (pdHigh - pdLow)
+float S1 = 2 * CP - pdHigh
+float S2 = CP - (pdHigh - pdLow)
+float S3 = S1 - (pdHigh - pdLow)
+float atrValue = ta.atr(atrLength)
+
+
+f_mtfBreakoutCount(int lookback, float bodyPct, float volMult, int volLen, int emaFastLen, int emaSlowLen) =>
+    float volSmaLocal = ta.sma(volume, volLen)
+    float emaFastLoc = ta.ema(close, emaFastLen)
+    float emaSlowLoc = ta.ema(close, emaSlowLen)
+    bool emaBullLoc = emaFastLoc > emaSlowLoc
+    float volThresh = volSmaLocal * volMult
+    float cnt = 0.0
+    for i = 0 to lookback - 1
+        float rng = high[i] - low[i]
+        bool bodyOK = rng > 0 and (close[i] - open[i]) / rng >= bodyPct
+        if close[i] > open[i] and bodyOK and volume[i] > volThresh and emaBullLoc
+            cnt += 1.0
+    cnt
+
+int mtfMidCalcLookback = useConfiguredMtfLookbacks ? mtfMidLookback : 10
+int mtfLowCalcLookback = useConfiguredMtfLookbacks ? mtfLowLookback : 15
+float midTF_count_raw = request.security(syminfo.tickerid, mtfMidTF, f_mtfBreakoutCount(mtfMidCalcLookback, mtfBodyPct, mtfVolMult, volSmaLen, ema20_length, ema50_length), lookahead=barmerge.lookahead_off, gaps=barmerge.gaps_off)
+bool midTF_confirmed = midTF_count_raw >= 1.0
+int midTF_count = int(midTF_count_raw)
+float lowTF_count_raw = request.security(syminfo.tickerid, mtfLowTF, f_mtfBreakoutCount(mtfLowCalcLookback, mtfBodyPct, mtfVolMult, volSmaLen, ema20_length, ema50_length), lookahead=barmerge.lookahead_off, gaps=barmerge.gaps_off)
+bool lowTF_confirmed = lowTF_count_raw >= 1.0
+int lowTF_count = int(lowTF_count_raw)
+
+float dayChangePct = not na(exactPrevDayClose) and exactPrevDayClose != 0 ? (close - exactPrevDayClose) / exactPrevDayClose * 100 : 0.0
+float dayChangeAbs = math.abs(dayChangePct)
+int dayChangeDir = dayChangePct > 0.001 ? 1 : dayChangePct < -0.001 ? -1 : 0
+bool isStrongMove = dayChangeAbs >= strongMoveThreshold
+color dayChangeColor = dayChangeDir == 1 ? (isStrongMove ? color.new(#00E676, 0) : color.new(#4CAF50, 0)) : dayChangeDir == -1 ? (isStrongMove ? color.new(#FF1744, 0) : color.new(#FF4444, 0)) : color.new(#A9A9A9, 0)
+
+// ─── PERCENTILE-RANK ENGINE (formula retained) ───────────────────────────────
+float tickSize = syminfo.mintick
+float cprWidthTicks = tickSize > 0 ? cprWidth / tickSize : 999.0
+bool aboveTickFloor = cprWidthTicks >= minTicksForNarrow
+int maxLookback = math.min(lookbackBars, 60)
+int maxShortLookback = math.min(shortLookback, 20)
+float prevH = htfHigh[1]
+float prevL = htfLow[1]
+float prevC = htfClose[1]
+float prevCP = not na(prevH) and not na(prevL) and not na(prevC) ? (prevH + prevL + prevC) / 3 : na
+float prevBC = not na(prevH) and not na(prevL) ? (prevH + prevL) / 2 : na
+float prevTC = not na(prevCP) and not na(prevBC) ? (prevCP - prevBC) + prevCP : na
+float prevWidth = not na(prevTC) and not na(prevBC) ? math.abs(prevTC - prevBC) : na
+float prevWidthPct = not na(prevWidth) and prevCP > 0 ? prevWidth / prevCP * 100 : na
+float priorRange = pdHigh - pdLow
+var float cachedPercentileRank = 50.0
+var float cachedPercentileRankShort = 50.0
+var float cachedPrevPercentileRank = 50.0
+var float cachedRangePercentileRank = 50.0
+var float lastCachedPdClose = na
+bool isNewHtfSession = na(lastCachedPdClose) or pdClose != lastCachedPdClose
+if isNewHtfSession
+    lastCachedPdClose := pdClose
+    int countSmaller = 0
+    int countTotal = 0
+    int countSmallerShort = 0
+    int countTotalShort = 0
+    int rangeCountSmaller = 0
+    int rangeCountTotal = 0
+    int prevCountSmaller = 0
+    int prevCountTotal = 0
+    int maxOuterLoop = math.max(maxLookback, maxShortLookback)
+    for i = 0 to maxOuterLoop - 1
+        float hH = htfHigh[i + 1]
+        float hL = htfLow[i + 1]
+        float hC = htfClose[i + 1]
+        if i < maxLookback
+            if not na(hH) and not na(hL)
+                rangeCountTotal += 1
+                if hH - hL > priorRange
+                    rangeCountSmaller += 1
+        if not na(hH) and not na(hL) and not na(hC)
+            float hCP = (hH + hL + hC) / 3
+            float hBC = (hH + hL) / 2
+            float hTC = (hCP - hBC) + hCP
+            float hPct = hCP > 0 ? math.abs(hTC - hBC) / hCP * 100 : 0.0
+            if i < maxLookback
+                countTotal += 1
+                if hPct < cprWidthPct
+                    countSmaller += 1
+            if i < maxShortLookback
+                countTotalShort += 1
+                if hPct < cprWidthPct
+                    countSmallerShort += 1
+        if i < maxLookback
+            float pH = htfHigh[i + 2]
+            float pL = htfLow[i + 2]
+            float pC = htfClose[i + 2]
+            if not na(pH) and not na(pL) and not na(pC)
+                float pCP = (pH + pL + pC) / 3
+                float pBC = (pH + pL) / 2
+                float pTC = (pCP - pBC) + pCP
+                float pPct = pCP > 0 ? math.abs(pTC - pBC) / pCP * 100 : 0.0
+                prevCountTotal += 1
+                if not na(prevWidthPct) and pPct < prevWidthPct
+                    prevCountSmaller += 1
+    cachedPercentileRank := countTotal > 0 ? float(countSmaller) / float(countTotal) * 100 : 50.0
+    cachedPercentileRankShort := countTotalShort > 0 ? float(countSmallerShort) / float(countTotalShort) * 100 : 50.0
+    cachedRangePercentileRank := rangeCountTotal > 0 ? float(rangeCountSmaller) / float(rangeCountTotal) * 100 : 50.0
+    cachedPrevPercentileRank := prevCountTotal > 0 ? float(prevCountSmaller) / float(prevCountTotal) * 100 : 50.0
+
+var float[] trueSessionWidthHistory = array.new_float()
+var float[] trueSessionRangeHistory = array.new_float()
+var int trueRankTrackedSessionTime = na
+var float truePercentileRank = 50.0
+var float truePercentileRankShort = 50.0
+var float truePrevPercentileRank = 50.0
+var float trueRangePercentileRank = 50.0
+bool trueRankDataValid = not na(htfCurrentSessionTime) and not na(cprWidthPct) and not na(priorRange)
+bool trueRankNewSession = useTrueHtfSessionPercentiles and trueRankDataValid and (na(trueRankTrackedSessionTime) or htfCurrentSessionTime != trueRankTrackedSessionTime)
+if trueRankNewSession
+    trueRankTrackedSessionTime := htfCurrentSessionTime
+    int histSize = array.size(trueSessionWidthHistory)
+    int currentCountTotal = math.min(histSize, maxLookback)
+    int currentCountSmaller = 0
+    int shortCountTotal = math.min(histSize, maxShortLookback)
+    int shortCountSmaller = 0
+    int rangeCountTotalTrue = math.min(array.size(trueSessionRangeHistory), maxLookback)
+    int rangeCountSmallerTrue = 0
+    if currentCountTotal > 0
+        for n = 0 to currentCountTotal - 1
+            float historicalWidth = array.get(trueSessionWidthHistory, histSize - 1 - n)
+            if historicalWidth < cprWidthPct
+                currentCountSmaller += 1
+    if shortCountTotal > 0
+        for n = 0 to shortCountTotal - 1
+            float historicalWidth = array.get(trueSessionWidthHistory, histSize - 1 - n)
+            if historicalWidth < cprWidthPct
+                shortCountSmaller += 1
+    if rangeCountTotalTrue > 0
+        int rangeSize = array.size(trueSessionRangeHistory)
+        for n = 0 to rangeCountTotalTrue - 1
+            float historicalRange = array.get(trueSessionRangeHistory, rangeSize - 1 - n)
+            if historicalRange > priorRange
+                rangeCountSmallerTrue += 1
+    int previousCountTotal = math.min(math.max(histSize - 1, 0), maxLookback)
+    int previousCountSmaller = 0
+    if histSize > 0 and previousCountTotal > 0
+        float previousSessionWidth = array.get(trueSessionWidthHistory, histSize - 1)
+        for n = 0 to previousCountTotal - 1
+            float olderWidth = array.get(trueSessionWidthHistory, histSize - 2 - n)
+            if olderWidth < previousSessionWidth
+                previousCountSmaller += 1
+    truePercentileRank := currentCountTotal > 0 ? float(currentCountSmaller) / float(currentCountTotal) * 100 : 50.0
+    truePercentileRankShort := shortCountTotal > 0 ? float(shortCountSmaller) / float(shortCountTotal) * 100 : 50.0
+    truePrevPercentileRank := previousCountTotal > 0 ? float(previousCountSmaller) / float(previousCountTotal) * 100 : 50.0
+    trueRangePercentileRank := rangeCountTotalTrue > 0 ? float(rangeCountSmallerTrue) / float(rangeCountTotalTrue) * 100 : 50.0
+    array.push(trueSessionWidthHistory, cprWidthPct)
+    array.push(trueSessionRangeHistory, priorRange)
+    if array.size(trueSessionWidthHistory) > 62
+        array.shift(trueSessionWidthHistory)
+    if array.size(trueSessionRangeHistory) > 62
+        array.shift(trueSessionRangeHistory)
+
+float activePercentileRank = useTrueHtfSessionPercentiles ? truePercentileRank : cachedPercentileRank
+float activePercentileRankShort = useTrueHtfSessionPercentiles ? truePercentileRankShort : cachedPercentileRankShort
+float activePrevPercentileRank = useTrueHtfSessionPercentiles ? truePrevPercentileRank : cachedPrevPercentileRank
+float activeRangePercentileRank = useTrueHtfSessionPercentiles ? trueRangePercentileRank : cachedRangePercentileRank
+bool layer1Pass = not useLayer1 or activePercentileRankShort <= pctExtreme
+bool layer2Pass = not useLayer2 or cprWidthPct <= absWidthPctCap
+bool layer3Pass = not useLayer3 or activePrevPercentileRank <= priorSessionMaxRank
+float cprAtrRatio = atrValue > 0 ? cprWidth / atrValue : 999.0
+bool layer4Pass = not useLayer4 or cprAtrRatio <= cprAtrRatioMax
+bool layer5Pass = not useLayer5 or activeRangePercentileRank <= rangeContractionPct
+int totalEnabledLayers = (useLayer1 ? 1 : 0) + (useLayer2 ? 1 : 0) + (useLayer3 ? 1 : 0) + (useLayer4 ? 1 : 0) + (useLayer5 ? 1 : 0)
+int layersPassing = (useLayer1 and layer1Pass ? 1 : 0) + (useLayer2 and layer2Pass ? 1 : 0) + (useLayer3 and layer3Pass ? 1 : 0) + (useLayer4 and layer4Pass ? 1 : 0) + (useLayer5 and layer5Pass ? 1 : 0)
+int effectiveMinLayers = math.min(minLayersRequired, totalEnabledLayers)
+bool isExtremelyNarrow = activePercentileRank <= pctExtreme and aboveTickFloor and layersPassing >= effectiveMinLayers
+
+// Aligned HTF plots. plot.style_circles/cross were marker plots, not true
+// dotted/dashed lines, and caused the apparent misalignment/overdrawing.
+pTC = plot(showCPR ? (isNewHtfSession ? na : cprDisplayTC) : na, title="TC", color=colorTC, linewidth=lineWidth, style=plot.style_linebr)
+pCP = plot(showCPR ? (isNewHtfSession ? na : CP) : na, title="CP", color=colorCP, linewidth=lineWidth, style=plot.style_linebr)
+pBC = plot(showCPR ? (isNewHtfSession ? na : cprDisplayBC) : na, title="BC", color=colorBC, linewidth=lineWidth, style=plot.style_linebr)
+fill(pTC, pBC, color=showFill and showCPR ? color.new(#FFD700, 88) : na, title="CPR Zone Fill")
+
+f_setLine(line ln, int x1, float y1, int x2, float y2, color c, int w, string st) =>
+    line r = ln
+    if na(r)
+        r := line.new(x1, y1, x2, y2, color=c, width=w, style=st, xloc=xloc.bar_index, extend=extend.none)
+    else
+        line.set_xy1(r, x1, y1)
+        line.set_xy2(r, x2, y2)
+        line.set_color(r, c)
+        line.set_width(r, w)
+        line.set_style(r, st)
+        line.set_extend(r, extend.none)
+    r
+f_setLabel(label lb, int x, float y, string txt, color c, color tc) =>
+    label r = lb
+    if na(lb)
+        r := label.new(x, y, txt, color=c, textcolor=tc, style=label.style_label_left, size=size.small, xloc=xloc.bar_index)
+    else
+        label.set_xy(r, x, y)
+        label.set_text(r, txt)
+        label.set_color(r, c)
+        label.set_textcolor(r, tc)
+        label.set_style(r, label.style_label_left)
+        label.set_size(r, size.small)
+    r
+
+float tomH = na(tomSrcHigh) ? pdHigh : tomSrcHigh
+float tomL = na(tomSrcLow) ? pdLow : tomSrcLow
+float tomC = na(tomSrcClose) ? pdClose : tomSrcClose
+float tomCP = (tomH + tomL + tomC) / 3
+float tomBCRaw = (tomH + tomL) / 2
+float tomTCRaw = (tomCP - tomBCRaw) + tomCP
+float tomTC = math.max(tomTCRaw, tomBCRaw)
+float tomBC = math.min(tomTCRaw, tomBCRaw)
+var line tomTCLine = na
+var line tomCPLine = na
+var line tomBCLine = na
+var label tomTCLabel = na
+var label tomCPLabel = na
+var label tomBCLabel = na
+var label tomCombinedLabel = na
+if barstate.islast and showTomCPR
+    int projStart = bar_index + 2
+    int projEnd = bar_index + tomLineExtend
+    tomTCLine := f_setLine(tomTCLine, projStart, tomTC, projEnd, tomTC, colorTomTC, lineWidth, tomLineStyle)
+    tomCPLine := f_setLine(tomCPLine, projStart, tomCP, projEnd, tomCP, colorTomCP, lineWidth, tomLineStyle)
+    tomBCLine := f_setLine(tomBCLine, projStart, tomBC, projEnd, tomBC, colorTomBC, lineWidth, tomLineStyle)
+    if tomCombineLabels
+        string tomText = "NEXT CPR\nTC: " + str.tostring(tomTC, format.mintick) + "\nCP: " + str.tostring(tomCP, format.mintick) + "\nBC: " + str.tostring(tomBC, format.mintick)
+        tomCombinedLabel := f_setLabel(tomCombinedLabel, projEnd, tomCP, tomText, color.new(#1A1A2E, 0), color.white)
+    else
+        tomTCLabel := f_setLabel(tomTCLabel, projEnd, tomTC, "Next TC: " + str.tostring(tomTC, format.mintick), colorTomTC, color.black)
+        tomCPLabel := f_setLabel(tomCPLabel, projEnd, tomCP, "Next CP: " + str.tostring(tomCP, format.mintick), colorTomCP, color.black)
+        tomBCLabel := f_setLabel(tomBCLabel, projEnd, tomBC, "Next BC: " + str.tostring(tomBC, format.mintick), colorTomBC, color.white)
+// ─── SESSION-LOCKED CPR STATUS ───────────────────────────────────────────────
+grpCPRStatus = "🏷️ CPR Narrow Status Label"
+showCPRStatusLabel = input.bool(true, title="Show CPR Narrow/Normal Status Label", group=grpCPRStatus)
+showCPRStatusDate = input.bool(true, title="Show CPR Status Session Date", group=grpCPRStatus)
+cprStatusPos = input.string("Top Center", title="Label Position", options=["Top Center", "Top Right", "Top Left"], group=grpCPRStatus)
+cprExtremeColor = input.color(color.new(#FF1744, 0), title="Extremely Narrow Color", group=grpCPRStatus)
+cprNormalColor = input.color(color.new(#00E676, 0), title="Normal CPR Color", group=grpCPRStatus)
+bool cprSessionDataValid = not na(pdHigh) and not na(pdLow) and not na(pdClose) and not na(CP) and not na(BC) and not na(TC) and not na(htfCurrentSessionTime)
+var int lastCprStatusSessionTime = na
+bool isNewCprStatusSession = cprSessionDataValid and (na(lastCprStatusSessionTime) or htfCurrentSessionTime != lastCprStatusSessionTime)
+var string cprStatusSessionDateStr = "N/A"
+var bool cprStatusSessionIsNarrow = false
+var bool cprStatusSessionValid = false
+if isNewCprStatusSession
+    lastCprStatusSessionTime := htfCurrentSessionTime
+    cprStatusSessionDateStr := str.format_time(htfCurrentSessionTime, "dd-MMM-yyyy", syminfo.timezone)
+    cprStatusSessionIsNarrow := isExtremelyNarrow
+    cprStatusSessionValid := true
+else if not cprSessionDataValid
+    cprStatusSessionValid := false
+var table cprStatusTable = na
+if showCPRStatusLabel and barstate.islast
+    if na(cprStatusTable)
+        string cprTp = cprStatusPos == "Top Center" ? position.top_center : cprStatusPos == "Top Right" ? position.top_right : position.top_left
+        cprStatusTable := table.new(cprTp, 1, 1, bgcolor=color.new(#1A1A2E, 10), border_color=color.new(color.gray, 50), border_width=1, frame_color=color.new(color.gray, 30), frame_width=1)
+    string cprStatusText = not cprStatusSessionValid ? "⚪ CPR DATA UNAVAILABLE" : cprStatusSessionIsNarrow ? "🔴 EXTREMELY NARROW CPR" : "🟢 NORMAL CPR"
+    color cprStatusColor = not cprStatusSessionValid ? color.gray : cprStatusSessionIsNarrow ? cprExtremeColor : cprNormalColor
+    if showCPRStatusDate and cprStatusSessionValid
+        cprStatusText += " • " + cprStatusSessionDateStr
+    table.cell(cprStatusTable, 0, 0, cprStatusText, text_color=cprStatusColor, text_size=size.normal, bgcolor=color.new(#0D0D1A, 0), text_halign=text.align_center)
+
+// ─── EN CPR START LABEL ──────────────────────────────────────────────────────
+grpEnStart = "🔴 EN CPR START Label"
+showEnStartLabel = input.bool(true, title="Show EN CPR Start Label", group=grpEnStart)
+enOnlyFirstOfStreak = input.bool(true, title="Label Only The First EN Session Of A Streak", group=grpEnStart)
+enShowDate = input.bool(true, title="Include Session Date In Label", group=grpEnStart)
+enShowStats = input.bool(true, title="Include Width% / Percentile Rank In Label", group=grpEnStart)
+enLabelColor = input.color(color.new(#FF1744, 0), title="EN Start Label Color", group=grpEnStart)
+enLabelTextColor = input.color(color.black, title="EN Start Label Text Color", group=grpEnStart)
+enLabelSizeStr = input.string("Small", title="EN Start Label Size", options=["Tiny", "Small", "Normal"], group=grpEnStart)
+enLabelSizeResolved = enLabelSizeStr == "Tiny" ? size.tiny : enLabelSizeStr == "Normal" ? size.normal : size.small
+var int enTrackedSessionTime = na
+var bool enPrevSessionWasEn = false
+bool enStartEvent = false
+bool enNewSession = cprSessionDataValid and (na(enTrackedSessionTime) or htfCurrentSessionTime != enTrackedSessionTime)
+if enNewSession
+    enTrackedSessionTime := htfCurrentSessionTime
+    bool enThisSessionIsNarrow = isExtremelyNarrow
+    if enThisSessionIsNarrow and not (enOnlyFirstOfStreak and enPrevSessionWasEn)
+        enStartEvent := true
+    enPrevSessionWasEn := enThisSessionIsNarrow
+if showEnStartLabel and enStartEvent
+    string enText = "🔴 EN CPR START"
+    if enShowDate
+        enText += "\n" + str.format_time(htfCurrentSessionTime, "dd-MMM-yyyy", syminfo.timezone)
+    if enShowStats
+        enText += "\nW: " + str.tostring(cprWidthPct, "#.###") + "% • PR: " + str.tostring(activePercentileRank, "#.#") + "%"
+    label.new(bar_index, low, text=enText, xloc=xloc.bar_index, yloc=yloc.belowbar, style=label.style_label_up, color=enLabelColor, textcolor=enLabelTextColor, size=enLabelSizeResolved)
+
+// ─── SUPER-NARROW / BREAKOUT / MTF / PERF CALCULATIONS ──────────────────────
+bool candleTouchesTC = low <= TC and high >= TC
+bool tcemasignal = candleGreen and candleTouchesTC and close > ema20
+bool tcuemasignal = candleGreen and candleTouchesTC and ema20AboveEma50 and high >= ema20 and low <= ema50
+bool candleTouchesBothEMAs = low <= ema20 and high >= ema20 and low <= ema50 and high >= ema50
+bool extraEmaCondition = candleTouchesBothEMAs and ema20AboveEma50
+bool strongBody = rangeOk ? candleBody / candleRange >= 0.8 : false
+bool kernelBullishFilter = useKernelFilter ? kernelBullish : true
+bool superNarrowBullish = isExtremelyNarrow and close > TC and extraEmaCondition and (tcemasignal or tcuemasignal) and close > ema200 and strongBody and kernelBullishFilter
+float consoHighest = ta.highest(high[1], consolidationBars)
+float consoLowest = ta.lowest(low[1], consolidationBars)
+float consoAvgPx = ta.sma(close[1], consolidationBars)
+float consoRangePct = consoAvgPx > 0 ? (consoHighest - consoLowest) / consoAvgPx * 100 : 999.0
+bool isTightConso = consoRangePct <= consolidationRangePct
+float cprBuffer = CP * (cprProximityPct / 100.0)
+bool consoNearCPR = consoLowest <= TC + cprBuffer and consoHighest >= BC - cprBuffer
+bool ema20CrossedRecently = not na(barsSinceEma20_50Cross) and barsSinceEma20_50Cross <= emaLookbackCross - 1
+bool emaStructureBullish = ema20AboveEma50 or ema20CrossedRecently
+bool withinEma200Range = ema200 > 0 ? close >= ema200 * (1.0 - ema200ProximityPct / 100.0) : false
+bool isBrkGreen = candleGreen
+bool isStrongBrk = rangeOk ? candleBody / candleRange >= breakoutBodyPct : false
+bool closesAboveTC = close > TC
+bool breakingConsoHigh = close > consoHighest
+bool breakoutVol = volume > volSma * breakoutVolMult
+float RAD2DEG = 180 / math.pi
+float atr14 = atrLength == 14 ? atrValue : ta.atr(14)
+float atr14Safe = atr14 != 0 ? atr14 : 1.0
+float kernelAngle = math.atan((yhat1 - yhat1[1]) / atr14Safe) * RAD2DEG
+bool isKernelAng = kernelAngle >= kernelAngAngle
+float EMA20Ang = math.atan((ema20 - ema20[1]) / atr14Safe) * RAD2DEG
+bool isEma20Ang = EMA20Ang >= ema20AngAngle
+float ema50Angle = math.atan((ema50 - ema50[1]) / atr14Safe) * RAD2DEG
+bool isEma50Ang = ema50Angle >= ema50AngAngle
+float ema200Angle = math.atan((ema200 - ema200[1]) / atr14Safe) * RAD2DEG
+bool isEma200Ang = ema200Angle >= ema200AngAngle
+bool anyAngTriggered = isKernelAng or isEma20Ang or isEma50Ang or isEma200Ang
+bool kernelBullishFilter_v2 = useKernelFilter_ANG ? kernelBullish : true
+bool rawCprBreakout_v2 = isTightConso and consoNearCPR and isBrkGreen and isStrongBrk and closesAboveTC and breakingConsoHigh and emaStructureBullish and withinEma200Range and breakoutVol and kernelBullishFilter_v2
+bool cprBreakoutSignal_v2 = rawCprBreakout_v2 and (useAngFilterForBrk ? anyAngTriggered : true)
+bool isAPlusPlus = cprBreakoutSignal_v2 and yhat1 > ema20 and ema20 > ema50 and ema50 > ema200
+bool isCprEnt = isAPlusPlus[1] and isAPlusPlus
+bool trendAlignmentFilter = isEma20Ang and ema20 > ema50 and ema50 > ema200
+bool nStrongBrk = rangeOk ? candleBody / candleRange >= narrowBreakoutBodyPct : false
+bool cprNarrowBreakout = isExtremelyNarrow and isBrkGreen and nStrongBrk and closesAboveTC and ema20AboveEma50 and breakoutVol and kernelBullishFilter
+bool higherTF_confirmed = cprBreakoutSignal_v2
+int mtfScore = (higherTF_confirmed ? 1 : 0) + (midTF_confirmed ? 1 : 0) + (lowTF_confirmed ? 1 : 0)
+bool mtfConfluence = (requireAllThree ? mtfScore >= 3 : mtfScore >= 2) and close > ema200
+
+var float kernelBuyHigh = na
+var int kernelBuyBar = na
+var bool kernelBuyArmed = false
+var line kernelBuyHighLine = na
+if kernelBuy
+    if not na(kernelBuyHighLine) and showKernelHighLine
+        line.delete(kernelBuyHighLine)
+        kernelBuyHighLine := na
+    kernelBuyHigh := high
+    kernelBuyBar := bar_index
+    kernelBuyArmed := true
+// OPT: the line's final x2 is all the chart keeps. Updating it only on the
+// last bar (including Bar Replay's last bar) draws the same segment.
+if kernelBuyArmed and showKernelHighLine and (na(kernelBuyHighLine) or barstate.islast)
+    if na(kernelBuyHighLine)
+        kernelBuyHighLine := line.new(kernelBuyBar, kernelBuyHigh, bar_index, kernelBuyHigh, xloc=xloc.bar_index, color=kernelHighLineColor, width=1, style=line.style_dashed)
+    else
+        line.set_x2(kernelBuyHighLine, bar_index)
+bool perfBuySignal = false
+if kernelBuyArmed and not na(kernelBuyHigh) and not na(kernelBuyBar)
+    bool withinWindow = bar_index - kernelBuyBar <= perfBuyMaxBars
+    bool afterKernelBar = bar_index > kernelBuyBar
+    if withinWindow and afterKernelBar and close > kernelBuyHigh and open <= kernelBuyHigh and mtfConfluence
+        perfBuySignal := true
+        kernelBuyArmed := false
+        if not na(kernelBuyHighLine) and showKernelHighLine
+            line.delete(kernelBuyHighLine)
+            kernelBuyHighLine := na
+    if not withinWindow and afterKernelBar
+        kernelBuyArmed := false
+        if not na(kernelBuyHighLine) and showKernelHighLine
+            line.delete(kernelBuyHighLine)
+            kernelBuyHighLine := na
+
+var table mtfTable = na
+if showMTFTable and barstate.islast
+    if na(mtfTable)
+        string tp = tablePos == "Top Right" ? position.top_right : tablePos == "Top Left" ? position.top_left : tablePos == "Bottom Right" ? position.bottom_right : tablePos == "Bottom Left" ? position.bottom_left : position.middle_right
+        mtfTable := table.new(tp, 3, 8, bgcolor=color.new(#1A1A2E, 10), border_color=color.new(color.gray, 50), border_width=1, frame_color=color.new(color.gray, 30), frame_width=1)
+        table.merge_cells(mtfTable, 0, 0, 2, 0)
+        table.cell(mtfTable, 0, 0, "⚡ MTF CPR CONFLUENCE", text_color=#FFD700, text_size=size.small, bgcolor=#0D0D1A, text_halign=text.align_center)
+        table.cell(mtfTable, 0, 1, "Timeframe", text_color=color.silver, text_size=size.small, bgcolor=#16213E)
+        table.cell(mtfTable, 1, 1, "Status", text_color=color.silver, text_size=size.small, bgcolor=#16213E)
+        table.cell(mtfTable, 2, 1, "Hits", text_color=color.silver, text_size=size.small, bgcolor=#16213E)
+    color rowColorH = higherTF_confirmed ? color.new(#00E676, 80) : color.new(#FF1744, 80)
+    table.cell(mtfTable, 0, 2, mtfHigherTF + "m (Chart)", text_color=color.white, text_size=size.small, bgcolor=rowColorH)
+    table.cell(mtfTable, 1, 2, higherTF_confirmed ? "✅ FIRED" : "⭕ WAIT", text_color=higherTF_confirmed ? #00E676 : #FF4444, text_size=size.small, bgcolor=rowColorH)
+    table.cell(mtfTable, 2, 2, "1/1", text_color=color.white, text_size=size.small, bgcolor=rowColorH)
+    color rowColorM = midTF_confirmed ? color.new(#00E676, 80) : color.new(#FF1744, 80)
+    table.cell(mtfTable, 0, 3, mtfMidTF + "m (" + str.tostring(mtfMidCalcLookback) + " bars)", text_color=color.white, text_size=size.small, bgcolor=rowColorM)
+    table.cell(mtfTable, 1, 3, midTF_confirmed ? "✅ FIRED" : "⭕ WAIT", text_color=midTF_confirmed ? #00E676 : #FF4444, text_size=size.small, bgcolor=rowColorM)
+    table.cell(mtfTable, 2, 3, str.tostring(midTF_count) + "/" + str.tostring(mtfMidCalcLookback), text_color=color.white, text_size=size.small, bgcolor=rowColorM)
+    color rowColorL = lowTF_confirmed ? color.new(#00E676, 80) : color.new(#FF1744, 80)
+    table.cell(mtfTable, 0, 4, mtfLowTF + "m (" + str.tostring(mtfLowCalcLookback) + " bars)", text_color=color.white, text_size=size.small, bgcolor=rowColorL)
+    table.cell(mtfTable, 1, 4, lowTF_confirmed ? "✅ FIRED" : "⭕ WAIT", text_color=lowTF_confirmed ? #00E676 : #FF4444, text_size=size.small, bgcolor=rowColorL)
+    table.cell(mtfTable, 2, 4, str.tostring(lowTF_count) + "/" + str.tostring(mtfLowCalcLookback), text_color=color.white, text_size=size.small, bgcolor=rowColorL)
+    color rowColorC = mtfConfluence ? color.new(#FFD700, 60) : color.new(#333355, 60)
+    table.cell(mtfTable, 0, 5, "Score: " + str.tostring(mtfScore) + "/3", text_color=mtfConfluence ? #FFD700 : color.gray, text_size=size.small, bgcolor=rowColorC)
+    table.cell(mtfTable, 1, 5, mtfConfluence ? "⭐ CONFLUENCE" : "— NO SIGNAL", text_color=mtfConfluence ? #FFD700 : color.gray, text_size=size.small, bgcolor=rowColorC)
+    table.cell(mtfTable, 2, 5, requireAllThree ? "Need 3/3" : "Need 2/3", text_color=color.silver, text_size=size.tiny, bgcolor=rowColorC)
+    color rowColorK = kernelBullish ? color.new(#00E676, 80) : color.new(#FF1744, 80)
+    table.cell(mtfTable, 0, 6, "🔮 Kernel", text_color=color.white, text_size=size.small, bgcolor=rowColorK)
+    table.cell(mtfTable, 1, 6, kernelBullish ? "✅ BULLISH" : "🔴 BEARISH", text_color=kernelBullish ? #00E676 : #FF4444, text_size=size.small, bgcolor=rowColorK)
+    table.cell(mtfTable, 2, 6, kernelBuy ? "🔔 TURN" : "—", text_color=color.white, text_size=size.small, bgcolor=rowColorK)
+    color rowColorP = perfBuySignal ? color.new(#FF6B00, 60) : kernelBuyArmed ? color.new(#FFD700, 80) : color.new(#333355, 60)
+    table.cell(mtfTable, 0, 7, "🏆 PERF BUY", text_color=color.white, text_size=size.small, bgcolor=rowColorP)
+    table.cell(mtfTable, 1, 7, perfBuySignal ? "🔥 FIRED!" : kernelBuyArmed ? "👀 ARMED" : "⭕ IDLE", text_color=perfBuySignal ? #FF6B00 : kernelBuyArmed ? #FFD700 : color.gray, text_size=size.small, bgcolor=rowColorP)
+    table.cell(mtfTable, 2, 7, kernelBuyArmed and not na(kernelBuyBar) ? "Watch >" + str.tostring(kernelBuyHigh, format.mintick) : "—", text_color=color.white, text_size=size.tiny, bgcolor=rowColorP)
+
+// ─── ENTRY / SL / TARGET ─────────────────────────────────────────────────────
+bool anySignal = estSource == "All Signals" ? (superNarrowBullish or cprBreakoutSignal_v2 or cprNarrowBreakout or mtfConfluence or kernelBuy or perfBuySignal) : estSource == "Super Narrow Bullish" ? superNarrowBullish : estSource == "CPR Breakout" ? cprBreakoutSignal_v2 : estSource == "Narrow CPR Breakout" ? cprNarrowBreakout : estSource == "MTF Confluence" ? mtfConfluence : estSource == "Kernel Buy" ? kernelBuy : false
+var line estEntryLine = na
+var line estSLLine = na
+var line estTgt1Line = na
+var line estTgt2Line = na
+var line estTgt3Line = na
+var label estEntryLbl = na
+var label estSLLbl = na
+var label estTgt1Lbl = na
+var label estTgt2Lbl = na
+var label estTgt3Lbl = na
+var label estInfoLbl = na
+var float est_entryPrice = na
+var float est_slPrice = na
+var float est_tgt1 = na
+var float est_tgt2 = na
+var float est_tgt3 = na
+var int est_sigBar = na
+var float est_riskPct = na
+var float est_reward1Pct = na
+var float est_reward2Pct = na
+var float est_reward3Pct = na
+var float est_rr1 = na
+var float est_rr2 = na
+var float est_rr3 = na
+if anySignal and showEST
+    float entryPrice = close
+    float rawSL = slMethod == "Candle Low" ? low : slMethod == "BC (CPR Bottom)" ? BC : slMethod == "EMA 20" ? ema20 : slMethod == "ATR Based" ? close - slAtrMult * atrValue : low
+    float slPrice = rawSL - rawSL * (slBufferPct / 100.0)
+    float riskAmt = entryPrice - slPrice
+    float tgt1 = 0.0
+    float tgt2 = 0.0
+    float tgt3 = 0.0
+    if tgtMethod == "Risk:Reward"
+        tgt1 := entryPrice + riskAmt * rrRatio1
+        tgt2 := entryPrice + riskAmt * rrRatio2
+        tgt3 := entryPrice + riskAmt * rrRatio3
+    else if tgtMethod == "R1 Level" or tgtMethod == "R2 Level" or tgtMethod == "R3 Level"
+        tgt1 := R1
+        tgt2 := R2
+        tgt3 := R3
+    else if tgtMethod == "ATR Based"
+        tgt1 := entryPrice + tgtAtrMult1 * atrValue
+        tgt2 := entryPrice + tgtAtrMult2 * atrValue
+        tgt3 := entryPrice + tgtAtrMult3 * atrValue
+    est_entryPrice := entryPrice
+    est_slPrice := slPrice
+    est_tgt1 := tgt1
+    est_tgt2 := tgt2
+    est_tgt3 := tgt3
+    est_sigBar := bar_index
+    est_riskPct := entryPrice > 0 ? riskAmt / entryPrice * 100 : 0.0
+    est_reward1Pct := entryPrice > 0 ? (tgt1 - entryPrice) / entryPrice * 100 : 0.0
+    est_reward2Pct := entryPrice > 0 ? (tgt2 - entryPrice) / entryPrice * 100 : 0.0
+    est_reward3Pct := entryPrice > 0 ? (tgt3 - entryPrice) / entryPrice * 100 : 0.0
+    est_rr1 := riskAmt > 0 ? (tgt1 - entryPrice) / riskAmt : 0.0
+    est_rr2 := riskAmt > 0 ? (tgt2 - entryPrice) / riskAmt : 0.0
+    est_rr3 := riskAmt > 0 ? (tgt3 - entryPrice) / riskAmt : 0.0
+if barstate.islast and showEST and not na(est_sigBar)
+    int x1 = math.max(est_sigBar, bar_index - 4900)
+    int x2 = est_sigBar + estLineLookFwd
+    estEntryLine := f_setLine(estEntryLine, x1, est_entryPrice, x2, est_entryPrice, colorEntry, 2, line.style_dashed)
+    estSLLine := f_setLine(estSLLine, x1, est_slPrice, x2, est_slPrice, colorSL, 2, line.style_dashed)
+    estTgt1Line := f_setLine(estTgt1Line, x1, est_tgt1, x2, est_tgt1, colorTgt1, 2, line.style_dashed)
+    estTgt2Line := f_setLine(estTgt2Line, x1, est_tgt2, x2, est_tgt2, colorTgt2, 1, line.style_dotted)
+    estTgt3Line := f_setLine(estTgt3Line, x1, est_tgt3, x2, est_tgt3, colorTgt3, 1, line.style_dotted)
+    if showESTLabels
+        estEntryLbl := f_setLabel(estEntryLbl, x2, est_entryPrice, "ENTRY: " + str.tostring(est_entryPrice, format.mintick), colorEntry, color.black)
+        estSLLbl := f_setLabel(estSLLbl, x2, est_slPrice, "SL: " + str.tostring(est_slPrice, format.mintick) + " (-" + str.tostring(est_riskPct, "#.##") + "%)", colorSL, color.white)
+        estTgt1Lbl := f_setLabel(estTgt1Lbl, x2, est_tgt1, "T1: " + str.tostring(est_tgt1, format.mintick) + " (+" + str.tostring(est_reward1Pct, "#.##") + "%) RR:" + str.tostring(est_rr1, "#.#"), colorTgt1, color.black)
+        estTgt2Lbl := f_setLabel(estTgt2Lbl, x2, est_tgt2, "T2: " + str.tostring(est_tgt2, format.mintick) + " (+" + str.tostring(est_reward2Pct, "#.##") + "%) RR:" + str.tostring(est_rr2, "#.#"), colorTgt2, color.black)
+        estTgt3Lbl := f_setLabel(estTgt3Lbl, x2, est_tgt3, "T3: " + str.tostring(est_tgt3, format.mintick) + " (+" + str.tostring(est_reward3Pct, "#.##") + "%) RR:" + str.tostring(est_rr3, "#.#"), colorTgt3, color.black)
+    if showESTInfo
+        string estInfoText = "Risk: " + str.tostring(est_riskPct, "#.##") + "%\nT1/T2/T3 RR: " + str.tostring(est_rr1, "#.#") + " / " + str.tostring(est_rr2, "#.#") + " / " + str.tostring(est_rr3, "#.#")
+        estInfoLbl := f_setLabel(estInfoLbl, x2, est_entryPrice, estInfoText, color.new(#1A1A2E, 0), color.white)
+
+// ─── BOLLINGER BANDS + CONF FILTERS ─────────────────────────────────────────
+grpBB = "📊 Bollinger Bands (BB Module)"
+showBB = input.bool(true, title="Show Bollinger Bands", group=grpBB)
+bbLength = input.int(20, "BB Length", minval=1, group=grpBB)
+bbMaType = input.string("SMA", "BB Basis MA Type", options=["SMA", "EMA", "SMMA (RMA)", "WMA", "VWMA"], group=grpBB)
+bbSrc = input.source(close, "BB Source", group=grpBB)
+bbMult = input.float(2.0, "BB StdDev", minval=0.001, maxval=50, group=grpBB)
+bbOffset = input.int(0, "BB Offset", minval=-500, maxval=500, group=grpBB, display=display.none)
+bb_ma(source, len, _type) =>
+    switch _type
+        "SMA" => ta.sma(source, len)
+        "EMA" => ta.ema(source, len)
+        "SMMA (RMA)" => ta.rma(source, len)
+        "WMA" => ta.wma(source, len)
+        "VWMA" => ta.vwma(source, len)
+float bbBasis = bb_ma(bbSrc, bbLength, bbMaType)
+float bbDev = bbMult * ta.stdev(bbSrc, bbLength)
+plot(showBB ? bbBasis : na, "BB Basis", color=#2962FF, offset=bbOffset)
+bbP1 = plot(showBB ? bbBasis + bbDev : na, "BB Upper", color=#F23645, offset=bbOffset)
+bbP2 = plot(showBB ? bbBasis - bbDev : na, "BB Lower", color=#089981, offset=bbOffset)
+fill(bbP1, bbP2, title="BB Background", color=color.rgb(33, 150, 243, 95))
+float bbLowerBand = bbBasis - bbDev
+float bbUpperBand = bbBasis + bbDev
+
+grpConfTighten = "🎯 CONF Tightening — Bollinger Band Slope Filter"
+enableBBSlopeFilter = input.bool(true, title="Require BB Slope for CONF", group=grpConfTighten)
+bbSlopeSource = input.string("Upper", title="BB Line Used for Slope Calc", options=["Basis", "Upper", "Lower"], group=grpConfTighten)
+bbSlopeMinAngle = input.float(40.0, title="Minimum BB Slope Angle (Degrees)", group=grpConfTighten, minval=0.0, maxval=90.0)
+float bbSlopeSourceValue = bbSlopeSource == "Basis" ? bbBasis : bbSlopeSource == "Upper" ? bbUpperBand : bbLowerBand
+float bbSlopeAngle = math.atan((bbSlopeSourceValue - bbSlopeSourceValue[1]) / atr14Safe) * RAD2DEG
+bool isBBSlopeOk = not enableBBSlopeFilter or bbSlopeAngle >= bbSlopeMinAngle
+
+grpMacdConfTighten = "🎯 CONF Tightening — MACD Histogram Structure Filter"
+enableMacdConfFilter = input.bool(true, title="Require MACD Histogram Structure for CONF", group=grpMacdConfTighten)
+bool macdHistPositive = hist > 0
+bool macdLineAboveZero = macdLine > 0
+bool macdSignalAboveZero = macdSignalLine > 0
+bool macdBothInsideBullishZone = macdHistPositive and macdLineAboveZero and macdSignalAboveZero
+bool macdHistogramStructureOk = not enableMacdConfFilter or macdBothInsideBullishZone
+
+grpConfEarlyTighten = "🎯 CONF Tightening — Early MACD Hist / Open-Close / Bar % Filter (s19)"
+enableConfMacdEarlyFilter = input.bool(true, title="Require MACD Green in 1st or 2nd Histogram Bar for CONF", group=grpConfEarlyTighten)
+enableConfOpenCloseFilter = input.bool(true, title="Require Open <= Previous Close for CONF", group=grpConfEarlyTighten)
+enableConfBarPctFilter = input.bool(true, title="Require Bar % Change < Max for CONF", group=grpConfEarlyTighten)
+confMaxBarPctChange = input.float(2.0, title="Max Bar % Change vs Previous Close", minval=0.1, maxval=20.0, step=0.1, group=grpConfEarlyTighten)
+bool confMacdHistFirstGreen = hist > 0 and hist[1] <= 0
+bool confMacdHistSecondGreen = hist > 0 and hist[1] > 0 and hist[2] <= 0
+bool confMacdEarlyGreenOk = not enableConfMacdEarlyFilter or confMacdHistFirstGreen or confMacdHistSecondGreen
+bool confOpenBelowPrevCloseOk = not enableConfOpenCloseFilter or open <= close[1]
+float confBarPctChange = close[1] != 0 ? math.abs((close - close[1]) / close[1]) * 100 : 0.0
+bool confBarPctOk = not enableConfBarPctFilter or confBarPctChange < confMaxBarPctChange
+
+// ─── CONF / ORIG / BIG ───────────────────────────────────────────────────────
+int c1 = superNarrowBullish ? 1 : 0
+int c2 = cprBreakoutSignal_v2 and not isAPlusPlus ? 1 : 0
+int c3 = cprNarrowBreakout and not cprBreakoutSignal_v2 ? 1 : 0
+int c4 = mtfConfluence ? 1 : 0
+int c5 = kernelBuy ? 1 : 0
+int c6 = perfBuySignal ? 1 : 0
+int c7 = isAPlusPlus and not isCprEnt ? 1 : 0
+int c8 = isKernelAng ? 1 : 0
+int c9 = isEma20Ang ? 1 : 0
+int c10 = isEma50Ang ? 1 : 0
+int c11 = isEma200Ang ? 1 : 0
+int baseTotalScore = c1 + c2 + c3 + c4 + c5 + c6 + c7 + c8 + c9 + c10 + c11
+bool showConfLabel = baseTotalScore >= 3 and trendAlignmentFilter and isBBSlopeOk and macdHistogramStructureOk and confMacdEarlyGreenOk and confOpenBelowPrevCloseOk and confBarPctOk
+bool showConfLabelV6 = showConfLabel and not showConfLabel[1]
+
+grpORIG = "🟠 ORIG — Pure Confluence Signal (TMKCPR-style, No Extra Filters)"
+enableORIG = input.bool(true, title="Enable ORIG Signal", group=grpORIG)
+origMinScore = input.int(3, title="ORIG Minimum Base Score Required", minval=1, maxval=11, group=grpORIG)
+origLabelColor = input.color(color.new(#FF9800, 0), title="ORIG Label Color", group=grpORIG)
+bool origConditionRaw = enableORIG and baseTotalScore >= origMinScore and trendAlignmentFilter
+bool origSignal = origConditionRaw and not origConditionRaw[1]
+plotshape(origSignal, title="ORIG Label", location=location.belowbar, color=origLabelColor, style=shape.labelup, textcolor=color.black, size=size.normal, text="🟠 ORIG")
+
+grpBig = "🟦 BIG Signal (CONF + Kernel Cross/Flip Confirmation)"
+enableBigSignal = input.bool(true, title="Enable BIG Signal", group=grpBig)
+bigLabelColor = input.color(color.new(#2979FF, 0), title="BIG Label Color", group=grpBig)
+bigKernelCrossLookback = input.int(19, title="Kernel Cross Above EMA200 — Lookback (bars)", minval=1, maxval=100, group=grpBig)
+bigKernelFlipLookback = input.int(10, title="Kernel Red→Green Flip — Lookback (bars)", minval=1, maxval=100, group=grpBig)
+bool bigKernelCrossNow = ta.crossover(yhat1, ema200)
+int bigBarsSinceKernelCross = ta.barssince(bigKernelCrossNow)
+bool bigKernelCrossCond = not na(bigBarsSinceKernelCross) and bigBarsSinceKernelCross <= bigKernelCrossLookback
+int bigBarsSinceKernelFlip = ta.barssince(kernelBuy)
+bool bigKernelFlipCond = not na(bigBarsSinceKernelFlip) and bigBarsSinceKernelFlip <= bigKernelFlipLookback
+bool bigKernelCondition = bigKernelCrossCond or bigKernelFlipCond
+bool bigConditionRaw = enableBigSignal and showConfLabel and bigKernelCondition
+bool bigSignal = bigConditionRaw and not bigConditionRaw[1]
+plotshape(bigSignal, title="BIG Label", location=location.belowbar, color=bigLabelColor, style=shape.labelup, textcolor=color.white, size=size.normal, text="🟦 BIG")
+
+// ─── BREAK / PURE / PURE+ ────────────────────────────────────────────────────
+bool anyBuySignalCondition = superNarrowBullish or (cprBreakoutSignal_v2 and not isAPlusPlus) or (cprNarrowBreakout and not cprBreakoutSignal_v2) or mtfConfluence or kernelBuy or perfBuySignal or (isAPlusPlus and not isCprEnt)
+bool anySignalAllCondition = (anyBuySignalCondition or isKernelAng or isEma20Ang or isEma50Ang or isEma200Ang) and baseTotalScore > 2
+grpAngBreak = "🎯 Any-Signal Breakout Mark (New)"
+showAngBreakLine = input.bool(true, title="Show Marked Signal-Close Line", group=grpAngBreak)
+showAngBreakLabel = input.bool(true, title="Show Breakout Label", group=grpAngBreak)
+angBreakLineColor = input.color(color.new(color.aqua, 0), title="Signal Line Color", group=grpAngBreak)
+angBreakLabelColor = input.color(color.new(#FF6B00, 0), title="Break Label Color", group=grpAngBreak)
+angBreakLineWidth = input.int(2, title="Line Width", minval=1, maxval=4, group=grpAngBreak)
+var float angMarkedClose = na
+var line angMarkedLine = na
+var bool angWaitingBreak = false
+if anySignalAllCondition
+    if not na(angMarkedLine)
+        line.delete(angMarkedLine)
+    angMarkedClose := close
+    angWaitingBreak := true
+    if showAngBreakLine
+        angMarkedLine := line.new(bar_index, angMarkedClose, bar_index + 1, angMarkedClose, xloc=xloc.bar_index, color=angBreakLineColor, width=angBreakLineWidth, style=line.style_dashed, extend=extend.right)
+bool angBreakoutSignal = false
+if angWaitingBreak and not anySignalAllCondition and not na(angMarkedClose)
+    if close >= angMarkedClose and candleGreen and trendAlignmentFilter
+        angBreakoutSignal := true
+        if not na(angMarkedLine)
+            line.delete(angMarkedLine)
+        angMarkedLine := na
+        angWaitingBreak := false
+bool pureSignal = angBreakoutSignal and (open < close[1] or open < close[3]) and trendAlignmentFilter
+bool showBreakLabelRaw = showAngBreakLabel and angBreakoutSignal and not pureSignal
+bool showPureLabelRaw = showAngBreakLabel and pureSignal
+bool showBreakLabelV6 = showBreakLabelRaw and not showBreakLabelRaw[1]
+bool showPureLabelV6 = showPureLabelRaw and not showPureLabelRaw[1]
+plotshape(showBreakLabelV6, title="Any-Signal Breakout Label (BREAK)", location=location.belowbar, color=angBreakLabelColor, style=shape.labelup, textcolor=color.white, size=size.normal, text="🎯 BREAK")
+plotshape(showPureLabelV6, title="Any-Signal Pure Breakout Label (PURE)", location=location.belowbar, color=color.lime, style=shape.labelup, textcolor=color.black, size=size.normal, text="✅ PURE")
+grpPurePlus = "➕ PURE+ (Enhanced PURE Confirmation)"
+enablePurePlus = input.bool(true, title="Enable PURE+ Signal", group=grpPurePlus)
+purePlusLabelColor = input.color(color.new(#FF9100, 0), title="PURE+ Label Color", group=grpPurePlus)
+purePlusMaxBars = input.int(10, title="Max Bars to Watch for Reclaim Inside Bands", minval=1, maxval=50, group=grpPurePlus)
+var float purePlusAnchorClose = na
+var int purePlusAnchorBar = na
+var bool purePlusWaitingReclaim = false
+if pureSignal
+    purePlusAnchorClose := close
+    purePlusAnchorBar := bar_index
+    purePlusWaitingReclaim := true
+bool purePlusImmediate = pureSignal and open > bbUpperBand and close > bbUpperBand
+if purePlusImmediate
+    purePlusWaitingReclaim := false
+    purePlusAnchorBar := na
+    purePlusAnchorClose := na
+bool purePlusAfterAnchorBar = purePlusWaitingReclaim and not na(purePlusAnchorBar) and bar_index > purePlusAnchorBar
+bool purePlusWithinWindow = purePlusAfterAnchorBar and bar_index - purePlusAnchorBar <= purePlusMaxBars
+bool purePlusCandleGreen = candleGreen
+bool purePlusOpenInsideBands = open < bbUpperBand and open > bbLowerBand
+bool purePlusCloseInsideBands = close < bbUpperBand and close > bbLowerBand
+bool purePlusCloseBelowAnchor = not na(purePlusAnchorClose) and close < purePlusAnchorClose
+bool purePlusReclaimSignal = purePlusWithinWindow and purePlusCandleGreen and purePlusOpenInsideBands and purePlusCloseInsideBands and purePlusCloseBelowAnchor
+if purePlusReclaimSignal
+    purePlusWaitingReclaim := false
+    purePlusAnchorBar := na
+    purePlusAnchorClose := na
+if purePlusWaitingReclaim and not na(purePlusAnchorBar) and bar_index - purePlusAnchorBar > purePlusMaxBars
+    purePlusWaitingReclaim := false
+    purePlusAnchorBar := na
+    purePlusAnchorClose := na
+bool purePlusSignal = enablePurePlus and (purePlusImmediate or purePlusReclaimSignal)
+plotshape(purePlusSignal, title="PURE+ Label", location=location.belowbar, color=purePlusLabelColor, style=shape.labelup, textcolor=color.black, size=size.normal, text="➕ PURE+")
+
+// ─── RETRACE ─────────────────────────────────────────────────────────────────
+grpRetrace = "🌀 RETRACE (Strict Kernel Dip & Reclaim + TC Reclaim After BREAK)"
+enableRetrace = input.bool(true, title="Enable RETRACE Signal", group=grpRetrace)
+retraceLabelColor = input.color(color.new(#00BCD4, 0), title="RETRACE Label Color", group=grpRetrace)
+retraceMaxBars = input.int(50, title="Max Bars to Watch After BREAK", minval=5, maxval=300, group=grpRetrace)
+retraceMinKernelDipPct = input.float(10.0, title="Min Kernel Dip (% of Candle Range)", minval=1.0, maxval=100.0, step=1.0, group=grpRetrace)
+var float retraceBreakClose = na
+var int retraceAnchorBar = na
+var bool waitingForRetrace = false
+if showBreakLabelV6
+    retraceBreakClose := close
+    retraceAnchorBar := bar_index
+    waitingForRetrace := true
+bool retraceAfterBreakBar = waitingForRetrace and not na(retraceAnchorBar) and bar_index > retraceAnchorBar
+bool retraceWithinWindow = retraceAfterBreakBar and bar_index - retraceAnchorBar <= retraceMaxBars
+float retraceKernelDipAmt = yhat1 - low
+bool retraceDipBelowKernel = low < yhat1
+bool retraceDipEnough = rangeOk and retraceKernelDipAmt >= candleRange * retraceMinKernelDipPct / 100.0
+bool retraceCloseAboveKernel = close > yhat1
+bool retraceCloseBelowBreakClose = not na(retraceBreakClose) and close < retraceBreakClose
+bool retraceCloseAboveTC = close > TC
+bool retraceSignal = enableRetrace and retraceWithinWindow and retraceCloseBelowBreakClose and retraceDipBelowKernel and retraceDipEnough and retraceCloseAboveKernel and retraceCloseAboveTC
+if retraceSignal
+    waitingForRetrace := false
+    retraceAnchorBar := na
+    retraceBreakClose := na
+if waitingForRetrace and not na(retraceAnchorBar) and bar_index - retraceAnchorBar > retraceMaxBars
+    waitingForRetrace := false
+    retraceAnchorBar := na
+    retraceBreakClose := na
+plotshape(retraceSignal, title="RETRACE Label", location=location.belowbar, color=retraceLabelColor, style=shape.labelup, textcolor=color.black, size=size.normal, text="🌀 RETRACE")
+
+// ─── ULT_CONF ────────────────────────────────────────────────────────────────
+grpUltConf = "🌟 ULT_CONF — Enhanced CONF Confirmation (Fully Independent)"
+enableUltConf = input.bool(true, title="Enable ULT_CONF Signal", group=grpUltConf)
+ultConfLabelColor = input.color(color.new(#FFD700, 0), title="ULT_CONF Label Color", group=grpUltConf)
+ultConfRsiLength = input.int(14, title="ULT_CONF RSI Length", minval=1, group=grpUltConf)
+ultConfRsiThreshold = input.float(70.0, title="ULT_CONF RSI Overbought Threshold", minval=50.0, maxval=100.0, step=0.5, group=grpUltConf)
+grpUltConfScore = "🌟 ULT_CONF — Independent Score Settings"
+ucMinScore = input.int(3, title="ULT_CONF Minimum Base Score Required", minval=1, maxval=11, group=grpUltConfScore)
+int uc_baseTotalScore = baseTotalScore
+bool uc_trendAlignmentFilter = trendAlignmentFilter
+grpUltConfBBSlope = "🌟 ULT_CONF — Independent BB Slope Filter"
+enableUcBBSlopeFilter = input.bool(true, title="Require BB Slope for ULT_CONF", group=grpUltConfBBSlope)
+ucBbSlopeSource = input.string("Upper", title="BB Line Used for Slope Calc (ULT_CONF)", options=["Basis", "Upper", "Lower"], group=grpUltConfBBSlope)
+ucBbSlopeMinAngle = input.float(40.0, title="Minimum BB Slope Angle (Degrees) (ULT_CONF)", group=grpUltConfBBSlope, minval=0.0, maxval=90.0)
+float uc_bbSlopeSourceValue = ucBbSlopeSource == "Basis" ? bbBasis : ucBbSlopeSource == "Upper" ? bbUpperBand : bbLowerBand
+float uc_bbSlopeAngle = math.atan((uc_bbSlopeSourceValue - uc_bbSlopeSourceValue[1]) / atr14Safe) * RAD2DEG
+bool uc_isBBSlopeOk = not enableUcBBSlopeFilter or uc_bbSlopeAngle >= ucBbSlopeMinAngle
+grpUltConfMacdStruct = "🌟 ULT_CONF — Independent MACD Histogram Structure Filter"
+enableUcMacdConfFilter = input.bool(true, title="Require MACD Histogram Structure for ULT_CONF", group=grpUltConfMacdStruct)
+bool uc_macdHistogramStructureOk = not enableUcMacdConfFilter or macdBothInsideBullishZone
+bool uc_showConfLabel = uc_baseTotalScore >= ucMinScore and uc_trendAlignmentFilter and uc_isBBSlopeOk and uc_macdHistogramStructureOk
+bool uc_showConfLabelV6 = uc_showConfLabel and not uc_showConfLabel[1]
+bool ultConfHistGreen = hist > 0
+bool ultConfPrevStraddleZero = math.min(macdLine[1], macdSignalLine[1]) <= 0 and math.max(macdLine[1], macdSignalLine[1]) >= 0
+float ultConfRsiValue = ta.rsi(close, ultConfRsiLength)
+bool ultConfRsiCond = ultConfRsiValue >= ultConfRsiThreshold
+bool ultConfSignal = enableUltConf and uc_showConfLabelV6 and ultConfHistGreen and ultConfPrevStraddleZero and ultConfRsiCond
+plotshape(ultConfSignal, title="ULT_CONF Label", location=location.belowbar, color=ultConfLabelColor, style=shape.labelup, textcolor=color.black, size=size.normal, text="🌟 ULT_CONF")
+
+// ─── RSI DATA WINDOW ─────────────────────────────────────────────────────────
+grpRSI = "📈 RSI Level"
+showRSI = input.bool(true, title="Show RSI Value", group=grpRSI)
+rsiLength = input.int(14, title="RSI Length", group=grpRSI, minval=1)
+rsiSource = input.source(close, title="RSI Source", group=grpRSI)
+rsiOB = input.int(70, title="RSI Overbought Level", group=grpRSI, minval=50, maxval=100)
+rsiOS = input.int(30, title="RSI Oversold Level", group=grpRSI, minval=0, maxval=50)
+rsiColor = input.color(color.new(color.purple, 0), title="RSI Line Color", group=grpRSI)
+float rsiValue = ta.rsi(rsiSource, rsiLength)
+
+// ─── CONF HIGH PULLBACK ──────────────────────────────────────────────────────
+grpConfPull = "🔁 CONF High Pullback (New Module)"
+showConfPullback = input.bool(true, title="Enable CONF High Pullback Logic", group=grpConfPull)
+showConfPullLine = input.bool(true, title="Show Marked CONF High Line", group=grpConfPull)
+showConfPullLabel = input.bool(true, title="Show PULL Label", group=grpConfPull)
+confPullWaitBars = input.int(15, title="Waiting Period (bars)", minval=1, maxval=200, group=grpConfPull)
+confPullLineColor = input.color(color.new(color.orange, 0), title="Marked CONF High Line Color", group=grpConfPull)
+confPullLabelColor = input.color(color.new(color.aqua, 0), title="PULL Label Color", group=grpConfPull)
+var float markedConfHigh = na
+var int confHighBarIndex = na
+var line confHighLine = na
+var bool waitingForPull = false
+var bool pullDoneForThis = false
+bool newConfSignal = showConfPullback and showConfLabel
+if newConfSignal
+    if not na(confHighLine)
+        line.delete(confHighLine)
+    markedConfHigh := high
+    confHighBarIndex := bar_index
+    waitingForPull := true
+    pullDoneForThis := false
+    if showConfPullLine
+        confHighLine := line.new(bar_index, markedConfHigh, bar_index + 1, markedConfHigh, xloc=xloc.bar_index, color=confPullLineColor, width=2, style=line.style_dashed, extend=extend.right)
+bool confPullSignal = false
+if showConfPullback and waitingForPull and not pullDoneForThis and not newConfSignal
+    if bar_index - confHighBarIndex > confPullWaitBars
+        if open < markedConfHigh and close > markedConfHigh and trendAlignmentFilter
+            confPullSignal := true
+            pullDoneForThis := true
+            waitingForPull := false
+            if not na(confHighLine)
+                line.delete(confHighLine)
+                confHighLine := na
+bool showPullLabelRaw = showConfPullLabel and confPullSignal
+bool showPullLabelV6 = showPullLabelRaw and not showPullLabelRaw[1]
+plotshape(showPullLabelV6, title="CONF High Pullback Label (PULL)", location=location.belowbar, color=confPullLabelColor, style=shape.labelup, size=size.normal, text="🔁 PULL")
+
+// ─── AUTO LIQUIDITY SUPPORT ──────────────────────────────────────────────────
+grpAutoSup = "🟢 Auto Support Line (Liquidity Sweep Level) — Revised"
+enableAutoSupport = input.bool(true, title="Enable Auto Support Line on CONF/PULL/PURE", group=grpAutoSup)
+supportPivotLen = input.int(5, title="Liquidity Pivot Strength (Left/Right Bars)", group=grpAutoSup, minval=1, maxval=50)
+maxLiqSearchBars = input.int(150, title="Max Bars to Search Back for Liquidity Pivot", group=grpAutoSup, minval=10, maxval=500)
+supportLineColor = input.color(color.new(color.lime, 0), title="Support Line Color", group=grpAutoSup)
+supportLineWidth = input.int(2, title="Support Line Width", minval=1, maxval=4, group=grpAutoSup)
+supportLineStyleStr = input.string("Dashed", title="Support Line Style", options=["Solid", "Dashed", "Dotted"], group=grpAutoSup)
+showSupportLabel = input.bool(true, title="Show Support Price Label", group=grpAutoSup)
+supportLabelColor = input.color(color.new(color.lime, 0), title="Support Label Color", group=grpAutoSup)
+replaceOnNewSignal = input.bool(true, title="Replace Old Support Line on New Signal", group=grpAutoSup)
+supportHistoryLimit = input.int(50, title="Max Historical Support Lines (when not replacing)", minval=1, maxval=200, group=grpAutoSup)
+fallbackLookback = input.int(20, title="Fallback Lowest-Low Bars (if no pivot found)", group=grpAutoSup, minval=5, maxval=200)
+useCorrectedLiquidityPivotLookup = input.bool(false, title="Use Corrected Latest-Pivot Lookup (May Change SUP Results)", tooltip="OFF preserves the original v2 result stream, which effectively always used the fallback lowest-low because its exact binary search did not find a past pivot. ON uses the intended latest confirmed liquidity pivot and can therefore change Auto-Support/SUP/EXT_ORIG results.", group=grpAutoSup)
+liqPivLow = ta.pivotlow(low, supportPivotLen, supportPivotLen)
+var float[] liqPlPrice = array.new_float(0)
+var int[] liqPlBar = array.new_int(0)
+int liqMaxStore = 300
+if not na(liqPivLow)
+    array.push(liqPlPrice, liqPivLow)
+    array.push(liqPlBar, bar_index - supportPivotLen)
+    if array.size(liqPlPrice) > liqMaxStore
+        array.shift(liqPlPrice)
+        array.shift(liqPlBar)
+
+f_findLatestLiquidityLow(int currentBar, int maxLookbackLiq) =>
+    float foundPrice = na
+    int foundBar = na
+    int sz = array.size(liqPlBar)
+    if sz > 0
+        for n = 0 to sz - 1
+            int idx = sz - 1 - n
+            int b = array.get(liqPlBar, idx)
+            if b < currentBar
+                if currentBar - b <= maxLookbackLiq
+                    foundPrice := array.get(liqPlPrice, idx)
+                    foundBar := b
+                break
+    [foundPrice, foundBar]
+supportLineStyleResolved = supportLineStyleStr == "Dashed" ? line.style_dashed : supportLineStyleStr == "Dotted" ? line.style_dotted : line.style_solid
+var line autoSupportLine = na
+var line[] autoSupportHistoryLines = array.new_line()
+var label autoSupportLabel = na
+var float autoSupportPrice = na
+var int autoSupportBar = na
+float fallbackLowest = ta.lowest(low, fallbackLookback)
+int fallbackOffsetSeries = ta.lowestbars(low, fallbackLookback)
+bool triggerAutoSupport = enableAutoSupport and (showConfLabel or pureSignal or confPullSignal)
+if triggerAutoSupport
+    float liqPrice = na
+    int liqBar = na
+    if useCorrectedLiquidityPivotLookup
+        [foundLiqPrice, foundLiqBar] = f_findLatestLiquidityLow(bar_index, maxLiqSearchBars)
+        liqPrice := foundLiqPrice
+        liqBar := foundLiqBar
+    float finalSupportPrice = na
+    int finalSupportBar = na
+    if not na(liqPrice)
+        finalSupportPrice := liqPrice
+        finalSupportBar := liqBar
+    else
+        finalSupportPrice := fallbackLowest
+        finalSupportBar := bar_index + fallbackOffsetSeries
+    autoSupportPrice := finalSupportPrice
+    autoSupportBar := finalSupportBar
+    if replaceOnNewSignal
+        if na(autoSupportLine)
+            autoSupportLine := line.new(autoSupportBar, autoSupportPrice, bar_index + 1, autoSupportPrice, xloc=xloc.bar_index, color=supportLineColor, width=supportLineWidth, style=supportLineStyleResolved, extend=extend.right)
+        else
+            line.set_xy1(autoSupportLine, autoSupportBar, autoSupportPrice)
+            line.set_xy2(autoSupportLine, bar_index + 1, autoSupportPrice)
+            line.set_color(autoSupportLine, supportLineColor)
+            line.set_width(autoSupportLine, supportLineWidth)
+            line.set_style(autoSupportLine, supportLineStyleResolved)
+            line.set_extend(autoSupportLine, extend.right)
+        if not na(autoSupportLabel)
+            label.delete(autoSupportLabel)
+        autoSupportLabel := na
+    else
+        autoSupportLine := line.new(autoSupportBar, autoSupportPrice, bar_index + 1, autoSupportPrice, xloc=xloc.bar_index, color=supportLineColor, width=supportLineWidth, style=supportLineStyleResolved, extend=extend.right)
+        array.push(autoSupportHistoryLines, autoSupportLine)
+        if array.size(autoSupportHistoryLines) > supportHistoryLimit
+            line.delete(array.shift(autoSupportHistoryLines))
+
+if barstate.islast
+    if enableAutoSupport and showSupportLabel and not na(autoSupportPrice)
+        if na(autoSupportLabel)
+            autoSupportLabel := label.new(bar_index, autoSupportPrice, "", xloc=xloc.bar_index, style=label.style_label_left, color=supportLabelColor, textcolor=color.black, size=size.small)
+        label.set_xy(autoSupportLabel, bar_index, autoSupportPrice)
+        label.set_text(autoSupportLabel, "SUPPORT: " + str.tostring(autoSupportPrice, format.mintick))
+        label.set_color(autoSupportLabel, supportLabelColor)
+        label.set_textcolor(autoSupportLabel, color.black)
+    else if not na(autoSupportLabel)
+        label.delete(autoSupportLabel)
+        autoSupportLabel := na
+bool touchTrendStrengthFilter = ema20 > ema50 and yhat1 > ema20
+bool autoSupportTouch = not na(autoSupportPrice) and not triggerAutoSupport and bar_index > autoSupportBar and low <= autoSupportPrice and high >= autoSupportPrice and kernelBullish and touchTrendStrengthFilter
+
+// ─── RETEST ──────────────────────────────────────────────────────────────────
+grpRetest = "🔄 CONF/PURE Retest Logic"
+enableRetest = input.bool(true, title="Enable CONF/PURE Retest Logic", group=grpRetest)
+showRetestLine = input.bool(true, title="Show Marked Signal-Low Line", group=grpRetest)
+showRetestLabel = input.bool(true, title="Show RETEST Label", group=grpRetest)
+retestLineColor = input.color(color.new(color.aqua, 0), title="Marked Signal-Low Line Color", group=grpRetest)
+retestLabelColor = input.color(color.new(color.aqua, 0), title="RETEST Label Color", group=grpRetest)
+retestMaxBars = input.int(50, title="Max Bars to Watch for Retest", group=grpRetest, minval=5, maxval=300)
+var float retestLevel = na
+var float retestConfOpen = na
+var int retestSignalBar = na
+var bool retestArmed = false
+var line retestLevelLine = na
+bool newConfOrPureSignal = enableRetest and (showConfLabel or pureSignal)
+if newConfOrPureSignal
+    if not na(retestLevelLine)
+        line.delete(retestLevelLine)
+    retestLevel := low
+    retestConfOpen := open
+    retestSignalBar := bar_index
+    retestArmed := true
+    if showRetestLine
+        retestLevelLine := line.new(bar_index, retestLevel, bar_index + 1, retestLevel, xloc=xloc.bar_index, color=retestLineColor, width=1, style=line.style_dashed, extend=extend.right)
+bool retestSignal = false
+if retestArmed and not newConfOrPureSignal and not na(retestLevel)
+    bool retestWithinWindow = bar_index - retestSignalBar <= retestMaxBars
+    bool retestAfterSignalBar = bar_index > retestSignalBar
+    bool retestTouch = low <= retestLevel and high >= retestLevel
+    bool retestCloseAboveConfOpen = close > retestConfOpen
+    if retestWithinWindow and retestAfterSignalBar and retestTouch and retestCloseAboveConfOpen
+        retestSignal := true
+        retestArmed := false
+        if not na(retestLevelLine)
+            line.delete(retestLevelLine)
+            retestLevelLine := na
+    if not retestWithinWindow and retestAfterSignalBar
+        retestArmed := false
+        if not na(retestLevelLine)
+            line.delete(retestLevelLine)
+            retestLevelLine := na
+bool showRetestLabelV6 = showRetestLabel and retestSignal
+plotshape(showRetestLabelV6, title="CONF/PURE Retest Label (RETEST)", location=location.belowbar, color=retestLabelColor, style=shape.labelup, textcolor=color.black, size=size.normal, text="🔄 RETEST")
+// ─── HR / HR+ / HR++ ─────────────────────────────────────────────────────────
+grpHR = "🕐 HR — Current Timeframe Bullish Body Pattern (Strict — Green Candle + Kernel Green + MACD Green + True Rising Streak Required)"
+enableHR = input.bool(true, title="Enable HR Signal", group=grpHR)
+hrBodyRatio = input.float(0.80, title="Minimum Body Ratio", minval=0.50, maxval=1.00, step=0.05, group=grpHR)
+hrLabelColor = input.color(color.new(#00E676, 0), title="HR Label Color", group=grpHR)
+grpMACD = "📈 MACD Histogram Filter (Shared by HR, HR+, HR++)"
+requireMacdGreen = input.bool(true, title="Require MACD Histogram Positive (Green Zone)", group=grpMACD)
+requireMacdRising = input.bool(true, title="Require MACD Histogram Rising (vs Previous Bar)", group=grpMACD)
+requireMacdRisingStreak = input.bool(true, title="Require Consecutive Rising Streak (Rejects Sliding/Chop)", group=grpMACD)
+macdRisingStreakBars = input.int(3, title="Consecutive Rising Bars Required", minval=1, maxval=10, group=grpMACD)
+macdFastLen_HR = input.int(12, title="MACD Fast Length", group=grpMACD)
+macdSlowLen_HR = input.int(26, title="MACD Slow Length", group=grpMACD)
+macdSigLen_HR = input.int(9, title="MACD Signal Length", group=grpMACD)
+macdSrc_HR = input.source(close, title="MACD Source", group=grpMACD)
+grpHRPlus = "🔺 HR+ (Independent — Prev-Candle HR Pattern + Kernel Flip + MACD Green & True Rising Streak + Current Candle MUST Be Green)"
+enableHRPlus = input.bool(true, title="Enable HR+ Signal", group=grpHRPlus)
+hrPlusBodyRatio = input.float(0.80, title="HR+ Minimum Body Ratio (Prev Candle)", minval=0.50, maxval=1.00, step=0.05, group=grpHRPlus)
+hrPlusLabelColor = input.color(color.new(#76FF03, 0), title="HR+ Label Color", group=grpHRPlus)
+grpHRPlusPlus = "🔻 HR++ (Existing HR Logic incl. Green Candle + MACD Green & True Rising Streak — Must Occur Below BC Line)"
+enableHRPlusPlus = input.bool(true, title="Enable HR++ Signal", group=grpHRPlusPlus)
+hrPlusPlusStrictBelow = input.bool(true, title="Require ENTIRE Candle Below BC (High < BC)", group=grpHRPlusPlus)
+hrPlusPlusLabelColor = input.color(color.new(#FF1744, 0), title="HR++ Label Color", group=grpHRPlusPlus)
+grpInfo = "📊 Line Position Info Label"
+showLineInfo = input.bool(true, title="Show Kernel/EMA20/EMA50/EMA200 % Position Label", group=grpInfo)
+lineInfoUseRange = input.bool(false, title="Use Full Candle Range Instead of Body for % Calc", group=grpInfo)
+lineInfoShowEma200 = input.bool(true, title="Include EMA200 % in Label", group=grpInfo)
+lineInfoShowMacd = input.bool(true, title="Include MACD Histogram Status in Label", group=grpInfo)
+lineInfoColor = input.color(color.new(#FFFFFF, 0), title="Info Label Text Color", group=grpInfo)
+lineInfoBg = input.color(color.new(#000000, 20), title="Info Label Background", group=grpInfo)
+lineInfoDecimals = input.string("#.0", title="Decimal Format", options=["#", "#.0", "#.00"], group=grpInfo)
+[hrMacdLine, hrMacdSignalLine, hrMacdHist] = ta.macd(macdSrc_HR, macdFastLen_HR, macdSlowLen_HR, macdSigLen_HR)
+max_bars_back(hrMacdHist, 20)  // f_histRisingStreak reads hrMacdHist[i] / hrMacdHist[i + 1]
+bool hrMacdHistPositive = hrMacdHist > 0
+bool hrMacdHistRising = hrMacdHist > hrMacdHist[1]
+f_histRisingStreak(_len) =>
+    bool _ok = true
+    for i = 0 to _len - 1
+        if not (hrMacdHist[i] > hrMacdHist[i + 1])
+            _ok := false
+            break
+    _ok
+bool hrMacdHistRisingStreak = f_histRisingStreak(macdRisingStreakBars)
+bool hrMacdOk = (not requireMacdGreen or hrMacdHistPositive) and (not requireMacdRising or hrMacdHistRising) and (not requireMacdRisingStreak or hrMacdHistRisingStreak)
+bool hrGreen = candleGreen
+bool hrStrongBody = rangeOk and bodyAbs / candleRange >= hrBodyRatio
+bool hrKernelInBody = yhat1 >= bodyLow and yhat1 <= bodyHigh
+bool hrEma20InBody = ema20 >= bodyLow and ema20 <= bodyHigh
+bool hrEma50InBody = ema50 >= bodyLow and ema50 <= bodyHigh
+int hrLineCount = (hrKernelInBody ? 1 : 0) + (hrEma20InBody ? 1 : 0) + (hrEma50InBody ? 1 : 0)
+bool hrAtLeastTwoLines = hrLineCount >= 2
+bool hrKernelGreen = kernelBullish
+bool hrSignal = enableHR and hrGreen and candleGreen and hrStrongBody and hrKernelInBody and hrEma20InBody and hrAtLeastTwoLines and hrKernelGreen and hrMacdOk
+//plotshape(hrSignal, title="HR Label", location=location.belowbar, color=hrLabelColor, style=shape.labelup, textcolor=color.black, size=size.normal, text="HR")
+float hrPlus_prevRange = high[1] - low[1]
+float hrPlus_prevAbsBody = math.abs(close[1] - open[1])
+float hrPlus_prevBodyLow = math.min(open[1], close[1])
+float hrPlus_prevBodyHigh = math.max(open[1], close[1])
+bool hrPlus_prevGreen = close[1] > open[1]
+bool hrPlus_prevStrongBody = hrPlus_prevRange > 0 and hrPlus_prevAbsBody / hrPlus_prevRange >= hrPlusBodyRatio
+bool hrPlus_prevKernelInBody = yhat1[1] >= hrPlus_prevBodyLow and yhat1[1] <= hrPlus_prevBodyHigh
+bool hrPlus_prevEma20InBody = ema20[1] >= hrPlus_prevBodyLow and ema20[1] <= hrPlus_prevBodyHigh
+bool hrPlus_prevEma50InBody = ema50[1] >= hrPlus_prevBodyLow and ema50[1] <= hrPlus_prevBodyHigh
+int hrPlus_prevLineCount = (hrPlus_prevKernelInBody ? 1 : 0) + (hrPlus_prevEma20InBody ? 1 : 0) + (hrPlus_prevEma50InBody ? 1 : 0)
+bool hrPlus_prevAtLeastTwoLines = hrPlus_prevLineCount >= 2
+bool hrPlus_prevHRPattern = hrPlus_prevGreen and hrPlus_prevStrongBody and hrPlus_prevKernelInBody and hrPlus_prevEma20InBody and hrPlus_prevAtLeastTwoLines
+bool hrPlus_kernelWasRed = krPlotColor[1] == krBearColor
+bool hrPlus_kernelNowGreen = kernelBullish
+bool hrPlus_kernelFlip = hrPlus_kernelWasRed and hrPlus_kernelNowGreen
+bool hrPlus_macdOk = hrMacdOk
+bool hrPlusSignal = enableHRPlus and hrPlus_prevHRPattern and hrPlus_kernelFlip and hrPlus_macdOk and candleGreen
+bool hrPlusPlus_belowBC = hrPlusPlusStrictBelow ? high < BC : close < BC
+bool hrPlusPlusSignal = enableHRPlusPlus and hrSignal and hrMacdOk and candleGreen and hrPlusPlus_belowBC
+float infoLo = lineInfoUseRange ? low : bodyLow
+float infoHi = lineInfoUseRange ? high : bodyHigh
+float kernelPct = f_pctInZone(yhat1, infoLo, infoHi)
+float ema20Pct = f_pctInZone(ema20, infoLo, infoHi)
+float ema50Pct = f_pctInZone(ema50, infoLo, infoHi)
+float ema200Pct = f_pctInZone(ema200, infoLo, infoHi)
+bool anyHRSignalDisplay = hrSignal or hrPlusSignal or hrPlusPlusSignal
+if showLineInfo and anyHRSignalDisplay
+    string infoText = "K:" + str.tostring(kernelPct, lineInfoDecimals) + "% E20:" + str.tostring(ema20Pct, lineInfoDecimals) + "% E50:" + str.tostring(ema50Pct, lineInfoDecimals) + "%"
+    if lineInfoShowEma200
+        infoText += " E200:" + str.tostring(ema200Pct, lineInfoDecimals) + "%"
+    if lineInfoShowMacd
+        infoText += " MACD:" + str.tostring(hrMacdHist, "#.###") + (hrMacdHistPositive ? " 🟢" : " 🔴") + (hrMacdHistRising ? " ↑" : " ↓") + (hrMacdHistRisingStreak ? " 📈Streak" : " 〰️NoStreak")
+    label.new(bar_index, low, text=infoText, xloc=xloc.bar_index, style=label.style_label_up, color=lineInfoBg, textcolor=lineInfoColor, size=size.small)
+
+// ─── MAS / ENGULF ────────────────────────────────────────────────────────────
+grpMAS = "🅼 MAS — Current Timeframe Bullish Body Pattern (Master_HR import)"
+enableMAS = input.bool(true, title="Enable MAS Signal", group=grpMAS)
+masBodyRatio = input.float(0.80, title="MAS Minimum Body Ratio", minval=0.50, maxval=1.00, step=0.05, group=grpMAS)
+showMASLabel = input.bool(true, title="Show MAS Label", group=grpMAS)
+masLabelColor = input.color(color.new(#00E676, 0), title="MAS Label Color", group=grpMAS)
+float masBodyRatioValue = rangeOk ? bodyAbs / candleRange : 0.0
+bool masStrongBody = rangeOk and masBodyRatioValue >= masBodyRatio
+bool masSignal = enableMAS and candleGreen and masStrongBody and hrKernelInBody and hrEma20InBody and hrAtLeastTwoLines
+plotshape(showMASLabel and masSignal, title="MAS Label", location=location.belowbar, color=masLabelColor, style=shape.labelup, textcolor=color.black, size=size.normal, text="🅼 MAS")
+
+grpEngulf = "🟩 ENGULF — Bullish Engulfing + Kernel/EMA Wrap + MACD Confirm"
+enableEngulf = input.bool(true, title="Enable ENGULF Signal", group=grpEngulf)
+engulfLabelColor = input.color(color.new(color.yellow, 0), title="ENGULF Label Color", group=grpEngulf)
+bool engulfGreen = candleGreen
+bool engulfKernelInside = hrKernelInBody
+bool engulfEma20Inside = hrEma20InBody
+bool engulfEma50Inside = hrEma50InBody
+bool engulfKernelGreen = kernelBullish
+bool engulfPrevRed = close[1] < open[1]
+bool engulfBodyEngulfsPrev = open <= close[1] and close >= open[1]
+bool engulfHistPrevRed = hist[1] < 0
+bool engulfHistNowGreen = hist > 0
+bool engulfHistFlip = engulfHistPrevRed and engulfHistNowGreen
+bool engulfMacdCrossNow = ta.crossover(macdLine, macdSignalLine)
+bool engulfMacdCrossBelowZeroNow = engulfMacdCrossNow and macdLine < 0 and macdSignalLine < 0
+bool engulfMacdCrossBelowZeroPrev = engulfMacdCrossNow[1] and macdLine[1] < 0 and macdSignalLine[1] < 0
+bool engulfMacdCrossBelowZero = engulfMacdCrossBelowZeroNow or engulfMacdCrossBelowZeroPrev
+bool engulfMacdConfirm = engulfHistFlip and engulfMacdCrossBelowZero
+bool engulfSignal = enableEngulf and engulfGreen and engulfKernelInside and engulfEma20Inside and engulfEma50Inside and engulfKernelGreen and engulfPrevRed and engulfBodyEngulfsPrev and engulfMacdConfirm
+plotshape(engulfSignal, title="ENGULF Label", location=location.belowbar, color=engulfLabelColor, style=shape.labelup, textcolor=color.black, size=size.normal, text="🟩 ENGULF")
+
+// ─── STRONG / ULT_STR / STR++ / ULT_STR++ / REVERSAL ────────────────────────
+grpStrong = "💪 STRONG Pattern (Strict 2 Red + 2 Green Below-Lines Setup)"
+enableStrongPattern = input.bool(true, title="Enable STRONG Pattern Signal", group=grpStrong)
+showStrongFamilyLabels = input.bool(true, title="Show STRONG / ULT_STR Labels", tooltip="The original code counted STRONG and ULT_STR in the 22-score but had their plotshape calls commented out. This restores visual consistency without changing either signal condition.", group=grpStrong)
+strongLabelColor = input.color(color.new(#00E5FF, 0), title="STRONG Label Color", group=grpStrong)
+strongMinBodyRatio = input.float(90.0, title="Min Body Ratio % (4th Candle)", minval=50.0, maxval=100.0, step=1.0, group=grpStrong)
+strongMinLowerWickRatio = input.float(80.0, title="Min Lower-Wick Ratio % (Alt. 4th Candle)", minval=50.0, maxval=100.0, step=1.0, group=grpStrong)
+requireBBLowerTouch = input.bool(false, title="Require BB Lower Band Touch (Current or Previous Candle)", group=grpStrong)
+f_strongLineFloor(int off) =>
+    math.min(math.min(yhat1[off], ema20[off]), math.min(ema50[off], ema200[off]))
+bool strong_c3_red = close[3] < open[3]
+bool strong_c3_below = high[3] < f_strongLineFloor(3)
+bool strong_c2_red = close[2] < open[2]
+bool strong_c2_below = high[2] < f_strongLineFloor(2)
+bool strong_c1_green = close[1] > open[1]
+bool strong_c1_below = high[1] < f_strongLineFloor(1)
+bool strong_c0_green = candleGreen
+bool strong_c0_below = high < f_strongLineFloor(0)
+float strong_lowerWick = bodyLow - low
+float strong_bodyRatioPct = rangeOk ? bodyAbs / candleRange * 100 : 0.0
+float strong_lowerWickRatioPct = rangeOk ? strong_lowerWick / candleRange * 100 : 0.0
+bool strong_candleShapeOk = strong_bodyRatioPct >= strongMinBodyRatio or strong_lowerWickRatioPct >= strongMinLowerWickRatio
+bool strong_histRed = hist < 0
+bool strong_macdLineBelowSignal = macdLine < macdSignalLine
+bool strong_bothBelowZero = macdLine < 0 and macdSignalLine < 0
+bool strong_macdConfirm = strong_histRed and strong_macdLineBelowSignal and strong_bothBelowZero
+bool strong_bbTouchNow = low <= bbLowerBand
+bool strong_bbTouchPrev = low[1] <= bbLowerBand[1]
+bool strong_bbTouchOk = not requireBBLowerTouch or strong_bbTouchNow or strong_bbTouchPrev
+bool strongSignal = enableStrongPattern and strong_c3_red and strong_c3_below and strong_c2_red and strong_c2_below and strong_c1_green and strong_c1_below and strong_c0_green and strong_c0_below and strong_candleShapeOk and strong_macdConfirm and strong_bbTouchOk
+//plotshape(showStrongFamilyLabels and strongSignal, title="STRONG Pattern Label", location=location.belowbar, color=strongLabelColor, style=shape.labelup, textcolor=color.black, size=size.normal, text="💪 STRONG")
+
+grpUlt = "🚀 ULT_STR (Kernel Reclaim Confirmation After STRONG)"
+enableUltStrong = input.bool(true, title="Enable ULT_STR Signal", group=grpUlt)
+ultLabelColor = input.color(color.new(#FFD700, 0), title="ULT_STR Label Color", group=grpUlt)
+var float strongCloseLevel = na
+var bool waitingForUlt = false
+if strongSignal
+    strongCloseLevel := close
+    waitingForUlt := true
+bool ult_candleGreen = candleGreen
+bool ult_aboveKernel = close > yhat1
+bool ult_belowStrongClose = not na(strongCloseLevel) and close < strongCloseLevel
+bool ultStrSignal = enableUltStrong and waitingForUlt and not strongSignal and ult_candleGreen and ult_aboveKernel and ult_belowStrongClose
+if ultStrSignal
+    waitingForUlt := false
+//plotshape(showStrongFamilyLabels and ultStrSignal, title="ULT_STR Label", location=location.belowbar, color=ultLabelColor, style=shape.labelup, textcolor=color.black, size=size.normal, text="🚀 ULT_STR")
+
+grpStrPlus = "⚡ STR++ (Repeat STRONG Below ULT_STR Close)"
+enableStrPlus = input.bool(true, title="Enable STR++ Signal", group=grpStrPlus)
+strPlusLabelColor = input.color(color.new(#FF00FF, 0), title="STR++ Label Color", group=grpStrPlus)
+strPlusInvalidatePct = input.float(1.0, title="Invalidate Upside Move % (from ULT_STR Close)", minval=0.1, step=0.1, group=grpStrPlus)
+var float ultCloseLevel = na
+var bool waitingForStrPlus = false
+if ultStrSignal
+    ultCloseLevel := close
+    waitingForStrPlus := true
+bool strPlusCandidate = waitingForStrPlus and not na(ultCloseLevel)
+bool strPlusInvalidateNow = strPlusCandidate and high >= ultCloseLevel * (1.0 + strPlusInvalidatePct / 100.0)
+bool strPlusTriggerNow = enableStrPlus and strPlusCandidate and not strPlusInvalidateNow and not ultStrSignal and strongSignal and close < ultCloseLevel
+if strPlusInvalidateNow
+    waitingForStrPlus := false
+    ultCloseLevel := na
+if strPlusTriggerNow
+    waitingForStrPlus := false
+    ultCloseLevel := na
+plotshape(strPlusTriggerNow, title="STR++ Label", location=location.belowbar, color=strPlusLabelColor, style=shape.labelup, textcolor=color.black, size=size.normal, text="⚡ STR++")
+
+grpUltStrPlus = "🔥 ULT_STR++ (Kernel Reclaim Confirmation After STR++)"
+enableUltStrPlus = input.bool(true, title="Enable ULT_STR++ Signal", group=grpUltStrPlus)
+ultStrPlusLabelColor = input.color(color.new(#00FFAA, 0), title="ULT_STR++ Label Color", group=grpUltStrPlus)
+var float strPlusCloseLevel = na
+var bool waitingForUltStrPlus = false
+if strPlusTriggerNow
+    strPlusCloseLevel := close
+    waitingForUltStrPlus := true
+bool ultStrPlus_candleGreen = candleGreen
+bool ultStrPlus_aboveKernel = close > yhat1
+bool ultStrPlus_belowStrPlusClose = not na(strPlusCloseLevel) and close < strPlusCloseLevel
+bool ultStrPlusSignal = enableUltStrPlus and waitingForUltStrPlus and not strPlusTriggerNow and ultStrPlus_candleGreen and ultStrPlus_aboveKernel and ultStrPlus_belowStrPlusClose
+if ultStrPlusSignal
+    waitingForUltStrPlus := false
+    strPlusCloseLevel := na
+plotshape(ultStrPlusSignal, title="ULT_STR++ Label", location=location.belowbar, color=ultStrPlusLabelColor, style=shape.labelup, textcolor=color.black, size=size.normal, text="🔥 ULT_STR++")
+
+grpReversal = "🔄 REVERSAL (Hammer Candle BELOW ULT_STR++ Close, Resets On Any Other Signal)"
+enableReversal = input.bool(true, title="Enable REVERSAL Signal", group=grpReversal)
+reversalLabelColor = input.color(color.new(#FF6D00, 0), title="REVERSAL Label Color", group=grpReversal)
+reversalMinWickRatio = input.float(70.0, title="Min Lower-Wick Ratio % (Hammer)", minval=50.0, maxval=100.0, step=1.0, group=grpReversal)
+reversalUpperWickTolPct = input.float(5.0, title="Max Upper-Wick % of Range (Body-Top ≈ High)", minval=0.0, maxval=30.0, step=0.5, group=grpReversal)
+reversalRequirePriceDown = input.bool(true, title="Require Current Candle Close < Previous Close (Downtrend)", group=grpReversal)
+var float reversalAnchorClose = na
+var bool waitingForReversal = false
+if ultStrPlusSignal
+    reversalAnchorClose := close
+    waitingForReversal := true
+bool reversalResetSignal = waitingForReversal and not ultStrPlusSignal and (strongSignal or ultStrSignal or strPlusTriggerNow)
+if reversalResetSignal
+    waitingForReversal := false
+    reversalAnchorClose := na
+bool reversal_priceDown = not reversalRequirePriceDown or close < close[1]
+bool reversal_belowAnchorClose = not na(reversalAnchorClose) and close < reversalAnchorClose
+float reversal_upperWick = high - bodyHigh
+float reversal_lowerWick = bodyLow - low
+float reversal_lowerWickRatioPct = rangeOk ? reversal_lowerWick / candleRange * 100 : 0.0
+bool reversal_upperWickOk = rangeOk and reversal_upperWick <= candleRange * reversalUpperWickTolPct / 100.0
+bool reversal_wickOk = reversal_lowerWickRatioPct >= reversalMinWickRatio
+bool reversal_bbInside = low <= bbLowerBand and high >= bbLowerBand
+bool reversal_hammerPattern = reversal_upperWickOk and reversal_wickOk and reversal_bbInside
+bool reversalSignal = enableReversal and waitingForReversal and not ultStrPlusSignal and reversal_priceDown and reversal_belowAnchorClose and reversal_hammerPattern
+if reversalSignal
+    waitingForReversal := false
+    reversalAnchorClose := na
+plotshape(reversalSignal, title="REVERSAL Label", location=location.belowbar, color=reversalLabelColor, style=shape.labelup, textcolor=color.black, size=size.normal, text="🔄 REVERSAL")
+bool ultStrOrStrPlusSignal = (strPlusTriggerNow and strongSignal) or ultStrPlusSignal or reversalSignal
+
+// ─── K+ ──────────────────────────────────────────────────────────────────────
+grpKPlus = "🟢 K+ Label (EMA/Kernel Alignment)"
+enableKPlus = input.bool(true, title="Enable K+ Label", group=grpKPlus)
+kPlusColor = input.color(color.new(color.lime, 0), title="K+ Label Color", group=grpKPlus)
+bool kpKernelGreen = kernelBullish
+bool kpKernelAboveEma20 = yhat1 > ema20
+bool kpEma20AboveEma50 = ema20 > ema50
+bool kpEma20AboveEma200 = ema20 > ema200
+bool kpEma200BelowKernel = ema200 < yhat1
+bool kpKernelInsideCandle = yhat1 >= low and yhat1 <= high
+bool kpPrev5AnyEma200AboveKernel = ema200[1] > yhat1[1] or ema200[2] > yhat1[2] or ema200[3] > yhat1[3] or ema200[4] > yhat1[4] or ema200[5] > yhat1[5]
+bool kPlusCondition = enableKPlus and kpKernelGreen and kpKernelAboveEma20 and kpEma20AboveEma50 and kpEma20AboveEma200 and kpEma200BelowKernel and kpKernelInsideCandle and kpPrev5AnyEma200AboveKernel
+plotshape(kPlusCondition, title="K+ Label", location=location.belowbar, color=kPlusColor, style=shape.labelup, textcolor=color.black, size=size.small, text="K+")
+// ─── 16-SIGNAL SCORE TABLE ───────────────────────────────────────────────────
+int c12 = autoSupportTouch ? 1 : 0
+int c13 = retestSignal ? 1 : 0
+int c14 = hrSignal ? 1 : 0
+int c15 = engulfSignal ? 1 : 0
+int c16 = masSignal ? 1 : 0
+int totalScore = baseTotalScore + c12 + c13 + c14 + c15 + c16
+grpScore = "📊 Multi-Signal Score Table"
+showScoreTable = input.bool(true, title="Show Signal Score Table", group=grpScore)
+scoreTablePos = input.string("Top Right", title="Score Table Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Middle Right", "Middle Left"], group=grpScore)
+var table scoreTable = na
+if showScoreTable and barstate.islast
+    string activeSigs = ""
+    if c1 > 0
+        activeSigs += "⚡ Super Bullish\n"
+    if c2 > 0
+        activeSigs += "🚀 CPR Breakout (ANG)\n"
+    if c3 > 0
+        activeSigs += "💥 Narrow Breakout\n"
+    if c4 > 0
+        activeSigs += "⭐ MTF Confluence\n"
+    if c5 > 0
+        activeSigs += "🔮 Kernel Buy\n"
+    if c6 > 0
+        activeSigs += "🏆 PERF Buy\n"
+    if c7 > 0
+        activeSigs += "🌟 A++ Breakout\n"
+    if c8 > 0
+        activeSigs += "📐 Kernel ANG\n"
+    if c9 > 0
+        activeSigs += "📐 EMA 20 ANG\n"
+    if c10 > 0
+        activeSigs += "📐 EMA 50 ANG\n"
+    if c11 > 0
+        activeSigs += "📐 EMA 200 ANG\n"
+    if c12 > 0
+        activeSigs += "🎯 TOUCH\n"
+    if c13 > 0
+        activeSigs += "🔄 RETEST\n"
+    if c14 > 0
+        activeSigs += "🕐 HR\n"
+    if c15 > 0
+        activeSigs += "🟩 ENGULF\n"
+    if c16 > 0
+        activeSigs += "🅼 MAS\n"
+    if activeSigs == ""
+        activeSigs := "— No Signals Active —"
+    if na(scoreTable)
+        string tpScore = scoreTablePos == "Top Right" ? position.top_right : scoreTablePos == "Top Left" ? position.top_left : scoreTablePos == "Bottom Right" ? position.bottom_right : scoreTablePos == "Bottom Left" ? position.bottom_left : scoreTablePos == "Middle Right" ? position.middle_right : position.middle_left
+        scoreTable := table.new(tpScore, 2, 3, bgcolor=color.new(#1A1A2E, 10), border_color=color.new(color.gray, 50), border_width=1, frame_color=color.new(color.gray, 30), frame_width=1)
+        table.merge_cells(scoreTable, 0, 0, 1, 0)
+        table.merge_cells(scoreTable, 0, 2, 1, 2)
+        table.cell(scoreTable, 0, 0, "🎯 SIGNAL SCORE", text_color=#00E5FF, text_size=size.small, bgcolor=#0D0D1A, text_halign=text.align_center)
+    color scoreColor = totalScore >= 6 ? #00E676 : totalScore >= 3 ? #FFD700 : totalScore > 0 ? #FF6B00 : color.gray
+    table.cell(scoreTable, 0, 1, "Score", text_color=color.silver, text_size=size.small, bgcolor=#16213E, text_halign=text.align_left)
+    table.cell(scoreTable, 1, 1, str.tostring(totalScore) + " / 16", text_color=scoreColor, text_size=size.normal, bgcolor=#16213E, text_halign=text.align_right)
+    table.cell(scoreTable, 0, 2, activeSigs, text_color=color.white, text_size=size.tiny, bgcolor=color.new(#0D0D1A, 30), text_halign=text.align_left)
+
+bool supBaseSignal = showConfLabel or confPullSignal or angBreakoutSignal or retestSignal or autoSupportTouch or hrSignal
+bool supSupportTouch = not na(autoSupportPrice) and low <= autoSupportPrice and high >= autoSupportPrice
+bool supSignal = enableAutoSupport and supBaseSignal and supSupportTouch
+plotshape(supSignal, title="SUP Label", location=location.belowbar, color=#00E676, style=shape.labelup, textcolor=color.black, size=size.normal, text="SUP")
+
+// ─── 22-LABEL ALL-SIGNAL SCORE ───────────────────────────────────────────────
+grpAllScore = "🏁 ALL-SIGNAL SCORE (22-Label Total)"
+showAllScoreTable = input.bool(true, title="Show All-Signal Score Table", group=grpAllScore)
+allScoreTablePos = input.string("Top Left", title="All-Signal Score Table Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Middle Right", "Middle Left"], group=grpAllScore)
+int score_CONF = showConfLabelV6 ? 1 : 0
+int score_ORIG = origSignal ? 1 : 0
+int score_BIG = bigSignal ? 1 : 0
+int score_BREAK = showBreakLabelV6 ? 1 : 0
+int score_PURE = showPureLabelV6 ? 1 : 0
+int score_PURE_PLUS = purePlusSignal ? 1 : 0
+int score_RETRACE = retraceSignal ? 1 : 0
+int score_ULT_CONF = ultConfSignal ? 1 : 0
+int score_PULL = showPullLabelV6 ? 1 : 0
+int score_RETEST = showRetestLabelV6 ? 1 : 0
+int score_SUP = supSignal ? 1 : 0
+int score_HR = hrSignal ? 1 : 0
+int score_HR_PLUS = hrPlusSignal ? 1 : 0
+int score_HR_PLUS_PLUS = hrPlusPlusSignal ? 1 : 0
+int score_MAS = showMASLabel and masSignal ? 1 : 0
+int score_ENGULF = engulfSignal ? 1 : 0
+int score_STRONG = strongSignal ? 1 : 0
+int score_ULT_STR = ultStrSignal ? 1 : 0
+int score_STR_PLUS = strPlusTriggerNow ? 1 : 0
+int score_ULT_STR_PLUS = ultStrPlusSignal ? 1 : 0
+int score_REVERSAL = reversalSignal ? 1 : 0
+int score_KPLUS = kPlusCondition ? 1 : 0
+int finalSignalScore = score_CONF + score_ORIG + score_BIG + score_BREAK + score_PURE + score_PURE_PLUS + score_RETRACE + score_ULT_CONF + score_PULL + score_RETEST + score_SUP + score_HR + score_HR_PLUS + score_HR_PLUS_PLUS + score_MAS + score_ENGULF + score_STRONG + score_ULT_STR + score_STR_PLUS + score_ULT_STR_PLUS + score_REVERSAL + score_KPLUS
+string allScoreStatus = finalSignalScore >= 10 ? "Very Strong" : finalSignalScore >= 6 ? "Strong" : finalSignalScore >= 3 ? "Moderate" : "Low"
+color allScoreColor = finalSignalScore >= 10 ? #00E676 : finalSignalScore >= 6 ? #FFD700 : finalSignalScore >= 3 ? #FF6B00 : color.gray
+var table allSignalScoreTable = na
+if showAllScoreTable and barstate.islast
+    string allScoreActiveList = ""
+    if score_CONF > 0
+        allScoreActiveList += "CONF\n"
+    if score_ORIG > 0
+        allScoreActiveList += "ORIG\n"
+    if score_BIG > 0
+        allScoreActiveList += "BIG\n"
+    if score_BREAK > 0
+        allScoreActiveList += "BREAK\n"
+    if score_PURE > 0
+        allScoreActiveList += "PURE\n"
+    if score_PURE_PLUS > 0
+        allScoreActiveList += "PURE+\n"
+    if score_RETRACE > 0
+        allScoreActiveList += "RETRACE\n"
+    if score_ULT_CONF > 0
+        allScoreActiveList += "ULT_CONF\n"
+    if score_PULL > 0
+        allScoreActiveList += "PULL\n"
+    if score_RETEST > 0
+        allScoreActiveList += "RETEST\n"
+    if score_SUP > 0
+        allScoreActiveList += "SUP\n"
+    if score_HR > 0
+        allScoreActiveList += "HR\n"
+    if score_HR_PLUS > 0
+        allScoreActiveList += "HR+\n"
+    if score_HR_PLUS_PLUS > 0
+        allScoreActiveList += "HR++\n"
+    if score_MAS > 0
+        allScoreActiveList += "MAS\n"
+    if score_ENGULF > 0
+        allScoreActiveList += "ENGULF\n"
+    if score_STRONG > 0
+        allScoreActiveList += "STRONG\n"
+    if score_ULT_STR > 0
+        allScoreActiveList += "ULT_STR\n"
+    if score_STR_PLUS > 0
+        allScoreActiveList += "STR++\n"
+    if score_ULT_STR_PLUS > 0
+        allScoreActiveList += "ULT_STR++\n"
+    if score_REVERSAL > 0
+        allScoreActiveList += "REVERSAL\n"
+    if score_KPLUS > 0
+        allScoreActiveList += "K+\n"
+    if allScoreActiveList == ""
+        allScoreActiveList := "— No Signals Active —"
+    if na(allSignalScoreTable)
+        string tpAllScore = allScoreTablePos == "Top Right" ? position.top_right : allScoreTablePos == "Top Left" ? position.top_left : allScoreTablePos == "Bottom Right" ? position.bottom_right : allScoreTablePos == "Bottom Left" ? position.bottom_left : allScoreTablePos == "Middle Right" ? position.middle_right : position.middle_left
+        allSignalScoreTable := table.new(tpAllScore, 2, 3, bgcolor=color.new(#1A1A2E, 10), border_color=color.new(color.gray, 50), border_width=1, frame_color=color.new(color.gray, 30), frame_width=1)
+        table.merge_cells(allSignalScoreTable, 0, 0, 1, 0)
+        table.merge_cells(allSignalScoreTable, 0, 2, 1, 2)
+        table.cell(allSignalScoreTable, 0, 0, "🏁 ALL-SIGNAL SCORE", text_color=#FFD700, text_size=size.small, bgcolor=#0D0D1A, text_halign=text.align_center)
+    table.cell(allSignalScoreTable, 0, 1, "Score (" + allScoreStatus + ")", text_color=color.silver, text_size=size.small, bgcolor=#16213E, text_halign=text.align_left)
+    table.cell(allSignalScoreTable, 1, 1, str.tostring(finalSignalScore) + " / 22", text_color=allScoreColor, text_size=size.normal, bgcolor=#16213E, text_halign=text.align_right)
+    table.cell(allSignalScoreTable, 0, 2, allScoreActiveList, text_color=color.white, text_size=size.tiny, bgcolor=color.new(#0D0D1A, 30), text_halign=text.align_left)
+
+// ─── EXT_ORIG ────────────────────────────────────────────────────────────────
+grpExtOrig = "🟣 EXT_ORIG (Extremely Narrow + Any 22-Signal)"
+enableExtOrig = input.bool(true, title="Enable EXT_ORIG Signal", group=grpExtOrig)
+extOrigUseSessionSnapshot = input.bool(true, title="Use Session-Locked EN Status (Same As Top Label)", tooltip="ON = status locked at session boundary. OFF = raw bar-by-bar isExtremelyNarrow.", group=grpExtOrig)
+showExtOrigLabel = input.bool(true, title="Show EXT_ORIG Label Above Bar", group=grpExtOrig)
+extOrigUsePlotshape = input.bool(true, title="Draw With plotshape (OFF = label.new Above High)", group=grpExtOrig)
+extOrigShowStats = input.bool(true, title="Include 22-Signal Score + Width% In label.new", group=grpExtOrig)
+extOrigLabelColor = input.color(color.new(#D500F9, 0), title="EXT_ORIG Label Color", group=grpExtOrig)
+extOrigLabelTextColor = input.color(color.white, title="EXT_ORIG Label Text Color", group=grpExtOrig)
+extOrigLabelSizeStr = input.string(
+     "Small",
+     title="EXT_ORIG Label Size",
+     options=["Tiny", "Small", "Normal"],
+     group=grpExtOrig)
+
+// Used only by label.new()
+extOrigLabelSizeResolved =
+     extOrigLabelSizeStr == "Tiny" ? size.tiny :
+     extOrigLabelSizeStr == "Normal" ? size.normal :
+     size.small
+
+bool anyOf22Signals = finalSignalScore >= 1
+bool extOrigSessionIsNarrow =
+     extOrigUseSessionSnapshot ? cprStatusSessionValid and cprStatusSessionIsNarrow : isExtremelyNarrow
+
+bool extOrigSignal = enableExtOrig and extOrigSessionIsNarrow and anyOf22Signals
+bool extOrigDisplay = extOrigSignal and showExtOrigLabel
+
+//plot(extOrigSignal ? 1 : 0, title="EXT_ORIG (1/0)", display=display.data_window)
+
+
+plotshape(extOrigDisplay and extOrigUsePlotshape and extOrigLabelSizeStr == "Small", title="EXT_ORIG Label Small",  location=location.abovebar, color=extOrigLabelColor, style=shape.labeldown, textcolor=extOrigLabelTextColor, size=size.small, text="EXT_ORIG")
+
+
+// label.new() can continue using the resolved size
+if extOrigDisplay and not extOrigUsePlotshape
+    string extOrigText = "🟣 EXT_ORIG"
+    if extOrigShowStats
+        extOrigText += "\n" + str.tostring(finalSignalScore) +
+                       "/22 • W:" + str.tostring(cprWidthPct, "#.###") + "%"
+
+    // FIX: explicit xloc=xloc.bar_index added for coordinate-system consistency.
+    label.new(bar_index, high, text=extOrigText, xloc=xloc.bar_index, yloc=yloc.abovebar,  style=label.style_label_down, color=extOrigLabelColor, textcolor=extOrigLabelTextColor, size=extOrigLabelSizeResolved )
+
+// ─── COMBINED STATE + ALERTS ─────────────────────────────────────────────────
+bool combinedSignalNow = showConfLabelV6 or showBreakLabelV6 or showPureLabelV6 or purePlusSignal or showPullLabelV6 or retestSignal or supSignal or strongSignal or engulfSignal or ultConfSignal or kPlusCondition or ultStrSignal or strPlusTriggerNow or ultStrPlusSignal or reversalSignal or bigSignal or retraceSignal or hrSignal or hrPlusSignal or hrPlusPlusSignal or origSignal or masSignal
+bool combinedSignalPrev = combinedSignalNow[1]
+bool combinedSignalNowOrPrev = combinedSignalNow or combinedSignalPrev
+
+//alertcondition(extOrigSignal, title="🟣 EXT_ORIG Signal", message="🟣 EXT_ORIG — Extremely Narrow CPR + 22-Signal fired on {{ticker}} {{interval}} at Price: {{close}}")
+//alertcondition(extOrigSignal[1], title="🟣 EXT_ORIG PREV Signal", message="🟣 EXT_ORIG (previous candle) — Extremely Narrow CPR + 22-Signal on {{ticker}} {{interval}} at Price: {{close}}")
+//alertcondition(enableNarrowAlert and isNewCprStatusSession and cprStatusSessionIsNarrow, title="🔴 EXTREMELY NARROW CPR Session", message="🔴 Extremely Narrow CPR session started on {{ticker}} {{interval}}")
+// ═══════════════════════════════════════════════════════════════════════════════
+// █████████████████████████████████████████████████████████████████████████████
+//  SCRIPT 2 — "Sameira - Intmaker_Common_v2"  (original code, result-preserving)
+// █████████████████████████████████████████████████████████████████████████████
+// ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+// KERNEL REGRESSION INPUTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+groupKernel = "🔮 Kernel Regression"
+
+krSrcB       = input.source(close, "Source", group=groupKernel)
+krHB         = input.float(8.0, "Lookback Window", group=groupKernel, minval=3)
+krRB         = input.float(8.0, "Relative Weight", group=groupKernel)
+krX0B        = input.int(25, "Start Regression At Bar", group=groupKernel)
+krLagB       = input.int(5, "Lag (smoothing)", group=groupKernel, minval=1)
+krWindowB    = input.int(50, "Kernel Window", group=groupKernel)
+krSmoothB    = input.bool(true, "Smooth Colors", group=groupKernel)
+
+krBullColorB = input.color(#3AFF17, "Bullish Color", group=groupKernel)
+krBearColorB = input.color(#FD1707, "Bearish Color", group=groupKernel)
+
+// krSrcB[i] is indexed with the kernel loop counter (i ≤ krNB, clamped to 2000 below),
+// i.e. a runtime offset — declare its buffer instead of relying on autodetection.
+max_bars_back(krSrcB, 2001)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CROSSOVER FILTER INPUTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+groupCross = "📈 Crossover Filter"
+
+crossLookback = input.int(20, "Crossover Lookback (Candles)", minval=1, group=groupCross)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TOP / RESISTANCE FILTER INPUTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+groupTop = "🚫 Top / Resistance Filter"
+
+topFilterEnabled = input.bool(true, "Enable Top Filter", group=groupTop)
+topLookback = input.int(20, "Top Detection Lookback", minval=2, group=groupTop)
+topDistancePct = input.float(0.50, "Minimum Distance From Recent High (%)", minval=0.0, step=0.10, group=groupTop)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LINE POSITION INFO INPUTS — TOP CENTRE PANEL   (logic ported from Shasha_Sameira_v1)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+groupLineInfo = "📊 Line Position Info (Top Centre)"
+
+showLineInfoB         = input.bool(true,  "Show Kernel / EMA % Position Panel", group=groupLineInfo)
+lineInfoOnlyOnSignal = input.bool(false, "Only Show When A Signal Fires (KERNEL / EMA200 / EMAKER / KMAKER / INTMAKER)", group=groupLineInfo)
+lineInfoUseRangeB     = input.bool(false, "Use Full Candle Range Instead Of Body For % Calc", group=groupLineInfo)
+lineInfoShowEma200B   = input.bool(true,  "Include EMA 200", group=groupLineInfo)
+lineInfoShowPrice    = input.bool(true,  "Show Line Price Along With %", group=groupLineInfo)
+lineInfoShowMacdB     = input.bool(false, "Include MACD Histogram Status", group=groupLineInfo)
+lineInfoShowScore    = input.bool(true,  "Include Total Score", group=groupLineInfo)
+
+// ─── VERTICAL POSITION ────────────────────────────────────────────────────────
+lineInfoVOffset   = input.int(1, "Vertical Offset — Steps Below Top Edge", options=[0, 1, 2, 3, 4], group=groupLineInfo)
+lineInfoOffsetPad = input.bool(false, "Offset As Padding (box stays at top, text moves down)", group=groupLineInfo)
+
+// ─── DARK-THEME STYLING ───────────────────────────────────────────────────────
+lineInfoBold         = input.bool(false, "BOLD Text (Unicode) — switch OFF if you see ▯ boxes", group=groupLineInfo)
+lineInfoTextSize     = input.string("Large", "Text Size", options=["Normal", "Large", "Huge"], group=groupLineInfo)
+lineInfoTextColor    = input.color(color.new(#FFEB3B, 0),  "Text Colour (Yellow)",           group=groupLineInfo)
+lineInfoHighlight    = input.bool(false, "Dim Lines That Sit OUTSIDE The Candle", group=groupLineInfo)
+lineInfoInsideColor  = input.color(color.new(#FFEB3B, 0),  "Inside-Candle Colour",           group=groupLineInfo)
+lineInfoOutsideColor = input.color(color.new(#FFEB3B, 60), "Outside-Candle Colour (dimmed)", group=groupLineInfo)
+lineInfoBgColor      = input.color(color.new(#000000, 35), "Panel Background",               group=groupLineInfo)
+
+liMacdFast           = input.int(12, "MACD Fast Length",   minval=1, group=groupLineInfo)
+liMacdSlow           = input.int(26, "MACD Slow Length",   minval=1, group=groupLineInfo)
+liMacdSig            = input.int(9,  "MACD Signal Length", minval=1, group=groupLineInfo)
+lineInfoDecimalsB     = input.string("#.0", "Decimal Format", options=["#", "#.0", "#.00"], group=groupLineInfo)
+
+// Number of panel columns is fixed by the inputs above
+int liCols = 3 + (lineInfoShowEma200B ? 1 : 0) + (lineInfoShowMacdB ? 1 : 0) + (lineInfoShowScore ? 1 : 0)
+
+string liTextSize = lineInfoTextSize == "Huge" ? size.huge : lineInfoTextSize == "Normal" ? size.normal : size.large
+
+int liRows = 1 + lineInfoVOffset
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// KTOUCHER FILTER INPUTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+groupKtoucher = "🎯 KTOUCHER Filter"
+
+ktoucherMinBodyRatio = input.float(85.0, "Min Body Ratio % — RED Touching Candle (Body/Range)", minval=50.0, maxval=100.0, step=1.0, group=groupKtoucher, tooltip="For RED touching candles: the candle's own BODY must make up at least this % of its total range (i.e. the WICK is small — roughly 10-15%). This describes the candle's SHAPE/ANATOMY, NOT how far it dips below the Kernel Regression line. GREEN candles are not subject to this filter.")
+
+groupScore = "🏆 Score System"
+
+scoreAlertThreshold = input.float(5, "Alert When Total Score >=", minval=0, step=0.5, group=groupScore)
+
+float maxPossibleScore = 6
+
+int krNB = math.min(krWindowB + krX0B, 2000)
+float krH2B = krHB - krLagB
+
+var float[] krW1B = array.new_float(0)
+var float[] krW2B = array.new_float(0)
+var float krDen1B = 0.0
+var float krDen2B = 0.0
+
+if barstate.isfirst
+    for i = 0 to krNB
+        float w1 = math.pow(1 + (i * i) / (2 * krHB * krHB * krRB), -krRB)
+        float w2 = math.pow(1 + (i * i) / (2 * krH2B * krH2B * krRB), -krRB)
+        array.push(krW1B, w1)
+        array.push(krW2B, w2)
+        krDen1B += w1
+        krDen2B += w2
+
+float krNum1B = 0.0
+float krNum2B = 0.0
+
+for i = 0 to krNB
+    float s = krSrcB[i]
+    krNum1B += s * array.get(krW1B, i)
+    krNum2B += s * array.get(krW2B, i)
+
+float yhat1B = krNum1B / krDen1B
+float yhat2B = krNum2B / krDen2B
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// KERNEL COLOR LOGIC
+// ═══════════════════════════════════════════════════════════════════════════════
+
+bool krIsBullishB = yhat1B > yhat1B[1]
+
+color krPlotColorB = krSmoothB ? (yhat2B > yhat1B ? krBullColorB : krBearColorB) : (krIsBullishB ? krBullColorB : krBearColorB)
+
+float bodyRatio = candleRange > 0 ? (bodyAbs / candleRange) * 100 : 0
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// KERNEL CANDLE PATTERN A — 90% STRONG CANDLE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+bool body90 = bodyRatio >= 90.0
+bool openEqualsLow = open == low
+
+bool kernelPattern90 = candleGreen and body90 and openEqualsLow
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// KERNEL CANDLE PATTERN B — 80% FLEXIBLE CANDLE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+bool body80to90 = bodyRatio >= 70.0 and bodyRatio < 90.0
+
+bool kernelPattern80 = candleGreen and body80to90
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FINAL KERNEL CANDLE CONDITION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+bool kernelCandleCondition = kernelPattern90 or kernelPattern80
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PRICE / KERNEL / EMA STRUCTURE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+bool candleAboveKernel = low > yhat1B
+
+bool kernelEmaStructure = yhat1B > ema20 and ema20 > ema50 and ema50 > ema200
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BULLISH CROSSOVER DETECTION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+bool kernelCrossEma20 = ta.crossover(yhat1B, ema20)
+bool ema50CrossEma200 = ta.crossover(ema50, ema200)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CROSSOVER RECENCY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+int barsSinceKernelCross = ta.barssince(kernelCrossEma20)
+int barsSinceEMA50Cross = ta.barssince(ema50CrossEma200)
+
+bool kernelCrossRecent = not na(barsSinceKernelCross) and barsSinceKernelCross <= crossLookback
+bool ema20CrossRecent = not na(barsSinceEma20_50Cross) and barsSinceEma20_50Cross <= crossLookback
+bool ema50CrossRecent = not na(barsSinceEMA50Cross) and barsSinceEMA50Cross <= crossLookback
+
+bool allCrossoversRecent = kernelCrossRecent and ema20CrossRecent and ema50CrossRecent
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TOP / RESISTANCE FILTER
+// ═══════════════════════════════════════════════════════════════════════════════
+
+float recentHigh = ta.highest(high, topLookback)
+
+float distanceFromTopPct = recentHigh > 0 ? ((recentHigh - close) / recentHigh) * 100 : 0
+
+bool nearRecentTop = distanceFromTopPct < topDistancePct
+
+bool topFilterPassed = not topFilterEnabled or not nearRecentTop
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FINAL KERNEL SIGNAL — LIVE / INTRABAR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+bool kernelSignal = kernelCandleCondition and candleAboveKernel and kernelEmaStructure and allCrossoversRecent and topFilterPassed
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EMA 200 BULLISH CROSS CLOSE LOGIC — LIVE / INTRABAR
+// ═══════════════════════════════════════════════════════════════════════════════
+
+bool ema200OpenBelow = open < ema200
+bool ema200CloseAbove = close > ema200
+
+bool ema200Signal = candleGreen and ema200OpenBelow and ema200CloseAbove
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EMAKER LOGIC
+// ═══════════════════════════════════════════════════════════════════════════════
+
+
+bool bodyLowAboveKernelRegression = bodyLow > yhat1B
+
+bool emaMakerSignal = ema200Signal and bodyLowAboveKernelRegression
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// KMAKER LOGIC
+// ═══════════════════════════════════════════════════════════════════════════════
+
+
+bool kmakerLowAboveEma20   = low > ema20
+
+bool kmakerOpenAboveEma20  = open > ema20
+bool kmakerOpenAboveKernel = open > yhat1B
+bool kmakerEma20AboveKernel =  yhat1B >= ema20
+
+bool kmakerBodyRatio80 = bodyRatio >= 80.0
+
+bool kmakerSignal = candleGreen and kmakerLowAboveEma20 and candleAboveKernel and kmakerOpenAboveEma20 and kmakerOpenAboveKernel and kmakerEma20AboveKernel and kmakerBodyRatio80
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MACD (shared by INTMAKER logic + Line Info Panel)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+[liMacdLine, liMacdSignalLine, liMacdHist] = ta.macd(close, liMacdFast, liMacdSlow, liMacdSig)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INTMAKER LOGIC
+// ═══════════════════════════════════════════════════════════════════════════════
+
+
+bool intMakerMacdHistGreen = liMacdHist > 0
+
+bool intMakerMacdLineAboveHist = liMacdLine > liMacdHist
+
+bool intMakerSignal = kmakerSignal and kernelEmaStructure and intMakerMacdHistGreen and intMakerMacdLineAboveHist and ta.rsi(close, 14) > 70
+
+
+var int  lastBarIndexForTrigger   = -1
+var bool triggeredThisBar         = false   // INTMAKER guard
+var bool kernelTriggeredThisBar   = false
+var bool ema200TriggeredThisBar   = false
+var bool emakerTriggeredThisBar   = false
+var bool kmakerTriggeredThisBar   = false
+var bool ktoucherTriggeredThisBar = false   // used later, once ktoucherSignal exists
+
+if bar_index != lastBarIndexForTrigger
+    triggeredThisBar         := false
+    kernelTriggeredThisBar   := false
+    ema200TriggeredThisBar   := false
+    emakerTriggeredThisBar   := false
+    kmakerTriggeredThisBar   := false
+    ktoucherTriggeredThisBar := false
+    lastBarIndexForTrigger   := bar_index
+
+bool intMakerTrigger = intMakerSignal and not intMakerSignal[1] and not triggeredThisBar
+
+if intMakerTrigger
+    triggeredThisBar := true
+
+bool kernelTrigger = kernelSignal and not kernelSignal[1] and not kernelTriggeredThisBar
+if kernelTrigger
+    kernelTriggeredThisBar := true
+
+bool ema200Trigger = ema200Signal and not ema200Signal[1] and not ema200TriggeredThisBar
+if ema200Trigger
+    ema200TriggeredThisBar := true
+
+bool emakerTrigger = emaMakerSignal and not emaMakerSignal[1] and not emakerTriggeredThisBar
+if emakerTrigger
+    emakerTriggeredThisBar := true
+
+bool kmakerTrigger = kmakerSignal and not kmakerSignal[1] and not kmakerTriggeredThisBar
+if kmakerTrigger
+    kmakerTriggeredThisBar := true
+
+var int intMakerDayCount = 0
+
+bool newDay = ta.change(time("D")) != 0
+
+if newDay
+    intMakerDayCount := 0
+
+if intMakerTrigger
+    intMakerDayCount += 1
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INTMAKER ALERT LIMIT — ONLY FIRST 2 TRIGGERS PER DAY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+bool intMakerAlertLimited = intMakerTrigger and intMakerDayCount <= 2
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// KTOUCHER LOGIC
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var bool  ktoucherArmed         = false
+var float ktoucherKmakerClose   = na
+var int   ktoucherArmedBarIndex = na
+
+if kmakerSignal
+    ktoucherArmed         := true
+    ktoucherKmakerClose   := close
+    ktoucherArmedBarIndex := bar_index
+
+bool ktoucherIsRedCandle     = close < open
+bool ktoucherTouchesKernel   = low <= yhat1B
+bool ktoucherClosesAbove     = close > yhat1B
+// [MERGED] ktoucherBodyAboveKernel removed — provably identical to bodyLowAboveKernelRegression above; ktoucherRedValid now reuses it.
+
+bool ktoucherRedValid = ktoucherIsRedCandle and ktoucherTouchesKernel and ktoucherClosesAbove and bodyLowAboveKernelRegression and bodyRatio >= ktoucherMinBodyRatio
+
+bool ktoucherGreenValid = (not ktoucherIsRedCandle) and ktoucherTouchesKernel and ktoucherClosesAbove
+
+bool ktoucherValidCandle = ktoucherRedValid or ktoucherGreenValid
+
+bool ktoucherIsUpcomingBar = na(ktoucherArmedBarIndex) ? false : bar_index > ktoucherArmedBarIndex
+
+bool ktoucherSignal = ktoucherArmed and ktoucherIsUpcomingBar and ktoucherValidCandle
+
+if ktoucherSignal
+    ktoucherArmed := false
+
+// One-shot trigger for the Daily Score Total (guard declared earlier above)
+bool ktoucherTrigger = ktoucherSignal and not ktoucherSignal[1] and not ktoucherTriggeredThisBar
+if ktoucherTrigger
+    ktoucherTriggeredThisBar := true
+
+float scoreKernel   = kernelSignal    ? 1.0 : 0.0
+float scoreEma200   = ema200Signal    ? 1.0 : 0.0
+float scoreEmaker   = emaMakerSignal  ? 1.0 : 0.0
+float scoreKmaker   = kmakerSignal    ? 1.0 : 0.0
+float scoreIntmaker = intMakerSignal  ? 1.0 : 0.0
+float scoreKtoucher = ktoucherSignal  ? 1.0 : 0.0
+
+float totalScoreB    = scoreKernel + scoreEma200 + scoreEmaker + scoreKmaker + scoreIntmaker + scoreKtoucher
+float totalScorePct = maxPossibleScore > 0 ? totalScoreB / maxPossibleScore * 100.0 : na
+
+var float dailyScoreTotal = 0.0
+
+if newDay
+    dailyScoreTotal := 0.0
+
+if kernelTrigger
+    dailyScoreTotal += 1.0
+if ema200Trigger
+    dailyScoreTotal += 1.0
+if emakerTrigger
+    dailyScoreTotal += 1.0
+if kmakerTrigger
+    dailyScoreTotal += 1.0
+if intMakerTrigger
+    dailyScoreTotal += 1.0
+if ktoucherTrigger
+    dailyScoreTotal += 1.0
+// ═══════════════════════════════════════════════════════════════════════════════
+// LINE POSITION %  —  KERNEL / EMA20 / EMA50 / EMA200
+// ═══════════════════════════════════════════════════════════════════════════════
+
+f_bold(string _s) =>
+    string _out = _s
+    _out := str.replace_all(_out, "A", "𝗔")
+    _out := str.replace_all(_out, "C", "𝗖")
+    _out := str.replace_all(_out, "D", "𝗗")
+    _out := str.replace_all(_out, "E", "𝗘")
+    _out := str.replace_all(_out, "K", "𝗞")
+    _out := str.replace_all(_out, "M", "𝗠")
+    _out := str.replace_all(_out, "S", "𝗦")
+    _out := str.replace_all(_out, "O", "𝗢")
+    _out := str.replace_all(_out, "R", "𝗥")
+    _out := str.replace_all(_out, "n", "𝗻")
+    _out := str.replace_all(_out, "a", "𝗮")
+    _out := str.replace_all(_out, "0", "𝟬")
+    _out := str.replace_all(_out, "1", "𝟭")
+    _out := str.replace_all(_out, "2", "𝟮")
+    _out := str.replace_all(_out, "3", "𝟯")
+    _out := str.replace_all(_out, "4", "𝟰")
+    _out := str.replace_all(_out, "5", "𝟱")
+    _out := str.replace_all(_out, "6", "𝟲")
+    _out := str.replace_all(_out, "7", "𝟳")
+    _out := str.replace_all(_out, "8", "𝟴")
+    _out := str.replace_all(_out, "9", "𝟵")
+    _out
+
+f_liText(string _name, float _pct, float _price) =>
+    string _s = _name + " " + (na(_pct) ? "n/a" : str.tostring(_pct, lineInfoDecimalsB) + "%")
+    if lineInfoShowPrice
+        _s := _s + "  |  " + (na(_price) ? "n/a" : str.tostring(_price, format.mintick))
+    lineInfoBold ? f_bold(_s) : _s
+
+f_liColor(float _pct) =>
+    not lineInfoHighlight ? lineInfoTextColor : (not na(_pct) and _pct >= 0.0 and _pct <= 100.0 ? lineInfoInsideColor : lineInfoOutsideColor)
+
+float liZoneLo   = lineInfoUseRangeB ? low  : bodyLow
+float liZoneHi   = lineInfoUseRangeB ? high : bodyHigh
+
+float liKernelPct = f_pctInZone(yhat1B, liZoneLo, liZoneHi)
+float liEma20Pct  = f_pctInZone(ema20, liZoneLo, liZoneHi)
+float liEma50Pct  = f_pctInZone(ema50, liZoneLo, liZoneHi)
+float liEma200Pct = f_pctInZone(ema200, liZoneLo, liZoneHi)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TOP CENTRE PANEL
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var table lineInfoTable = na
+
+bool liShowNow = showLineInfoB and (not lineInfoOnlyOnSignal or (kernelSignal or ema200Signal or emaMakerSignal or kmakerSignal or intMakerSignal))
+
+if barstate.islast and liShowNow
+    int liRow = lineInfoVOffset
+
+    if na(lineInfoTable)
+        lineInfoTable := table.new(position.top_center, liCols, liRows,
+             bgcolor      = lineInfoOffsetPad ? lineInfoBgColor          : na,
+             border_color = lineInfoOffsetPad ? color.new(color.gray, 50) : na,
+             border_width = lineInfoOffsetPad ? 1                         : 0,
+             frame_color  = lineInfoOffsetPad ? color.new(color.gray, 30) : na,
+             frame_width  = lineInfoOffsetPad ? 1                         : 0)
+
+        if lineInfoVOffset > 0
+            for r = 0 to lineInfoVOffset - 1
+                table.cell(lineInfoTable, 0, r, " ", text_size=size.tiny, bgcolor=na)
+
+    table.cell(lineInfoTable, 0, liRow, f_liText("K",    liKernelPct, yhat1B), text_color=f_liColor(liKernelPct), text_size=liTextSize, text_halign=text.align_center, bgcolor=lineInfoBgColor)
+    table.cell(lineInfoTable, 1, liRow, f_liText("E20",  liEma20Pct,  ema20), text_color=f_liColor(liEma20Pct),  text_size=liTextSize, text_halign=text.align_center, bgcolor=lineInfoBgColor)
+    table.cell(lineInfoTable, 2, liRow, f_liText("E50",  liEma50Pct,  ema50), text_color=f_liColor(liEma50Pct),  text_size=liTextSize, text_halign=text.align_center, bgcolor=lineInfoBgColor)
+
+    if lineInfoShowEma200B
+        table.cell(lineInfoTable, 3, liRow, f_liText("E200", liEma200Pct, ema200), text_color=f_liColor(liEma200Pct), text_size=liTextSize, text_halign=text.align_center, bgcolor=lineInfoBgColor)
+
+    if lineInfoShowMacdB
+        string liMacdTxt = "MACD " + str.tostring(liMacdHist, "#.###") + (liMacdHist > 0 ? " 🟢" : " 🔴") + (liMacdHist > liMacdHist[1] ? " ↑" : " ↓")
+        table.cell(lineInfoTable, lineInfoShowEma200B ? 4 : 3, liRow, lineInfoBold ? f_bold(liMacdTxt) : liMacdTxt,
+             text_color=liMacdHist > 0 ? color.new(#00E676, 0) : color.new(#FF1744, 0),
+             text_size=liTextSize, text_halign=text.align_center, bgcolor=lineInfoBgColor)
+
+    if lineInfoShowScore
+        int scoreColIndex = 3 + (lineInfoShowEma200B ? 1 : 0) + (lineInfoShowMacdB ? 1 : 0)
+        string liScoreTxt = "SCORE " + str.tostring(totalScoreB, "#") + "/" + str.tostring(maxPossibleScore, "#")
+        color liScoreColor = totalScoreB >= scoreAlertThreshold ? color.new(#00E676, 0) : lineInfoTextColor
+        table.cell(lineInfoTable, scoreColIndex, liRow, lineInfoBold ? f_bold(liScoreTxt) : liScoreTxt,
+             text_color=liScoreColor, text_size=liTextSize, text_halign=text.align_center, bgcolor=lineInfoBgColor)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DAY CHANGE % — PINE SCREENER COLUMN ONLY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+bool liIsDailyTF = timeframe.isdaily
+
+float previousDayClose = liIsDailyTF ? close[1] : request.security(syminfo.tickerid, "D", close[1], lookahead=barmerge.lookahead_off, gaps=barmerge.gaps_off)
+
+float dayChangePctB = previousDayClose > 0 ? ((close - previousDayClose) / previousDayClose) * 100 : na
+
+plot(dayChangePctB, title="Day Change %", display=display.data_window, precision=2)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INTMAKER DAY COUNT — DATA WINDOW / SCREENER COLUMN ONLY
+// ═══════════════════════════════════════════════════════════════════════════════
+bool kmakerOnlySignal = kmakerSignal and not intMakerSignal
+//plot(intMakerDayCount, title="INTMAKER Day Count", display=display.data_window)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 🏆 SCORE PLOTS — DATA WINDOW / SCREENER COLUMNS ONLY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+plot(totalScoreB,      title="Total Score",       display=display.data_window)
+plot(kernelSignal     ? 1 : 0, title="KERNEL Signal",      display=display.data_window)
+plot(ema200Signal     ? 1 : 0, title="EMA200 Signal",      display=display.data_window)
+plot(emaMakerSignal   ? 1 : 0, title="EMAKER Signal",      display=display.data_window)
+plot(kmakerSignal     ? 1 : 0, title="KMAKER Signal",      display=display.data_window)
+plot(kmakerOnlySignal ? 1 : 0, title="KMAKER Only Signal", display=display.data_window)
+//plot(intMakerSignal   ? 1 : 0, title="INTMAKER Signal",    display=display.data_window)
+//plot(intMakerTrigger  ? 1 : 0, title="INTMAKER Trigger",   display=display.data_window)
+//plot(ktoucherSignal   ? 1 : 0, title="KTOUCHER Signal",    display=display.data_window)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// KERNEL LABEL  (1 point)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+if kernelSignal
+    label.new(x=bar_index, y=na, text="KERNEL +1", yloc=yloc.belowbar, style=label.style_label_up, color=color.new(color.green, 0), textcolor=color.white, size=size.small)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EMA 200 LABEL  (1 point)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+if ema200Signal
+    label.new(x=bar_index, y=na, text="EMA200 +1", yloc=yloc.belowbar, style=label.style_label_up, color=color.new(color.blue, 0), textcolor=color.white, size=size.small)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EMAKER LABEL  (1 point)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+if emaMakerSignal
+    label.new(x=bar_index, y=na, text="EMAKER +1", yloc=yloc.belowbar, style=label.style_label_up, color=color.new(color.purple, 0), textcolor=color.white, size=size.small)
+
+if kmakerOnlySignal
+    label.new(x=bar_index, y=na, text="KMAKER +1", yloc=yloc.belowbar, style=label.style_label_up, color=color.new(color.teal, 0), textcolor=color.white, size=size.small)
+
+if intMakerTrigger
+    label.new(x=bar_index, y=na, text="INTMAKER " + str.tostring(intMakerDayCount) + " (+1)", yloc=yloc.belowbar, style=label.style_label_up, color=color.new(color.maroon, 0), textcolor=color.white, size=size.small)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// KTOUCHER LABEL  (1 point)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+if ktoucherSignal
+    label.new(x=bar_index, y=na, text="KTOUCHER +1", yloc=yloc.abovebar, style=label.style_label_down, color=color.new(color.fuchsia, 0), textcolor=color.white, size=size.small)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ALERTS
+// ═══════════════════════════════════════════════════════════════════════════════
+//alertcondition( kernelSignal or kmakerSignal or intMakerSignal or ktoucherSignal or origSignal or  extOrigSignal, title="PreciseCombined",  message="KERNEL / EMA200 / EMAKER / KMAKER / INTMAKER Signal")
+//alertcondition( kernelSignal[1] or kmakerSignal[1] or intMakerSignal[1] or ktoucherSignal[1] or origSignal[1] or extOrigSignal[1], title="PreciseCombined_prev",  message="KERNEL / EMA200 / EMAKER / KMAKER / INTMAKER Signal")
+
+grpEnBanner = "🔴 Extremely Narrow CPR — Top Centre Text (v3 Add-On)"
+enBannerEnabled       = input.bool(true, title="Show Extremely Narrow CPR Text (Top Centre)", group=grpEnBanner)
+enBannerText          = input.string("🔴 EXTREMELY NARROW CPR TODAY", title="Text To Display When CPR Is Extremely Narrow", group=grpEnBanner)
+enBannerTextColor     = input.color(color.new(#FF1744, 0), title="Text Colour", group=grpEnBanner)
+enBannerBgColor       = input.color(color.new(#0D0D1A, 0), title="Background Colour (100% transp. = no box)", group=grpEnBanner)
+enBannerTextSizeStr   = input.string("Large", title="Text Size", options=["Tiny", "Small", "Normal", "Large", "Huge"], group=grpEnBanner)
+enBannerPosition      = input.string("Top Center", title="Banner Position", options=["Top Center", "Top Right", "Top Left"], group=grpEnBanner)
+enBannerVOffset       = input.int(3, title="Steps Below Top Edge (avoid overlap with other top-centre panels)", options=[0, 1, 2, 3, 4, 5, 6], group=grpEnBanner)
+enBannerOnlyWhenValid = input.bool(true, title="Hide When CPR Data Is Not Available", tooltip="ON = show nothing until valid CPR data exists for the session (never shows a false banner). OFF = fall back to the live bar-by-bar isExtremelyNarrow value.", group=grpEnBanner)
+
+// Resolved once per bar — table.new/table.cell need a const-ish size value.
+enBannerTextSize = enBannerTextSizeStr == "Tiny" ? size.tiny : enBannerTextSizeStr == "Small" ? size.small : enBannerTextSizeStr == "Normal" ? size.normal : enBannerTextSizeStr == "Large" ? size.large : size.huge
+enBannerPos      = enBannerPosition == "Top Right" ? position.top_right : enBannerPosition == "Top Left" ? position.top_left : position.top_center
+
+bool enBannerNarrowNow = enBannerOnlyWhenValid ? (cprStatusSessionValid and cprStatusSessionIsNarrow) : isExtremelyNarrow
+bool enBannerShowNow   = enBannerEnabled and enBannerNarrowNow
+
+var table enBannerTable = na
+var int   enBannerRowsBuilt = -1
+
+if barstate.islast and enBannerEnabled
+    int enBannerRowsNeeded = 1 + enBannerVOffset
+    if na(enBannerTable) or enBannerRowsBuilt != enBannerRowsNeeded
+        if not na(enBannerTable)
+            table.delete(enBannerTable)
+        enBannerTable := table.new(enBannerPos, 1, enBannerRowsNeeded, bgcolor=na, border_color=na, border_width=0, frame_color=na, frame_width=0)
+        enBannerRowsBuilt := enBannerRowsNeeded
+        if enBannerVOffset > 0
+            for r = 0 to enBannerVOffset - 1
+                table.cell(enBannerTable, 0, r, " ", text_size=size.tiny, bgcolor=na)
+    // NOT extremely narrow → blank, fully transparent cell = no visible text.
+    table.cell(enBannerTable, 0, enBannerVOffset, enBannerShowNow ? enBannerText : " ", text_color=enBannerTextColor, text_size=enBannerTextSize, bgcolor=enBannerShowNow ? enBannerBgColor : na, text_halign=text.align_center)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 🔴 EXTREMELY NARROW CPR (Current) & TOMORROW EXTREMELY NARROW CPR (Projected)
+//     — Data-Window Plots + Alert Conditions
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Tomorrow's projected CPR width %, computed from the already-derived tomTC/tomCP/tomBC projection
+float tomCprWidth     = math.abs(tomTC - tomBC)
+float tomCprWidthPct  = tomCP > 0 ? tomCprWidth / tomCP * 100 : na
+float tomCprWidthTicks = tickSize > 0 and not na(tomCprWidthPct) ? tomCprWidth / tickSize : 999.0
+bool  tomAboveTickFloor = tomCprWidthTicks >= minTicksForNarrow
+
+// Rank tomorrow's projected width against the same session-width history used elsewhere
+// (falls back to the current session's active percentile rank if no history array is populated)
+int   tomHistSize       = array.size(trueSessionWidthHistory)
+int   tomLookbackCount  = math.min(tomHistSize, maxLookback)
+int   tomCountSmaller   = 0
+if tomLookbackCount > 0 and not na(tomCprWidthPct)
+    for n = 0 to tomLookbackCount - 1
+        float histW = array.get(trueSessionWidthHistory, tomHistSize - 1 - n)
+        if histW < tomCprWidthPct
+            tomCountSmaller += 1
+float tomPercentileRank = tomLookbackCount > 0 ? float(tomCountSmaller) / float(tomLookbackCount) * 100 : activePercentileRank
+
+bool tomorrowExtremelyNarrow = not na(tomCprWidthPct) and tomAboveTickFloor and tomPercentileRank <= pctExtreme
+
+plot(isExtremelyNarrow ? 1 : 0, title="Extremely Narrow CPR", display=display.data_window)
+plot(tomorrowExtremelyNarrow ? 1 : 0, title="Tomorrow Extremely Narrow CPR", display=display.data_window)
+
+bool origPureBreakExtOrigAlert = origSignal or  showPureLabelV6 or  showBreakLabelV6 or  extOrigDisplay
+
+//alertcondition(isExtremelyNarrow, title="🔴 Extremely Narrow CPR", message="🔴 Extremely Narrow CPR on {{ticker}} {{interval}} at Price: {{close}}")
+//alertcondition(tomorrowExtremelyNarrow, title="🔴 Tomorrow Extremely Narrow CPR", message="🔴 Tomorrow's Projected CPR Is Extremely Narrow on {{ticker}} {{interval}} at Price: {{close}}")
+
+// ############################################################################
+// ##  SLOPE LABEL LOGIC — exact port from ASZEIC_Crypto_Position_v1 (V8)   ##
+// ##  Bound to the Intmaker kernel (yhat1B / krPlotColorB), the twin of    ##
+// ##  Script 1's only kernel. EMA 20/50/200 are the shared series.         ##
+// ##  With matching kernel + EMA inputs, SLOPE / SLOPE 3RD fire on the     ##
+// ##  same bars as Script 1. Zone-gated SLOPE IDEA is not included:        ##
+// ##  this script has no ASZE zone engine, and those labels do not use it. ##
+// ############################################################################
+
+groupSlope = "🔔 V8 · Slope Alignment Alert"
+slopeMaxStreakBars = input.int(3, "Fire only on 1st…Nth consecutive bar of setup", minval = 1, maxval = 10, group = groupSlope, tooltip = "Once the raw SLOPE condition has been true for MORE than this many consecutive bars, the SLOPE label stops — prevents repeats on a long-running trend. Resets the moment the condition goes false again.")
+slopeBgHighlight   = input.bool(false, "Highlight bars where SLOPE alignment is true (lime background)", group = groupSlope)
+
+bool slopeKernelGreen  = krPlotColorB == krBullColorB
+bool slopeStackAligned = yhat1B > ema20 and ema20 > ema50 and ema50 > ema200
+bool slopeKernelRising = yhat1B > yhat1B[1]
+bool slopeEma20Rising  = ema20  > ema20[1]
+bool slopeEma50Rising  = ema50  > ema50[1]
+bool slopeEma200Rising = ema200 > ema200[1]
+bool slopeAllRising    = slopeKernelRising and slopeEma20Rising and slopeEma50Rising and slopeEma200Rising
+
+bool slopeSignalRaw = slopeKernelGreen and slopeStackAligned and slopeAllRising
+
+var int slopeStreakCount = 0
+if slopeSignalRaw
+    slopeStreakCount := nz(slopeStreakCount[1]) + 1
+else
+    slopeStreakCount := 0
+
+bool slopeSignal = slopeSignalRaw and slopeStreakCount <= slopeMaxStreakBars
+
+bgcolor(slopeBgHighlight and slopeSignal ? color.new(color.lime, 70) : na, title = "V8 · Slope Alignment bar")
+plot(slopeSignal ? 1.0 : 0.0, title = "V8 Slope Alignment Signal (limited)", display = display.data_window)
+
+if slopeSignal
+    label.new(bar_index, low, "SLOPE", style = label.style_label_up, color = color.lime, textcolor = color.black, size = size.small)
+
+bool slopeThirdCandle = slopeSignalRaw and slopeStreakCount == 3
+
+if slopeThirdCandle
+    label.new(bar_index, low, "SLOPE 3RD", style = label.style_label_up, color = color.lime, textcolor = color.black, size = size.small)
+
+plot(slopeThirdCandle ? 1.0 : 0.0, title = "V8 Slope 3rd Candle", display = display.data_window)
+
+bool origPureBreakExtOrigAlertslope = origPureBreakExtOrigAlert or slopeSignal
+
+alertcondition(slopeSignal, title = "🔔 V8 · SLOPE · Kernel>EMA20>EMA50>EMA200 (All Rising)", message = "SLOPE ALIGNMENT on {{ticker}} at {{close}} — Kernel(green) > EMA20 > EMA50 > EMA200, and every line is rising vs. the previous bar. (Early setup bar — not a long-running trend repeat.)")
+alertcondition(slopeThirdCandle, title = "🔔 SLOPE · 3rd Consecutive Candle", message = "3rd consecutive SLOPE candle on {{ticker}} at {{close}}.")
+
+alertcondition( origPureBreakExtOrigAlertslope, title="EXTORIGPUREBREAKSLOPE",  message="Signal: EXTORIGPUREBREAKSLOPE — {{ticker}} {{interval}} — Price: {{close}}")
+alertcondition( origSignal, title="ORIG_SLOPE",  message="Signal: ORIGSLOPE — {{ticker}} {{interval}} — Price: {{close}}")

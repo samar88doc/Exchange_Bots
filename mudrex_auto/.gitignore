@@ -1,0 +1,26 @@
+# secrets & local state — never commit
+.env
+.env.*
+!.env.example
+data/*
+!data/.gitkeep
+*.session
+*.session-journal
+*.db
+*.db-wal
+*.db-shm
+KILL_SWITCH
+data/bot.pid
+data/bot.log
+data/backups/
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
