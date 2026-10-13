@@ -21,7 +21,10 @@ fi
 . .venv/bin/activate
 pip install --upgrade pip >/dev/null
 pip install -r requirements-dev.txt
-[ -f .env ] || cp .env.example .env && echo "Created .env from .env.example (edit it locally; never commit it)."
+if [ ! -f .env ]; then
+  cp .env.example .env
+  echo "Created .env from .env.example (edit it locally; never commit it)."
+fi
 python -m app.main init-db
 python -m pytest -q
 echo "Setup complete. Next: edit .env, run: python -m app.main auth, then scripts/start.sh"

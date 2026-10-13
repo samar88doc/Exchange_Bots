@@ -283,20 +283,24 @@ def _fetch_dashboard_data(settings: Settings) -> dict[str, Any]:
         active_trades_objs = storage.active_trades()
         all_trades_objs = storage.trades()
 
-        # Query Pi42 positions if in REAL mode
+        # In REAL mode, read the exchange's own open positions so the dashboard
+        # can show Pi42's liquidation price rather than only our local estimate.
         pi42_positions_by_id: dict[str, dict[str, Any]] = {}
         if settings.trading_mode == "REAL":
-            for p in _get_live_positions(settings.pi42_base_url, settings.pi42_api_key,
-                                         settings.pi42_api_secret):
-                pid = str(p.get("positionId") or p.get("id") or "")
-                if pid:
-                    pi42_positions_by_id[pid] = p
+            for raw_position in _get_live_positions(
+                settings.pi42_base_url, settings.pi42_api_key, settings.pi42_api_secret
+            ):
+                position_id = str(raw_position.get("positionId") or raw_position.get("id") or "")
+                if position_id:
+                    pi42_positions_by_id[position_id] = raw_position
 
         active_trades = []
         total_unrealized_pnl = Decimal("0")
 
         for t in active_trades_objs:
             live_price = _get_live_price(t.symbol, settings.pi42_public_base_url)
+            live_position = pi42_positions_by_id.get(t.position_id or "") or {}
+            liquidation_price = live_position.get("liquidationPrice") or t.liquidation_price
 
             # Targets list with status
             hits: set[int] = set()
@@ -337,7 +341,7 @@ def _fetch_dashboard_data(settings: Settings) -> dict[str, Any]:
 
                 total_unrealized_pnl += pnl_quote
 
-            # Calculate distance and progress towards the 8% target (target1)
+            # Distance and progress towards the ROI take-profit (target1)
             target_dist_pct: float | None = None
             target_progress_pct = 0.0
             if t.target1 is not None and live_price is not None and live_price > Decimal("0") and t.entry_price > Decimal("0"):
@@ -354,9 +358,9 @@ def _fetch_dashboard_data(settings: Settings) -> dict[str, Any]:
                     if total_move > Decimal("0"):
                         target_progress_pct = max(0.0, min(100.0, round(float((curr_move / total_move) * Decimal("100")), 1)))
 
-            # Pure 8% ROI Target strategy - No Stop Loss
+            # Pure ROI target strategy - no stop-loss (this bot never places one)
             sl_mode = "NO_SL"
-            sl_display_text = "No Stop-Loss (8% ROI Target Exit)"
+            sl_display_text = f"No Stop-Loss ({settings.target_roi_pct}% ROI Target Exit)"
 
             active_trades.append({
                 "id": t.id,
@@ -380,7 +384,7 @@ def _fetch_dashboard_data(settings: Settings) -> dict[str, Any]:
                 "quantity": str(t.quantity),
                 "notional": str(t.notional),
                 "est_margin": str(t.est_margin),
-                "liquidation_price": str(t.liquidation_price) if t.liquidation_price else None,
+                "liquidation_price": str(liquidation_price) if liquidation_price else None,
                 "status": t.status,
                 "status_reason": t.status_reason or "",
                 "position_id": t.position_id,
@@ -1882,7 +1886,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
               <th>Entry</th>
               <th>Mark Price</th>
               <th>Unrealized PnL</th>
-              <th>Target (8% ROI)</th>
+              <th>ROI Target</th>
               <th>Protection</th>
               <th>Liq. Price</th>
               <th>Margin</th>
@@ -2044,7 +2048,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           </div>
           <div style="margin-top:6px; font-size:0.82rem; color:var(--text-sub); display:flex; justify-content:space-between;">
             <span>Entry Price: <strong class="mono" id="modal-edit-entry" style="color:#FFF;">-</strong></span>
-            <span>Target ROI: <strong class="mono" style="color:var(--accent-green);" id="target-roi-pct">8.0%</strong></span>
+            <span>Target ROI: <strong class="mono" style="color:var(--accent-green);" id="target-roi-pct">—</strong></span>
           </div>
         </div>
 
@@ -2289,7 +2293,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
               <div>Liquidation: <strong class="mono" style="color:var(--accent-red)">${t.liquidation_price ? '$' + t.liquidation_price : '-'}</strong></div>
             </div>
 
-            <!-- 8% ROI Target Exit Card -->
+            <!-- ROI Target Exit Card -->
             <div class="stepper-container" style="background:rgba(255,255,255,0.02); border:1px solid var(--border-subtle); border-radius:10px; padding:12px;">
               <div class="stepper-header" style="margin-bottom:8px;">
                 <span style="font-weight:700; color:#FFF; display:flex; align-items:center; gap:6px;">
@@ -2321,7 +2325,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <!-- Strategy & Protection Info -->
             <div class="risk-shield-box" style="border-color:rgba(255,255,255,0.08); background:rgba(255,255,255,0.015); padding:10px 12px;">
               <div class="risk-shield-top" style="margin-bottom:4px;">
-                <span>Exit Rule: <strong style="color:var(--accent-green)">Pure 8% Target Run</strong></span>
+                <span>Exit Rule: <strong style="color:var(--accent-green)">Pure ROI Target Run</strong></span>
                 <span class="mono" style="font-size:0.72rem; color:var(--text-sub);">No Stop-Loss</span>
               </div>
               <div style="font-size:0.72rem; color:var(--text-muted);">
