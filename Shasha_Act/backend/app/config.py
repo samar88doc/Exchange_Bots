@@ -56,7 +56,7 @@ class Settings(BaseSettings):
     shark_device_type: str = "WEB"
     shark_user_category: str = "EXTERNAL"
     shark_request_timeout_seconds: float = 10.0
-    market_data_max_subscriptions: int = 20
+    market_data_max_subscriptions: int = 350
     market_data_stale_seconds: int = 30
     market_data_poll_seconds: float = 60.0
 

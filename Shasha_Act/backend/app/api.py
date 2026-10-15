@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 from app.db import session_dependency
-from app.models import AuditEvent, Fill, Order, OutboxJob, RiskControl, SignalEvent, Trade
+from app.models import AuditEvent, Fill, Order, OutboxJob, RiskControl, SentimentHistory, SignalEvent, Trade
 from app.schemas import (
     CancelPendingRequest,
     CloseTradeRequest,
@@ -593,6 +593,80 @@ async def market_data(
         return value if value is not None else Decimal("-Infinity")
     items.sort(key=sort_key, reverse=order == "desc")
     return {**state, "items": items, "count": len(items)}
+
+
+@router.get("/market/sentiment-history")
+async def get_sentiment_history(
+    limit: int = Query(50, le=200),
+    session: AsyncSession = Depends(session_dependency),
+) -> list[dict[str, Any]]:
+    """Return persisted sentiment transitions, newest first."""
+    rows = list(
+        (
+            await session.execute(
+                select(SentimentHistory)
+                .order_by(SentimentHistory.occurred_at.desc())
+                .limit(limit)
+            )
+        ).scalars()
+    )
+    return [
+        {"id": r.id, "time": r.occurred_at.isoformat(), "from": r.from_sentiment, "to": r.to_sentiment}
+        for r in rows
+    ]
+
+
+@router.post("/market/sentiment-history")
+async def post_sentiment_history(
+    request: Request,
+    session: AsyncSession = Depends(session_dependency),
+) -> dict[str, Any]:
+    """Record a new sentiment transition."""
+    body = await request.json()
+    from_s = str(body.get("from", "")).strip()
+    to_s = str(body.get("to", "")).strip()
+    if not from_s or not to_s:
+        raise HTTPException(400, "'from' and 'to' are required")
+    row = SentimentHistory(from_sentiment=from_s, to_sentiment=to_s)
+    session.add(row)
+    await session.commit()
+    return {"id": row.id, "time": row.occurred_at.isoformat(), "from": from_s, "to": to_s}
+
+
+@router.get("/market/live-feed")
+async def market_live_feed(
+    request: Request,
+    limit: int = Query(350, le=500),
+) -> list[dict[str, Any]]:
+    state = request.app.state.context.market.state()
+    items = state["items"][:limit]
+    res = []
+    for item in items:
+        last = float(item["last_price"]) if item.get("last_price") else 0.0
+        pct = float(item["change_24h_percent"]) if item.get("change_24h_percent") else 0.0
+        high = float(item["high_24h"]) if item.get("high_24h") else 0.0
+        low = float(item["low_24h"]) if item.get("low_24h") else 0.0
+        vol = float(item["volume_24h"]) if item.get("volume_24h") else 0.0
+        change_abs = float(item["change_abs"]) if item.get("change_abs") else 0.0
+        res.append({
+            "symbol": item["symbol"],
+            "base_asset": item.get("base_asset") or item["symbol"],
+            "quote_asset": item.get("quote_asset") or "USDT",
+            "last_price": last,
+            "open_price": last - change_abs,
+            "high": high,
+            "low": low,
+            "volume": vol,
+            "change_pct": pct,
+            "change_abs": change_abs,
+            "day_open": last - change_abs,
+            "day_high": high,
+            "day_low": low,
+            "day_change_pct": pct,
+            "status": "ok",
+            "webhook_status": "",
+        })
+    return res
 
 
 @router.get("/history")

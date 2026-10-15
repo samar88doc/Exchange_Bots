@@ -167,17 +167,33 @@ class MarketDataService:
         for ticker in self.tickers.values():
             if ticker.is_stale(self.settings.market_data_stale_seconds, now):
                 continue
+            spec = self.resolver_contracts.get(ticker.symbol)
+            base_asset = spec.base_asset if spec else (ticker.symbol[:-4] if ticker.symbol.endswith("USDT") else ticker.symbol)
+            quote_asset = spec.quote_asset if spec else "USDT"
+            pct = ticker.change_24h_percent
+            change_abs = None
+            if pct is not None and ticker.last_price > 0:
+                # Calculate absolute change: p = last - (last / (1 + P/100))
+                divisor = Decimal("1") + (pct / Decimal("100"))
+                if divisor > 0:
+                    open_approx = ticker.last_price / divisor
+                    change_abs = ticker.last_price - open_approx
+
             items.append(
                 {
                     "symbol": ticker.symbol,
+                    "base_asset": base_asset,
+                    "quote_asset": quote_asset,
                     "last_price": str(ticker.last_price),
                     "price_label": "Last price",
                     "change_24h_percent": (
                         str(ticker.change_24h_percent) if ticker.change_24h_percent is not None else None
                     ),
+                    "change_abs": str(change_abs) if change_abs is not None else None,
                     "volume_24h": str(ticker.volume_24h) if ticker.volume_24h is not None else None,
                     "high_24h": str(ticker.high_24h) if ticker.high_24h is not None else None,
                     "low_24h": str(ticker.low_24h) if ticker.low_24h is not None else None,
+                    "status": "ok",
                     "source": ticker.source,
                     "updated_at": ticker.received_at.isoformat(),
                 }

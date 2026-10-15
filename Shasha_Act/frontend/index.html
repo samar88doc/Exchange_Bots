@@ -106,9 +106,96 @@
       </section>
 
       <section class="page" id="view-markets">
-        <div class="page-heading compact-heading"><div><div class="eyebrow">PUBLIC MARKET DATA</div><h1>Markets</h1><p class="subheading">Shark 24-hour ticker stream and REST fallback. Change is not a 24-hour chart.</p></div><div class="heading-actions"><span class="feed-pill" id="market-feed-pill"><i></i><span>Feed status unavailable</span></span></div></div>
-        <section class="panel market-panel"><div class="panel-head"><div><div class="panel-title">USDT perpetual watch</div><div class="panel-caption" id="market-note">No market data has been received yet.</div></div><div class="panel-actions"><label class="search-field"><span>⌕</span><input id="market-search" type="search" placeholder="Search contract" maxlength="64"></label><select class="select-control" id="market-sort"><option value="symbol">Symbol</option><option value="change_24h_percent">24h change</option><option value="volume_24h">24h volume</option><option value="last_price">Last price</option></select></div></div><div class="table-scroll"><table><thead><tr><th>CONTRACT</th><th>LAST PRICE</th><th>24H CHANGE</th><th>24H HIGH / LOW</th><th>24H VOLUME</th><th>SOURCE</th><th>UPDATED</th></tr></thead><tbody id="market-rows"><tr><td colspan="7" class="empty-cell">Market feed has not provided a current snapshot.</td></tr></tbody></table></div></section>
-        <div class="inline-note"><span class="note-icon">i</span><span>Prices and volume are reported exactly as observed from the Shark public ticker. A missing or stale value is shown as unavailable.</span></div>
+        <div class="market-page-head">
+          <div>
+            <h1 class="market-feed-title"><span class="market-icon">☵</span> SharkExchange Live Feed</h1>
+            <p class="subheading">Real-time 24h ticker data · auto-refresh every 5 s</p>
+          </div>
+          <div class="market-header-actions">
+            <select class="select-control" id="market-limit">
+              <option value="50">50 symbols</option>
+              <option value="100">100 symbols</option>
+              <option value="200">200 symbols</option>
+              <option value="350" selected>350 symbols (All)</option>
+            </select>
+            <button class="button button-secondary button-small" id="market-refresh-btn"><span class="refresh-icon">↻</span> Refresh</button>
+            <div class="market-feed-status good" id="market-feed-status">
+              <span class="wifi-dot">●</span> <span id="market-status-text">Connecting…</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="market-stats-grid">
+          <div class="panel market-stat-card sentiment-stat" id="market-sentiment-card">
+            <div class="stat-label">SENTIMENT</div>
+            <div class="stat-value" id="market-sentiment-label">Waiting…</div>
+          </div>
+          <div class="panel market-stat-card">
+            <div class="stat-label">TOTAL SYMBOLS</div>
+            <div class="stat-value" id="market-total-symbols">—</div>
+          </div>
+          <div class="panel market-stat-card">
+            <div class="stat-label">GAINERS</div>
+            <div class="stat-value positive" id="market-gainers-count">—</div>
+          </div>
+          <div class="panel market-stat-card">
+            <div class="stat-label">LOSERS</div>
+            <div class="stat-value negative" id="market-losers-count">—</div>
+          </div>
+          <div class="panel market-stat-card">
+            <div class="stat-label">TOTAL VOLUME</div>
+            <div class="stat-value info" id="market-total-vol">—</div>
+          </div>
+        </div>
+
+        <div class="panel market-sentiment-history-box" id="market-history-box">
+          <div class="sentiment-history-head">
+            <span>SENTIMENT HISTORY (PERSISTED)</span>
+            <span class="muted" id="sentiment-history-count">0 transitions</span>
+          </div>
+          <div class="sentiment-history-list" id="market-sentiment-history">
+            <div class="muted-note">No sentiment transitions recorded yet.</div>
+          </div>
+        </div>
+
+        <div class="market-filters-row">
+          <div class="search-field market-search-field">
+            <span>⌕</span>
+            <input id="market-search" type="search" placeholder="Search symbol…" maxlength="64">
+          </div>
+          <div class="segmented" id="market-filter-dir">
+            <button class="selected" data-dir="all">All</button>
+            <button data-dir="up">▲ Gainers</button>
+            <button data-dir="down">▼ Losers</button>
+          </div>
+          <span class="market-showing-badge" id="market-showing-count">0 showing</span>
+        </div>
+
+        <section class="panel table-panel market-table-panel">
+          <div class="table-scroll">
+            <table class="market-feed-table">
+              <thead>
+                <tr>
+                  <th class="w-num">#</th>
+                  <th class="sortable" data-sort="symbol"><span>Symbol <span class="sort-arr">↕</span></span></th>
+                  <th class="sortable" data-sort="last_price"><span>Last Price <span class="sort-arr">↕</span></span></th>
+                  <th class="sortable" data-sort="change_pct"><span>24h % <span class="sort-arr">↕</span></span></th>
+                  <th class="sortable" data-sort="high"><span>24h High <span class="sort-arr">↕</span></span></th>
+                  <th class="sortable" data-sort="low"><span>24h Low <span class="sort-arr">↕</span></span></th>
+                  <th class="sortable" data-sort="hl_range"><span>H/L Range <span class="sort-arr">↕</span></span></th>
+                  <th class="sortable" data-sort="day_change_pct"><span>Day % <span class="sort-arr">↕</span></span></th>
+                  <th class="sortable" data-sort="day_hl_range"><span>Day H/L <span class="sort-arr">↕</span></span></th>
+                  <th class="sortable" data-sort="volume"><span>24h Volume <span class="sort-arr">↕</span></span></th>
+                  <th>Webhook Status</th>
+                </tr>
+              </thead>
+              <tbody id="market-rows">
+                <tr><td colspan="11" class="empty-cell"><span class="spinner"></span>Loading live market feed…</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+        <div class="inline-note"><span class="note-icon">i</span><span>Live tick data streamed from Shark public WebSocket &amp; REST fallback. Prices flash green on tick up and red on tick down.</span></div>
       </section>
 
       <section class="page" id="view-signals">

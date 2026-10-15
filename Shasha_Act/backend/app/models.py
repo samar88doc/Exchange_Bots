@@ -257,3 +257,14 @@ class MarketSnapshot(Base):
     low_24h: Mapped[Decimal | None] = mapped_column(PRICE, nullable=True)
     source: Mapped[str] = mapped_column(String(24), nullable=False, default="SHARK_LAST")
     updated_at: Mapped[datetime] = mapped_column(TS, nullable=False, default=utcnow)
+
+
+class SentimentHistory(Base):
+    __tablename__ = "shasha_act_sentiment_history"
+    __table_args__ = (Index("ix_shasha_act_sentiment_occurred", "occurred_at"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    occurred_at: Mapped[datetime] = mapped_column(TS, nullable=False, default=utcnow, server_default=func.now())
+    from_sentiment: Mapped[str] = mapped_column(String(32), nullable=False)
+    to_sentiment: Mapped[str] = mapped_column(String(32), nullable=False)
+

@@ -13,6 +13,14 @@
     historyLimit: 50,
     performance: null,
     market: null,
+    marketFeed: [],
+    marketSortKey: "change_pct",
+    marketSortDir: "desc",
+    marketFilterDir: "all",
+    marketLimit: 350,
+    prevMarketPrices: {},
+    trendHistory: [],
+    prevTrend: "Waiting...",
     currentView: "dashboard",
     performanceDays: 30,
     pollTimer: null,
@@ -366,32 +374,293 @@
     }).join("");
   }
 
-  async function loadMarkets() {
-    const q = $("#market-search")?.value || "";
-    const sort = $("#market-sort")?.value || "symbol";
-    const order = sort === "symbol" ? "asc" : "desc";
-    const data = await api(`/api/market?q=${encodeURIComponent(q)}&sort=${encodeURIComponent(sort)}&order=${order}`);
-    state.market = data;
-    renderMarkets();
+  function fmtVol(value) {
+    if (!value) return "—";
+    const num = Number(value);
+    if (!Number.isFinite(num)) return "—";
+    if (num >= 1_000_000_000) return (num / 1_000_000_000).toFixed(2) + "B";
+    if (num >= 1_000_000) return (num / 1_000_000).toFixed(2) + "M";
+    if (num >= 1_000) return (num / 1_000).toFixed(1) + "K";
+    return num.toFixed(2);
   }
-  function renderMarkets() {
-    const data = state.market;
-    if (!data) return;
-    const items = data.items || [];
-    const feed = $("#market-feed-pill");
-    const health = data.health || "DISCONNECTED";
-    feed.className = `feed-pill ${["CONNECTED", "REST_FALLBACK"].includes(health) ? "good" : health === "DEGRADED" ? "warn" : ""}`;
-    feed.innerHTML = `<i></i><span>${esc(health.replaceAll("_", " "))}</span>`;
-    setText("#market-note", data.note || "No current ticker data");
-    const rows = $("#market-rows");
-    if (!items.length) {
-      rows.innerHTML = blankRow(7, data.health === "DISCONNECTED" ? "Market feed is disconnected; no current prices are shown." : "No current ticker snapshot matches this filter.");
+
+  function rangeBarHtml(low, high, last) {
+    const l = Number(low);
+    const h = Number(high);
+    const cur = Number(last);
+    if (!h || !l || h === l || !Number.isFinite(cur)) {
+      return `<div class="range-bar-track"><div class="range-bar-fill" style="width: 50%"></div></div>`;
+    }
+    const pct = Math.min(100, Math.max(0, ((cur - l) / (h - l)) * 100));
+    const tone = pct > 50 ? "up" : "down";
+    return `
+      <div class="range-bar-cell">
+        <div class="range-bar-track">
+          <div class="range-bar-fill ${tone}" style="width: ${pct.toFixed(1)}%"></div>
+        </div>
+        <div class="range-bar-labels">
+          <span>L</span>
+          <span>${pct.toFixed(0)}%</span>
+          <span>H</span>
+        </div>
+      </div>
+    `;
+  }
+
+  function dayRangeBarHtml(low, high, last) {
+    const l = Number(low);
+    const h = Number(high);
+    const cur = Number(last);
+    if (!h || !l || h === l || !Number.isFinite(cur)) {
+      return `<span class="muted">—</span>`;
+    }
+    const pct = Math.min(100, Math.max(0, ((cur - l) / (h - l)) * 100));
+    const tone = pct > 50 ? "up" : "down";
+    return `
+      <div class="range-bar-cell">
+        <div class="range-bar-track">
+          <div class="range-bar-fill ${tone}" style="width: ${pct.toFixed(1)}%"></div>
+        </div>
+        <div class="range-bar-labels">
+          <span class="negative">${fmtPrice(l)}</span>
+          <span>${pct.toFixed(0)}%</span>
+          <span class="positive">${fmtPrice(h)}</span>
+        </div>
+      </div>
+    `;
+  }
+
+  function priceCellHtml(symbol, price) {
+    const cur = Number(price);
+    const prev = state.prevMarketPrices[symbol];
+    let flashCls = "";
+    if (prev !== undefined && Number.isFinite(cur) && cur !== prev) {
+      flashCls = cur > prev ? "flash-up" : "flash-down";
+    }
+    state.prevMarketPrices[symbol] = cur;
+    return `<span class="price-val ${flashCls}">${fmtPrice(cur)}</span>`;
+  }
+
+  async function updateSentiment(gainers, losers, totalValid) {
+    if (totalValid === 0) return { label: "Waiting...", cls: "neutral" };
+    const gPct = gainers / totalValid;
+    const lPct = losers / totalValid;
+    let label = "Neutral";
+    let cls = "neutral";
+    if (gPct > 0.55) { label = "Bullish"; cls = "bullish"; }
+    else if (lPct > 0.55) { label = "Bearish"; cls = "bearish"; }
+
+    if (label !== "Waiting..." && label !== state.prevTrend) {
+      if (state.prevTrend !== "Waiting...") {
+        const from = state.prevTrend;
+        const to = label;
+        api("/api/market/sentiment-history", {
+          method: "POST",
+          body: { from, to },
+        }).then((saved) => {
+          if (saved) {
+            state.trendHistory = [{ time: saved.time, from, to }, ...state.trendHistory].slice(0, 50);
+            renderSentimentHistory();
+          }
+        }).catch(() => {
+          state.trendHistory = [{ time: new Date().toISOString(), from, to }, ...state.trendHistory].slice(0, 50);
+          renderSentimentHistory();
+        });
+      }
+      state.prevTrend = label;
+    }
+    return { label, cls };
+  }
+
+  function renderSentimentHistory() {
+    const list = $("#market-sentiment-history");
+    const count = $("#sentiment-history-count");
+    if (!list) return;
+    if (count) setText(count, `${state.trendHistory.length} transition(s)`);
+    if (!state.trendHistory.length) {
+      list.innerHTML = `<div class="muted-note">No sentiment transitions recorded yet.</div>`;
       return;
     }
-    rows.innerHTML = items.map((item) => {
-      const change = n(item.change_24h_percent);
-      const cls = change === null ? "neutral" : change >= 0 ? "positive" : "negative";
-      return `<tr><td><div class="contract-cell">${coinIcon(item.symbol)}<div class="contract-copy"><strong>${esc(item.symbol)}</strong><small>Shark USDT market</small></div></div></td><td class="neutral">${fmtPrice(item.last_price)}</td><td class="${cls}">${change === null ? "Unavailable" : `${change > 0 ? "+" : ""}${fmtNum(change, 3)}%`}</td><td><div class="dual-value"><strong>${fmtPrice(item.high_24h)}</strong><small>low ${fmtPrice(item.low_24h)}</small></div></td><td>${fmtNum(item.volume_24h, 2)}</td><td>${pill(item.source, item.source?.includes("WS") ? "good" : "info")}</td><td>${esc(fmtDateTime(item.updated_at))}</td></tr>`;
+    list.innerHTML = state.trendHistory.map((h) => {
+      const cls = h.to === "Bullish" ? "bullish" : h.to === "Bearish" ? "bearish" : "neutral";
+      return `
+        <div class="sentiment-transition-row">
+          <span class="trans-time">${new Date(h.time).toLocaleTimeString()}</span>
+          <span class="trans-from">${esc(h.from)}</span>
+          <span class="trans-arrow">→</span>
+          <span class="trans-to ${cls}">${esc(h.to)}</span>
+        </div>
+      `;
+    }).join("");
+  }
+
+  async function loadSentimentHistory() {
+    try {
+      const rows = await api("/api/market/sentiment-history?limit=50");
+      if (Array.isArray(rows)) {
+        state.trendHistory = rows;
+        if (rows.length > 0 && state.prevTrend === "Waiting...") {
+          state.prevTrend = rows[0].to;
+        }
+        renderSentimentHistory();
+      }
+    } catch (e) {
+      // Ignore network errors
+    }
+  }
+
+  async function loadMarkets(showSpinner = false) {
+    const refreshBtn = $("#market-refresh-btn");
+    if (showSpinner && refreshBtn) refreshBtn.classList.add("loading");
+    try {
+      const limit = Number($("#market-limit")?.value || 350);
+      state.marketLimit = limit;
+      const data = await api(`/api/market/live-feed?limit=${limit}`);
+      state.marketFeed = Array.isArray(data) ? data : [];
+      renderMarketsFeed();
+      const statusEl = $("#market-feed-status");
+      const statusText = $("#market-status-text");
+      if (statusEl) statusEl.className = "market-feed-status good";
+      if (statusText) setText(statusText, `Connected ${new Date().toLocaleTimeString()}`);
+    } catch (error) {
+      const statusEl = $("#market-feed-status");
+      const statusText = $("#market-status-text");
+      if (statusEl) statusEl.className = "market-feed-status bad";
+      if (statusText) setText(statusText, "Disconnected");
+      toast(error.message, "error");
+    } finally {
+      if (refreshBtn) refreshBtn.classList.remove("loading");
+    }
+  }
+
+  async function renderMarketsFeed() {
+    const feed = state.marketFeed || [];
+    const search = ($("#market-search")?.value || "").trim().toUpperCase();
+    const filterDir = state.marketFilterDir || "all";
+    const sortKey = state.marketSortKey || "change_pct";
+    const sortDir = state.marketSortDir || "desc";
+
+    let rows = feed.filter((r) => r.status === "ok" && Number(r.last_price) > 0);
+    
+    // Summary metrics before search filter
+    const totalValid = rows.length;
+    const gainers = rows.filter((r) => Number(r.change_pct) > 0).length;
+    const losers = rows.filter((r) => Number(r.change_pct) < 0).length;
+    const totalVol = rows.reduce((s, r) => s + (Number(r.volume) || 0), 0);
+    
+    const sentiment = await updateSentiment(gainers, losers, totalValid);
+    
+    // Update KPI Cards
+    const card = $("#market-sentiment-card");
+    if (card) card.className = `panel market-stat-card sentiment-stat ${sentiment.cls}`;
+    setText("#market-sentiment-label", sentiment.label);
+    setText("#market-total-symbols", totalValid);
+    setText("#market-gainers-count", gainers);
+    setText("#market-losers-count", losers);
+    setText("#market-total-vol", fmtVol(totalVol));
+
+    // Filter by direction
+    if (filterDir === "up") rows = rows.filter((r) => Number(r.change_pct) > 0);
+    if (filterDir === "down") rows = rows.filter((r) => Number(r.change_pct) < 0);
+
+    // Filter by search
+    if (search) {
+      rows = rows.filter((r) => (r.symbol && r.symbol.toUpperCase().includes(search)) || (r.base_asset && r.base_asset.toUpperCase().includes(search)));
+    }
+
+    // Sort
+    rows.sort((a, b) => {
+      let av, bv;
+      if (sortKey === "hl_range") {
+        av = (!a.high || !a.low || a.high === a.low) ? 50 : ((a.last_price - a.low) / (a.high - a.low)) * 100;
+        bv = (!b.high || !b.low || b.high === b.low) ? 50 : ((b.last_price - b.low) / (b.high - b.low)) * 100;
+      } else if (sortKey === "day_hl_range") {
+        av = (!a.day_high || !a.day_low || a.day_high === a.day_low) ? 50 : ((a.last_price - a.day_low) / (a.day_high - a.day_low)) * 100;
+        bv = (!b.day_high || !b.day_low || b.day_high === b.day_low) ? 50 : ((b.last_price - b.day_low) / (b.day_high - b.day_low)) * 100;
+      } else {
+        av = a[sortKey];
+        bv = b[sortKey];
+      }
+      if (typeof av === "number" && typeof bv === "number") {
+        return sortDir === "asc" ? av - bv : bv - av;
+      }
+      return sortDir === "asc" ? String(av || "").localeCompare(String(bv || "")) : String(bv || "").localeCompare(String(av || ""));
+    });
+
+    setText("#market-showing-count", `${rows.length} showing`);
+
+    // Update active sort indicator on table headers
+    $$(".market-feed-table th.sortable").forEach((th) => {
+      const col = th.dataset.sort;
+      if (col === sortKey) {
+        th.classList.add("active-sort");
+        const arr = th.querySelector(".sort-arr");
+        if (arr) setText(arr, sortDir === "asc" ? "▲" : "▼");
+      } else {
+        th.classList.remove("active-sort");
+        const arr = th.querySelector(".sort-arr");
+        if (arr) setText(arr, "↕");
+      }
+    });
+
+    const tbody = $("#market-rows");
+    if (!tbody) return;
+    if (!rows.length) {
+      tbody.innerHTML = blankRow(11, "No symbols match your filter.");
+      return;
+    }
+
+    tbody.innerHTML = rows.map((row, i) => {
+      const change = Number(row.change_pct) || 0;
+      const changeTone = change > 0 ? "up" : change < 0 ? "down" : "flat";
+      const changeIcon = change > 0 ? "▲" : change < 0 ? "▼" : "—";
+      const baseShort = (row.base_asset || row.symbol || "").slice(0, 2);
+      
+      const dayChange = Number(row.day_change_pct) || 0;
+      const dayTone = dayChange > 0 ? "up" : dayChange < 0 ? "down" : "flat";
+      const dayIcon = dayChange > 0 ? "▲" : dayChange < 0 ? "▼" : "—";
+      
+      return `
+        <tr>
+          <td class="muted w-num">${i + 1}</td>
+          <td>
+            <div class="contract-cell">
+              <div class="asset-badge ${changeTone}">${esc(baseShort)}</div>
+              <div class="contract-copy">
+                <strong>${esc(row.base_asset || row.symbol)}</strong>
+                <small>${esc(row.symbol)}</small>
+              </div>
+            </div>
+          </td>
+          <td>${priceCellHtml(row.symbol, row.last_price)}</td>
+          <td>
+            <span class="pct-pill ${changeTone}">
+              <span>${changeIcon}</span>
+              <span>${change >= 0 ? "+" : ""}${change.toFixed(3)}%</span>
+            </span>
+          </td>
+          <td class="positive font-mono">${fmtPrice(row.high)}</td>
+          <td class="negative font-mono">${fmtPrice(row.low)}</td>
+          <td>${rangeBarHtml(row.low, row.high, row.last_price)}</td>
+          <td>
+            ${row.day_open > 0 ? `
+              <span class="pct-pill ${dayTone}">
+                <span>${dayIcon}</span>
+                <span>${dayChange >= 0 ? "+" : ""}${dayChange.toFixed(3)}%</span>
+              </span>
+            ` : `<span class="muted">—</span>`}
+          </td>
+          <td>${dayRangeBarHtml(row.day_low, row.day_high, row.last_price)}</td>
+          <td class="font-mono muted">${fmtVol(row.volume)}</td>
+          <td>
+            ${row.webhook_status ? `
+              <span class="badge ${row.webhook_status === 'BUY' ? 'badge-green' : row.webhook_status === 'SELL' ? 'badge-red' : 'badge-blue'}">
+                ${esc(row.webhook_status)}
+              </span>
+            ` : `<span class="muted">—</span>`}
+          </td>
+        </tr>
+      `;
     }).join("");
   }
 
@@ -513,7 +782,10 @@
     const labels = { dashboard: "Overview", positions: "Positions", markets: "Markets", signals: "Signal log", history: "Trade history", settings: "Settings" };
     setText("#page-crumb", labels[view] || view);
     $("#sidebar").classList.remove("open");
-    if (view === "markets") loadMarkets().catch((error) => toast(error.message, "error"));
+    if (view === "markets") {
+      loadMarkets().catch((error) => toast(error.message, "error"));
+      loadSentimentHistory();
+    }
     if (view === "history") loadHistory().catch((error) => toast(error.message, "error"));
     if (view === "signals") loadEvents().catch((error) => toast(error.message, "error"));
     if (view === "positions") renderPositions();
@@ -688,11 +960,34 @@
       try { state.performance = await api(`/api/performance?days=${state.performanceDays}`); renderPerformance(); }
       catch (error) { toast(error.message, "error"); }
     });
-    $("#market-search").addEventListener("input", () => {
-      clearTimeout(state.marketTimer);
-      state.marketTimer = setTimeout(() => loadMarkets().catch((error) => toast(error.message, "error")), 250);
+    $("#market-search")?.addEventListener("input", () => {
+      renderMarketsFeed();
     });
-    $("#market-sort").addEventListener("change", () => loadMarkets().catch((error) => toast(error.message, "error")));
+    $("#market-limit")?.addEventListener("change", () => {
+      loadMarkets(true);
+    });
+    $("#market-refresh-btn")?.addEventListener("click", () => {
+      loadMarkets(true);
+    });
+    $("#market-filter-dir")?.addEventListener("click", (event) => {
+      const btn = event.target.closest("button");
+      if (!btn) return;
+      state.marketFilterDir = btn.dataset.dir || "all";
+      $$("#market-filter-dir button").forEach((b) => b.classList.toggle("selected", b === btn));
+      renderMarketsFeed();
+    });
+    $(".market-feed-table thead")?.addEventListener("click", (event) => {
+      const th = event.target.closest("th.sortable");
+      if (!th) return;
+      const col = th.dataset.sort;
+      if (state.marketSortKey === col) {
+        state.marketSortDir = state.marketSortDir === "asc" ? "desc" : "asc";
+      } else {
+        state.marketSortKey = col;
+        state.marketSortDir = "desc";
+      }
+      renderMarketsFeed();
+    });
     $("#event-status-filter").addEventListener("change", () => loadEvents().catch((error) => toast(error.message, "error")));
     $("#event-symbol-filter").addEventListener("input", () => {
       clearTimeout(state.eventTimer);
