@@ -118,8 +118,6 @@
   }
   function forgetToken() {
     state.token = "";
-    sessionStorage.removeItem("shasha_dashboard_token");
-    localStorage.removeItem("shasha_dashboard_token");
     if (state.pollTimer) clearInterval(state.pollTimer);
     state.pollTimer = null;
     if (state.marketTimer) clearInterval(state.marketTimer);
@@ -132,8 +130,6 @@
     try {
       const settings = await api("/api/settings");
       state.settings = settings;
-      sessionStorage.setItem("shasha_dashboard_token", state.token);
-      localStorage.setItem("shasha_dashboard_token", state.token);
       $("#auth-overlay").classList.add("hidden");
       await refreshAll(true);
       if (!state.pollTimer) state.pollTimer = setInterval(() => refreshAll(false), 15000);
@@ -144,8 +140,6 @@
       return true;
     } catch (error) {
       state.token = "";
-      sessionStorage.removeItem("shasha_dashboard_token");
-      localStorage.removeItem("shasha_dashboard_token");
       showAuth(error.message || "Authentication failed.");
       return false;
     }
@@ -1112,11 +1106,6 @@
     bindEvents();
     const pathView = window.location.hash.slice(1);
     if (["dashboard", "positions", "markets", "signals", "history", "settings"].includes(pathView)) switchView(pathView);
-    const savedToken = sessionStorage.getItem("shasha_dashboard_token") || localStorage.getItem("shasha_dashboard_token");
-    if (savedToken) {
-      authenticate(savedToken);
-    } else {
-      showAuth("");
-    }
+    showAuth("");
   });
 })();
