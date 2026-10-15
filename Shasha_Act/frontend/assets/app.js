@@ -65,7 +65,10 @@
     if (Number.isNaN(date.getTime())) return "—";
     return new Intl.DateTimeFormat("en-IN", { timeZone: state.settings?.market_day_timezone || undefined, hour: "2-digit", minute: "2-digit", second: "2-digit" }).format(date);
   };
-  const setText = (selector, value) => { const element = $(selector); if (element) element.textContent = value; };
+  const setText = (target, value) => {
+    const element = typeof target === "string" ? $(target) : target;
+    if (element && "textContent" in element) element.textContent = value;
+  };
   const api = async (path, options = {}) => {
     const headers = { ...(options.headers || {}) };
     if (state.token) headers["X-Dashboard-Token"] = state.token;
@@ -115,8 +118,12 @@
   }
   function forgetToken() {
     state.token = "";
+    sessionStorage.removeItem("shasha_dashboard_token");
+    localStorage.removeItem("shasha_dashboard_token");
     if (state.pollTimer) clearInterval(state.pollTimer);
     state.pollTimer = null;
+    if (state.marketTimer) clearInterval(state.marketTimer);
+    state.marketTimer = null;
     showAuth("");
   }
 
@@ -125,12 +132,20 @@
     try {
       const settings = await api("/api/settings");
       state.settings = settings;
+      sessionStorage.setItem("shasha_dashboard_token", state.token);
+      localStorage.setItem("shasha_dashboard_token", state.token);
       $("#auth-overlay").classList.add("hidden");
       await refreshAll(true);
       if (!state.pollTimer) state.pollTimer = setInterval(() => refreshAll(false), 15000);
+      if (state.currentView === "markets") {
+        loadMarkets(false).catch((error) => console.error(error));
+        loadSentimentHistory();
+      }
       return true;
     } catch (error) {
       state.token = "";
+      sessionStorage.removeItem("shasha_dashboard_token");
+      localStorage.removeItem("shasha_dashboard_token");
       showAuth(error.message || "Authentication failed.");
       return false;
     }
@@ -441,7 +456,7 @@
     return `<span class="price-val ${flashCls}">${fmtPrice(cur)}</span>`;
   }
 
-  async function updateSentiment(gainers, losers, totalValid) {
+  function updateSentiment(gainers, losers, totalValid) {
     if (totalValid === 0) return { label: "Waiting...", cls: "neutral" };
     const gPct = gainers / totalValid;
     const lPct = losers / totalValid;
@@ -476,7 +491,7 @@
     const list = $("#market-sentiment-history");
     const count = $("#sentiment-history-count");
     if (!list) return;
-    if (count) setText(count, `${state.trendHistory.length} transition(s)`);
+    if (count) count.textContent = `${state.trendHistory.length} transition(s)`;
     if (!state.trendHistory.length) {
       list.innerHTML = `<div class="muted-note">No sentiment transitions recorded yet.</div>`;
       return;
@@ -521,19 +536,20 @@
       const statusEl = $("#market-feed-status");
       const statusText = $("#market-status-text");
       if (statusEl) statusEl.className = "market-feed-status good";
-      if (statusText) setText(statusText, `Connected ${new Date().toLocaleTimeString()}`);
+      if (statusText) statusText.textContent = `Connected ${new Date().toLocaleTimeString()}`;
     } catch (error) {
+      console.error("loadMarkets error:", error);
       const statusEl = $("#market-feed-status");
       const statusText = $("#market-status-text");
       if (statusEl) statusEl.className = "market-feed-status bad";
-      if (statusText) setText(statusText, "Disconnected");
+      if (statusText) statusText.textContent = "Disconnected";
       toast(error.message, "error");
     } finally {
       if (refreshBtn) refreshBtn.classList.remove("loading");
     }
   }
 
-  async function renderMarketsFeed() {
+  function renderMarketsFeed() {
     const feed = state.marketFeed || [];
     const search = ($("#market-search")?.value || "").trim().toUpperCase();
     const filterDir = state.marketFilterDir || "all";
@@ -548,7 +564,7 @@
     const losers = rows.filter((r) => Number(r.change_pct) < 0).length;
     const totalVol = rows.reduce((s, r) => s + (Number(r.volume) || 0), 0);
     
-    const sentiment = await updateSentiment(gainers, losers, totalValid);
+    const sentiment = updateSentiment(gainers, losers, totalValid);
     
     // Update KPI Cards
     const card = $("#market-sentiment-card");
@@ -592,14 +608,13 @@
     // Update active sort indicator on table headers
     $$(".market-feed-table th.sortable").forEach((th) => {
       const col = th.dataset.sort;
+      const arr = th.querySelector(".sort-arr");
       if (col === sortKey) {
         th.classList.add("active-sort");
-        const arr = th.querySelector(".sort-arr");
-        if (arr) setText(arr, sortDir === "asc" ? "▲" : "▼");
+        if (arr) arr.textContent = sortDir === "asc" ? "▲" : "▼";
       } else {
         th.classList.remove("active-sort");
-        const arr = th.querySelector(".sort-arr");
-        if (arr) setText(arr, "↕");
+        if (arr) arr.textContent = "↕";
       }
     });
 
@@ -782,9 +797,18 @@
     const labels = { dashboard: "Overview", positions: "Positions", markets: "Markets", signals: "Signal log", history: "Trade history", settings: "Settings" };
     setText("#page-crumb", labels[view] || view);
     $("#sidebar").classList.remove("open");
+    if (state.marketTimer) {
+      clearInterval(state.marketTimer);
+      state.marketTimer = null;
+    }
     if (view === "markets") {
-      loadMarkets().catch((error) => toast(error.message, "error"));
+      loadMarkets(false).catch((error) => console.error(error));
       loadSentimentHistory();
+      state.marketTimer = setInterval(() => {
+        if (state.currentView === "markets") {
+          loadMarkets(false).catch((error) => console.error(error));
+        }
+      }, 5000);
     }
     if (view === "history") loadHistory().catch((error) => toast(error.message, "error"));
     if (view === "signals") loadEvents().catch((error) => toast(error.message, "error"));
@@ -1088,6 +1112,11 @@
     bindEvents();
     const pathView = window.location.hash.slice(1);
     if (["dashboard", "positions", "markets", "signals", "history", "settings"].includes(pathView)) switchView(pathView);
-    showAuth("");
+    const savedToken = sessionStorage.getItem("shasha_dashboard_token") || localStorage.getItem("shasha_dashboard_token");
+    if (savedToken) {
+      authenticate(savedToken);
+    } else {
+      showAuth("");
+    }
   });
 })();
