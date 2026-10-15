@@ -43,53 +43,57 @@ def _price_percent(base: Decimal | None, price: Decimal | None, *, above: bool) 
 
 
 def format_signal_message(event: Any, trade: Any | None) -> str:
+    """Return an HTML-formatted Telegram message (use parse_mode=HTML when sending)."""
     symbol = (trade.symbol if trade else event.symbol) or event.tradingview_symbol or "unresolved"
-    signal_close = _money(event.signal_close)
+
+    # ── Trade not created / rejected ──────────────────────────────────────────
     if trade is None:
         reason = event.status_reason or "The alert could not be safely queued."
         return (
-            "⚠️ SHASHA signal not executed\n"
-            f"Symbol: {symbol}\n"
-            f"Signal close: {signal_close}\n"
-            f"Status: {event.status}\n"
-            f"Reason: {reason}"
+            "⚠️ <b>SHASHA — Signal Not Executed</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"📌 <b>Symbol:</b>  {symbol}\n"
+            f"❌ <b>Status:</b>  {event.status}\n"
+            f"📋 <b>Reason:</b>  {reason}\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "<i>📚 For educational purposes only.</i>"
         )
 
-    base = trade.actual_entry or trade.planned_entry
-    target1_pct = _price_percent(base, trade.target1_price, above=True)
-    target2_pct = _price_percent(base, trade.target2_price, above=True)
-    target3_pct = _price_percent(base, trade.target3_price, above=True)
-    stop_pct = _price_percent(base, trade.initial_stop_price, above=False)
-    if trade.status in {"REJECTED", "FAILED", "CANCELLED", "UNKNOWN", "PROTECTION_ERROR"}:
-        title = "⚠️ SHASHA — execution needs attention"
-    else:
-        title = "🟢 SHASHA — LONG SIGNAL"
+    # ── Direction banner ──────────────────────────────────────────────────────
+    direction = (trade.direction or "LONG").upper()
+    is_long = direction == "LONG"
+    dir_emoji = "🟢" if is_long else "🔴"
+    dir_label = "LONG  📈" if is_long else "SHORT  📉"
 
-    lines = [
-        title,
-        f"Symbol: {trade.symbol} (TradingView: {trade.tradingview_symbol})",
-        f"Buy Price (Previous Candle Close): {_money(trade.planned_entry)}",
-        f"Signal close: {signal_close}",
-        "Direction: LONG",
-        f"Target 1 (+{target1_pct}% underlying): {_money(trade.target1_price)}",
-        f"Target 2 (+{target2_pct}% underlying): {_money(trade.target2_price)}",
-        f"Target 3 (+{target3_pct}% underlying): {_money(trade.target3_price)}",
-        f"Initial SL (−{stop_pct}% underlying): {_money(trade.initial_stop_price)}",
-        f"Active SL: {_money(trade.stop_price)} ({trade.stop_stage})",
-        f"Margin: {_money(trade.margin)} USDT | Leverage: {trade.leverage}x",
-        f"Status: {trade.status}",
-    ]
-    if trade.mode == "PAPER":
-        lines.insert(1, "Mode: PAPER — simulated workflow; no private trade API order was sent.")
-    if trade.actual_entry is not None:
-        lines.insert(4, f"Actual average fill: {_money(trade.actual_entry)}")
-    if trade.status in {"ENTRY_PENDING", "ENTRY_PARTIAL", "QUEUED", "SUBMITTING"}:
-        lines[-1] = f"Status: {trade.status} (LIMIT entry; not an open position)"
-    if trade.status_reason:
-        lines.append(f"Detail: {trade.status_reason}")
-    lines.append("Trailing SL: after T1 → entry before fees; after T2 → T1 price; close remaining at T3.")
-    lines.append("Targets are underlying price moves, not leveraged account ROI. Fees, funding and slippage apply.")
-    return "\n".join(lines)
+    # Alert / attention header for bad statuses
+    is_bad = trade.status in {"REJECTED", "FAILED", "CANCELLED", "UNKNOWN", "PROTECTION_ERROR"}
+    header_emoji = "⚠️" if is_bad else dir_emoji
+    header_label = "Needs Attention" if is_bad else f"{direction} SIGNAL"
+
+    # ── Price fields ──────────────────────────────────────────────────────────
+    entry = _money(trade.actual_entry or trade.planned_entry)
+    sl    = _money(trade.stop_price or trade.initial_stop_price)
+    t1    = _money(trade.target1_price)
+    t2    = _money(trade.target2_price)
+    t3    = _money(trade.target3_price)
+
+    mode_line = "\n🧪 <i>PAPER — simulated, no real order sent.</i>" if trade.mode == "PAPER" else ""
+
+    return (
+        f"{header_emoji} <b>SHASHA — {header_label}</b>{mode_line}\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"📌 <b>Symbol</b>     :  <code>{symbol}</code>\n"
+        f"📊 <b>Direction</b>  :  <b>{dir_label}</b>\n"
+        f"💰 <b>Entry</b>      :  <code>{entry}</code>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 <b>Target 1</b>   :  <code>{t1}</code>\n"
+        f"🎯 <b>Target 2</b>   :  <code>{t2}</code>\n"
+        f"🎯 <b>Target 3</b>   :  <code>{t3}</code>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"🛑 <b>Stop Loss</b>  :  <code>{sl}</code>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "<i>📚 For educational purposes only.</i>"
+    )
 
 
 class TelegramNotifier:
@@ -121,7 +125,11 @@ class TelegramNotifier:
         try:
             response = await (await self._http()).post(
                 endpoint,
-                json={"chat_id": self.settings.telegram_chat_id, "text": text},
+                json={
+                    "chat_id": self.settings.telegram_chat_id,
+                    "text": text,
+                    "parse_mode": "HTML",
+                },
             )
         except httpx.TimeoutException as exc:
             raise TelegramRetryableError("TELEGRAM_TIMEOUT") from exc
