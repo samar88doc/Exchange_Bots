@@ -35,6 +35,7 @@ mkdir -p "$LOGS_DIR"
 # Clean up any old process on port 8000
 echo "► Checking port $PORT..."
 fuser -k "${PORT}/tcp" 2>/dev/null || true
+pkill -f "telegram_listener.py" 2>/dev/null || true
 if [ -f "$PID_FILE" ]; then
   old_pid=$(cat "$PID_FILE" 2>/dev/null || echo "")
   if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then

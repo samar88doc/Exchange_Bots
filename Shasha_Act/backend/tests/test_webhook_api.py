@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.config import Settings
@@ -66,6 +67,25 @@ def test_webhook_accepts_user_demo_format(test_client: TestClient) -> None:
     data = resp.json()
     assert data["accepted"] is True
     assert data["status"] in ("QUEUED", "ENTRY_PENDING")
+
+
+def test_webhook_rejects_third_party_telegram_and_vip_signals(test_client: TestClient) -> None:
+    # Signals from VIP Telegram scraper must be rejected with 403 Forbidden
+    resp = test_client.post(
+        "/api/webhooks/tradingview",
+        json={
+            "event_id": "tg-66879-INJUSDT",
+            "strategy_id": "vip_telegram",
+            "strategy_name": "Vip Crypto Signal Jemal",
+            "symbol": "INJUSDT",
+            "action": "BUY",
+            "price": 8.0,
+            "source": "TELEGRAM",
+            "secret": "demo-webhook-secret-12345",
+        },
+    )
+    assert resp.status_code == 403
+    assert "Third-party Telegram signals are prohibited" in resp.json()["detail"]
 
 
 def test_dashboard_api_requires_auth_but_health_is_safe_and_public(
@@ -173,8 +193,12 @@ def test_pending_entry_is_listed_and_can_be_cancelled_by_trade_id(
     )
     assert bad_phrase.status_code == 422
 
+    assert isinstance(test_client.app, FastAPI)
+    assert test_client.portal is not None
+    session_factory = test_client.app.state.session_factory
+
     async def confirm_simulated_entry_pending() -> None:
-        async with test_client.app.state.session_factory() as session:
+        async with session_factory() as session:
             trade = await session.get(Trade, trade_id)
             assert trade is not None
             trade.status = "ENTRY_PENDING"

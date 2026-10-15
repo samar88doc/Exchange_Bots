@@ -66,6 +66,16 @@
           <article class="kpi-card"><div class="kpi-label"><span>WIN RATE TODAY</span><span class="kpi-icon icon-amber">◌</span></div><div class="kpi-value" id="kpi-win-rate">—</div><div class="kpi-foot"><span id="kpi-win-note">Closed trades only</span><span class="muted">Market-local day</span></div></article>
         </div>
 
+        <div class="fee-panel" id="fee-panel">
+          <div class="fee-panel-head"><span class="fee-panel-title">💸 Fees &amp; Funding Today</span><span class="fee-panel-sub" id="fee-panel-date">Market-local day</span></div>
+          <div class="fee-panel-cards">
+            <div class="fee-card fee-card-gross"><div class="fee-card-label">GROSS P&amp;L</div><div class="fee-card-value" id="kpi-gross-pnl">—</div><div class="fee-card-note">Before deductions</div></div>
+            <div class="fee-card fee-card-fees"><div class="fee-card-label">TRADING FEES</div><div class="fee-card-value negative" id="kpi-trading-fees">—</div><div class="fee-card-note">Exchange / taker fees</div></div>
+            <div class="fee-card fee-card-funding"><div class="fee-card-label">FUNDING FEES</div><div class="fee-card-value" id="kpi-funding-fees">—</div><div class="fee-card-note" id="kpi-funding-note">Funding from open positions</div></div>
+            <div class="fee-card fee-card-net"><div class="fee-card-label">NET P&amp;L</div><div class="fee-card-value" id="kpi-net-breakdown">—</div><div class="fee-card-note">Gross − fees − funding</div></div>
+          </div>
+        </div>
+
         <div class="dashboard-grid">
           <section class="panel performance-panel">
             <div class="panel-head"><div><div class="panel-title">Performance</div><div class="panel-caption">Realized net P&L · <span id="performance-mode">PAPER</span></div></div><div class="segmented" id="performance-range"><button class="selected" data-days="30">30D</button><button data-days="7">7D</button></div></div>

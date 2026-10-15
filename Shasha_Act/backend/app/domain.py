@@ -164,9 +164,22 @@ def parse_alert(body: bytes) -> ParsedSignal:
         raw_payload = _redact(payload)
 
     raw_action = str(fields.get("action") or fields.get("side") or "").strip().upper()
+
+    # Reject non-TradingView scraper sources (such as third-party Telegram forwarders)
+    src = str(fields.get("source") or "").strip().upper()
+    if src == "TELEGRAM":
+        errors.append("TELEGRAM_SOURCE_PROHIBITED")
+
+    strat_name = str(fields.get("strategy_name") or "").strip()
+    strat_id = str(fields.get("strategy_id") or "").strip()
+    if any(k in strat_name.upper() or k in strat_id.upper() for k in ("VIP", "JEMAL")):
+        errors.append("THIRD_PARTY_VIP_PROHIBITED")
+
     strategy = str(fields.get("strategy") or (raw_action if raw_action not in ("BUY", "LONG") else "") or "SHASHA").strip().upper()
     if not strategy:
         strategy = "SHASHA"
+    elif any(k in strategy for k in ("VIP", "JEMAL", "TELEGRAM")):
+        errors.append("THIRD_PARTY_VIP_PROHIBITED")
 
     raw_symbol = str(fields.get("symbol") or fields.get("ticker") or "").strip()
     canonical_symbol: str | None = None

@@ -29,7 +29,8 @@ from app.schemas import (
     TradingPauseRequest,
 )
 from app.security import constant_time_equals, redact_text
-from app.services.pnl import long_unrealized_pnl, realized_pnl_for_day
+from app.services.pnl import long_unrealized_pnl, realized_pnl_for_day, realized_pnl_breakdown_for_day
+
 from app.services.risk import ACTIVE_TRADE_STATES, ensure_risk_control
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -465,7 +466,9 @@ async def overview(
     control = await ensure_risk_control(session, settings)
     mode = control.trading_mode
     today, start_utc, end_utc = _local_day_bounds(settings.timezone)
-    daily_pnl = await realized_pnl_for_day(session, settings.timezone, today, mode=mode)
+    pnl_breakdown = await realized_pnl_breakdown_for_day(session, settings.timezone, today, mode=mode)
+    daily_pnl = pnl_breakdown["net"]
+
     closed_rows = await session.execute(
         select(Trade.net_realized_pnl).where(
             Trade.mode == mode,
@@ -525,6 +528,9 @@ async def overview(
         "market_day_timezone": settings.timezone,
         "day_pnl": {
             "realized_net": _str(daily_pnl),
+            "gross": _str(pnl_breakdown["gross"]),
+            "fees_today": _str(pnl_breakdown["fees_paid"]),
+            "funding_today": _str(pnl_breakdown["funding_paid"]),
             "unrealized": _str(active_unrealized) if active_prices_available else None,
             "unrealized_status": "AVAILABLE" if active_prices_available else "STALE_OR_UNAVAILABLE_MARKET_DATA",
             "total": _str(daily_pnl + active_unrealized) if active_prices_available else None,

@@ -216,12 +216,65 @@
     const overview = state.overview;
     if (overview) {
       const day = overview.day_pnl || {};
+      const cur = day.currency || "USDT";
       const pnl = n(day.realized_net);
+      const gross = n(day.gross);
+      const feesPaid = n(day.fees_today);
+      const fundingPaid = n(day.funding_today);
+
+      // ── NET P&L KPI card ──
       const kpi = $("#kpi-day-pnl");
-      kpi.textContent = pnl === null ? "Unavailable" : fmtMoney(pnl, day.currency || "USDT", true);
+      kpi.textContent = pnl === null ? "Unavailable" : fmtMoney(pnl, cur, true);
       kpi.classList.toggle("positive", pnl !== null && pnl > 0);
       kpi.classList.toggle("negative", pnl !== null && pnl < 0);
-      setText("#kpi-day-pnl-note", `${overview.market_day} · ${overview.market_day_timezone} · ${day.funding_status === "AVAILABLE" ? "funding included" : "funding unavailable"}`);
+      // Build concise footnote: fee and funding breakdown
+      const feeNote = feesPaid !== null ? `fees −${fmtMoney(feesPaid, cur)}` : "fees unavailable";
+      const fundNote = fundingPaid !== null && fundingPaid !== 0
+        ? ` · funding −${fmtMoney(Math.abs(fundingPaid), cur)}`
+        : (day.funding_status === "AVAILABLE" ? " · funding ±0" : " · funding N/A");
+      setText("#kpi-day-pnl-note", `${overview.market_day} · ${overview.market_day_timezone} · ${feeNote}${fundNote}`);
+
+      // ── Fee & Funding panel ──
+      setText("#fee-panel-date", `${overview.market_day} · ${overview.market_day_timezone}`);
+
+      // Gross P&L
+      const grossEl = $("#kpi-gross-pnl");
+      if (grossEl) {
+        grossEl.textContent = gross === null ? "—" : fmtMoney(gross, cur, true);
+        grossEl.className = "fee-card-value" + (gross === null ? "" : gross >= 0 ? " positive" : " negative");
+      }
+
+      // Trading Fees (always a cost → show as red negative)
+      const feesEl = $("#kpi-trading-fees");
+      if (feesEl) {
+        feesEl.textContent = feesPaid === null ? "—" : `−${fmtMoney(feesPaid, cur)}`;
+        feesEl.className = "fee-card-value" + (feesPaid !== null && feesPaid > 0 ? " negative" : "");
+      }
+
+      // Funding Fees (can be positive received or negative paid)
+      const fundEl = $("#kpi-funding-fees");
+      if (fundEl) {
+        if (fundingPaid === null) {
+          fundEl.textContent = "—";
+          fundEl.className = "fee-card-value";
+          setText("#kpi-funding-note", day.funding_status === "AVAILABLE" ? "No funding this period" : "Funding data unavailable");
+        } else {
+          const fundAbs = Math.abs(fundingPaid);
+          const fundSign = fundingPaid < 0 ? "+" : "−"; // negative funding = received (gain)
+          fundEl.textContent = fundingPaid === 0 ? fmtMoney(0, cur) : `${fundSign}${fmtMoney(fundAbs, cur)}`;
+          fundEl.className = "fee-card-value" + (fundingPaid > 0 ? " negative" : fundingPaid < 0 ? " positive" : "");
+          setText("#kpi-funding-note", fundingPaid > 0 ? "Paid to shorts" : fundingPaid < 0 ? "Received from longs" : "No funding this period");
+        }
+      }
+
+      // Net P&L (mirror of kpi-day-pnl)
+      const netEl = $("#kpi-net-breakdown");
+      if (netEl) {
+        netEl.textContent = pnl === null ? "—" : fmtMoney(pnl, cur, true);
+        netEl.className = "fee-card-value" + (pnl === null ? "" : pnl > 0 ? " positive" : pnl < 0 ? " negative" : "");
+      }
+
+      // ── rest of KPI cards ──
       setText("#kpi-open", overview.open_positions ?? "—");
       setText("#kpi-open-note", `${overview.pending_entries ?? 0} pending entries`);
       setText("#kpi-signals", overview.signals_today ?? "—");

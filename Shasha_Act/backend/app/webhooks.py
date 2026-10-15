@@ -61,10 +61,29 @@ async def receive_tradingview(request: Request, token: str | None = None) -> dic
 
     authenticated = False
     if auth_token:
-        authenticated = constant_time_equals(auth_token, expected) or constant_time_equals(auth_token, "demo-webhook-secret-12345")
+        authenticated = constant_time_equals(auth_token, expected) or (
+            settings.environment == "test" and constant_time_equals(auth_token, "demo-webhook-secret-12345")
+        )
 
     if not authenticated:
         raise HTTPException(status_code=401, detail="Webhook authentication failed")
+
+    # Reject non-TradingView scraper sources (e.g. VIP Telegram forwarders) immediately
+    try:
+        cand = json.loads(body.decode("utf-8", errors="replace"))
+        if isinstance(cand, dict):
+            src = str(cand.get("source") or "").strip().upper()
+            strat_name = str(cand.get("strategy_name") or "")
+            strat_id = str(cand.get("strategy_id") or "")
+            if src == "TELEGRAM" or any(k in strat_name.upper() or k in strat_id.upper() for k in ("VIP", "JEMAL")):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Third-party Telegram signals are prohibited; only TradingView alerts are accepted",
+                )
+    except HTTPException:
+        raise
+    except Exception:
+        pass
 
     if settings.environment == "production" and request.url.scheme != "https":
         raise HTTPException(status_code=400, detail="HTTPS is required for production webhooks")
@@ -109,13 +128,18 @@ async def receive_tradingview(request: Request, token: str | None = None) -> dic
             await session.flush()
 
             if parsed.errors:
-                await enqueue_unique_job(
-                    session,
-                    kind="TELEGRAM_SIGNAL",
-                    event_id=event.id,
-                    idempotency_key=f"notify:{event.id}:rejected-payload",
-                    priority=20,
-                )
+                # Suppress telegram alert for non-permitted sources/VIP signals
+                if not any(
+                    err in parsed.errors
+                    for err in ("TELEGRAM_SOURCE_PROHIBITED", "THIRD_PARTY_VIP_PROHIBITED")
+                ):
+                    await enqueue_unique_job(
+                        session,
+                        kind="TELEGRAM_SIGNAL",
+                        event_id=event.id,
+                        idempotency_key=f"notify:{event.id}:rejected-payload",
+                        priority=20,
+                    )
             else:
                 try:
                     trade = await reserve_trade_slot(

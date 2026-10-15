@@ -43,6 +43,7 @@ fi
 echo "► Ensuring port $PORT is free..."
 fuser -k "${PORT}/tcp" 2>/dev/null || true
 pkill -f "ngrok http" 2>/dev/null || true
+pkill -f "telegram_listener.py" 2>/dev/null || true
 
 echo ""
 echo "✅ Shasha_Act has been stopped."

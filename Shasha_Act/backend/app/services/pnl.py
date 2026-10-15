@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
+from typing import TypedDict
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
@@ -11,13 +12,31 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models import Fill
 
 
+class DayPnlBreakdown(TypedDict):
+    net: Decimal
+    gross: Decimal
+    fees_paid: Decimal
+    funding_paid: Decimal
+
+
 async def realized_pnl_for_day(
     session: AsyncSession,
     timezone_name: str = "Asia/Kolkata",
     on_date: date | None = None,
     mode: str | None = None,
 ) -> Decimal:
-    """Return net realized P&L and incurred fees for the configured local calendar day.
+    """Return net realized P&L for the configured local calendar day (backwards-compat)."""
+    breakdown = await realized_pnl_breakdown_for_day(session, timezone_name, on_date, mode)
+    return breakdown["net"]
+
+
+async def realized_pnl_breakdown_for_day(
+    session: AsyncSession,
+    timezone_name: str = "Asia/Kolkata",
+    on_date: date | None = None,
+    mode: str | None = None,
+) -> DayPnlBreakdown:
+    """Return net P&L, gross P&L, trading fees and funding fees for the local calendar day.
 
     Gross realized values and exchange/paper fees are read from persisted fills. Funding
     is reported separately because Shark's documented trade-history endpoint does not
@@ -33,9 +52,21 @@ async def realized_pnl_for_day(
     if mode is not None:
         criteria.append(Fill.mode == mode.upper())
     rows = await session.execute(
-        select(Fill.gross_realized_pnl, Fill.fee).where(*criteria)
+        select(Fill.gross_realized_pnl, Fill.fee, Fill.funding).where(*criteria)
     )
-    return sum((gross - fee for gross, fee in rows.all()), Decimal("0"))
+    gross_total = Decimal("0")
+    fees_total = Decimal("0")
+    funding_total = Decimal("0")
+    for gross, fee, funding in rows.all():
+        gross_total += gross or Decimal("0")
+        fees_total += fee or Decimal("0")
+        funding_total += funding or Decimal("0")
+    return DayPnlBreakdown(
+        net=gross_total - fees_total - funding_total,
+        gross=gross_total,
+        fees_paid=fees_total,
+        funding_paid=funding_total,
+    )
 
 
 def long_unrealized_pnl(entry_price: Decimal, mark_price: Decimal, remaining_quantity: Decimal) -> Decimal:

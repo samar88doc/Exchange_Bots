@@ -209,3 +209,65 @@ async def test_paper_manual_close_requires_fresh_ticker_and_closes_simulated_qua
         assert trade.remaining_quantity == Decimal("0")
         assert trade.exit_price == Decimal("2060")
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_realized_pnl_breakdown_deducts_trading_fees_and_funding(tmp_path) -> None:
+    from app.services.pnl import realized_pnl_breakdown_for_day, realized_pnl_for_day
+
+    database_path = tmp_path / "pnl.sqlite3"
+    engine = make_engine(f"sqlite+aiosqlite:///{database_path}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(UTC)
+
+    async with sessions() as session:
+        # Create an entry fill with trading fee
+        session.add(
+            Fill(
+                id="f1",
+                trade_id="t1",
+                order_id="o1",
+                mode="PAPER",
+                entry_exit="ENTRY",
+                side="BUY",
+                price=Decimal("100"),
+                quantity=Decimal("1"),
+                fee=Decimal("0.05"),
+                gross_realized_pnl=Decimal("0"),
+                funding=None,
+                fill_time=now,
+            )
+        )
+        # Create an exit fill with gross profit, trading fee, and funding fee
+        session.add(
+            Fill(
+                id="f2",
+                trade_id="t1",
+                order_id="o2",
+                mode="PAPER",
+                entry_exit="EXIT",
+                side="SELL",
+                price=Decimal("110"),
+                quantity=Decimal("1"),
+                fee=Decimal("0.06"),
+                gross_realized_pnl=Decimal("10.00"),
+                funding=Decimal("0.02"),
+                fill_time=now,
+            )
+        )
+        await session.commit()
+
+        breakdown = await realized_pnl_breakdown_for_day(session, "Asia/Kolkata", now.date(), mode="PAPER")
+        assert breakdown["gross"] == Decimal("10.00")
+        assert breakdown["fees_paid"] == Decimal("0.11")
+        assert breakdown["funding_paid"] == Decimal("0.02")
+        # Net = Gross - Fees - Funding = 10.00 - 0.11 - 0.02 = 9.87
+        assert breakdown["net"] == Decimal("9.87")
+
+        # Also backwards-compat realized_pnl_for_day matches net
+        net = await realized_pnl_for_day(session, "Asia/Kolkata", now.date(), mode="PAPER")
+        assert net == Decimal("9.87")
+    await engine.dispose()
+

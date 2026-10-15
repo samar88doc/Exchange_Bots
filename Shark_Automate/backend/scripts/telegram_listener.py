@@ -21,7 +21,7 @@ except ImportError:
 API_ID = os.environ.get("TELEGRAM_API_ID")
 API_HASH = os.environ.get("TELEGRAM_API_HASH")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL", "") # e.g. "Crypto Futures" or channel ID
-WEBHOOK_URL = "http://127.0.0.1:8000/api/webhooks/tradingview"
+WEBHOOK_URL = os.environ.get("VIP_TELEGRAM_WEBHOOK_URL", "") # Disabled by default: do not forward to port 8000
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "demo-webhook-secret-12345")
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -115,6 +115,10 @@ async def handler(event):
             "x-webhook-secret": WEBHOOK_SECRET
         }
         
+        if not WEBHOOK_URL:
+            logger.info("WEBHOOK_URL not configured; skipping signal forwarding.")
+            return
+
         try:
             async with httpx.AsyncClient() as http_client:
                 response = await http_client.post(WEBHOOK_URL, json=payload, headers=headers)
