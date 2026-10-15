@@ -1,10 +1,12 @@
 """Authentication, exact Shark request signing, and webhook rate limiting."""
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import json
 import re
+import secrets
 import time
 from collections import defaultdict, deque
 from decimal import Decimal
@@ -14,6 +16,7 @@ from urllib.parse import urlencode
 
 from fastapi import HTTPException, Request, status
 
+PASSWORD_ALGORITHM = "pbkdf2_sha256"
 _SENSITIVE_TEXT = re.compile(
     r"(?i)(token|secret|signature|api[_-]?key|authorization|password)\s*[:=]\s*(?:bearer\s+)?([^\s,;&\"']+)"
 )
@@ -23,6 +26,54 @@ def constant_time_equals(candidate: str | None, expected: str | None) -> bool:
     if not candidate or not expected:
         return False
     return hmac.compare_digest(candidate.encode("utf-8"), expected.encode("utf-8"))
+
+
+def hash_password(password: str, iterations: int = 240_000, *, salt: bytes | None = None) -> str:
+    """PBKDF2-HMAC-SHA256 password hash usable without any third-party dependency."""
+    if not password:
+        raise ValueError("password must not be empty")
+    if iterations < 50_000:
+        raise ValueError("password hash iterations are below the minimum accepted strength")
+    salt_bytes = salt or secrets.token_bytes(16)
+    derived = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt_bytes, iterations)
+    return "$".join(
+        (
+            PASSWORD_ALGORITHM,
+            str(iterations),
+            base64.b64encode(salt_bytes).decode("ascii"),
+            base64.b64encode(derived).decode("ascii"),
+        )
+    )
+
+
+def verify_password(password: str, encoded: str) -> bool:
+    """Constant-time verification of an encoded PBKDF2 hash."""
+    if not password or not encoded:
+        return False
+    try:
+        algorithm, iterations, salt_b64, digest_b64 = encoded.split("$")
+    except ValueError:
+        return False
+    if algorithm != PASSWORD_ALGORITHM:
+        return False
+    try:
+        iterations_value = int(iterations)
+        salt = base64.b64decode(salt_b64)
+        expected = base64.b64decode(digest_b64)
+    except (ValueError, TypeError):
+        return False
+    if iterations_value < 50_000 or not salt or not expected:
+        return False
+    derived = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations_value)
+    return hmac.compare_digest(derived, expected)
+
+
+def new_session_token() -> str:
+    return secrets.token_urlsafe(48)
+
+
+def hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def redact_text(text: str) -> str:

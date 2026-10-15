@@ -1,6 +1,7 @@
 """Database-backed PAPER order/fill simulator; it has no Shark private API reference."""
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import uuid4
@@ -9,9 +10,25 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
+from app.domain import (
+    ValidationProblem,
+    align_to_tick,
+    next_trailing_stop,
+    round_up_to_step,
+)
 from app.market_data import TickerSnapshot
 from app.models import AuditEvent, Fill, Order, SignalEvent, Trade
 from app.services.outbox import enqueue_unique_job
+
+
+def _aligned_price(value: Decimal | None, trade: Trade) -> Decimal | None:
+    """Tick-align a price for comparison; stored levels can carry storage noise."""
+    if value is None:
+        return None
+    try:
+        return align_to_tick(value, trade.price_tick)
+    except ValidationProblem:
+        return value
 
 
 class PaperExecutionAdapter:
@@ -84,6 +101,9 @@ class PaperExecutionAdapter:
         now = ticker.received_at
         if now.tzinfo is None:
             now = now.replace(tzinfo=UTC)
+        aligned = _aligned_price(ticker.last_price, trade)
+        if aligned is not None and aligned != ticker.last_price:
+            ticker = replace(ticker, last_price=aligned)
         trade.last_price = ticker.last_price
 
         if trade.status == "ENTRY_PENDING":
@@ -135,11 +155,12 @@ class PaperExecutionAdapter:
                 )
                 return
 
+        limit_price = _aligned_price(trade.planned_entry, trade) or trade.planned_entry
         # A long limit buy can only simulate a match at/below its limit. A ticker touch
         # is a simulation criterion, not proof that a real exchange order would fill.
-        if ticker.last_price > trade.planned_entry:
+        if ticker.last_price > limit_price:
             return
-        entry_price = trade.planned_entry
+        entry_price = limit_price
         quantity = trade.quantity or Decimal("0")
         if quantity <= 0:
             raise RuntimeError("paper entry quantity is invalid")
@@ -151,12 +172,20 @@ class PaperExecutionAdapter:
         trade.remaining_quantity = quantity
         if trade.leverage and trade.leverage > 0:
             lev = Decimal(str(trade.leverage))
-            trade.liquidation_price = max(entry_price * (Decimal("1") - (Decimal("1") / lev) + Decimal("0.005")), Decimal("0"))
+            # Simplified isolated-margin estimate: maintenance buffer approximated, never
+            # presented as an exchange liquidation price in PAPER mode.
+            trade.liquidation_price = max(
+                entry_price * (Decimal("1") - (Decimal("1") / lev)) * Decimal("0.995"), Decimal("0")
+            )
         trade.status = "OPEN"
         trade.status_reason = "PAPER simulated limit fill; no exchange order was sent."
         trade.protection_state = "SIMULATED_ACTIVE"
         trade.opened_at = now
         trade.stop_stage = "INITIAL"
+        trade.partial_closed = False
+        trade.target_progress = 0
+        trade.trailing_active = False
+        trade.trailing_high_price = entry_price if trade.trailing_enabled else None
         if event is not None:
             event.status = "OPEN"
             event.status_reason = "PAPER simulated entry fill."
@@ -219,13 +248,18 @@ class PaperExecutionAdapter:
             await session.flush()
             trade.protective_stop_order_id = stop_order.client_order_id
         if not trade.target_order_ids:
-            target_data = (
-                ("TARGET_1", trade.target1_quantity, trade.target1_price),
-                ("TARGET_2", trade.target2_quantity, trade.target2_price),
-                ("TARGET_3", trade.target3_quantity, trade.target3_price),
-            )
+            target_data = [("TARGET_1", trade.target1_quantity, trade.target1_price)]
+            if trade.secondary_targets_enabled:
+                target_data.extend(
+                    [
+                        ("TARGET_2", trade.target2_quantity, trade.target2_price),
+                        ("TARGET_3", trade.target3_quantity, trade.target3_price),
+                    ]
+                )
             ids: list[str] = []
             for kind, quantity, price in target_data:
+                if price is None or quantity is None or quantity <= 0:
+                    continue
                 target = Order(
                     id=str(uuid4()),
                     trade_id=trade.id,
@@ -234,7 +268,7 @@ class PaperExecutionAdapter:
                     side="SELL",
                     order_type="LIMIT",
                     status="NEW",
-                    quantity=quantity or Decimal("0"),
+                    quantity=quantity,
                     price=price,
                     reduce_only=True,
                     request_summary={"paper": True, "take_profit": kind},
@@ -269,13 +303,103 @@ class PaperExecutionAdapter:
                 now,
                 taker=True,
             )
-            await self._mark_closed(session, trade, event, now, trade.stop_price, "SIMULATED_STOP")
+            stop_reason = {
+                "TRAILING": "SIMULATED_TRAILING_STOP",
+                "BREAK_EVEN": "SIMULATED_BREAK_EVEN_STOP",
+            }.get(trade.stop_stage, "SIMULATED_STOP")
+            await self._mark_closed(session, trade, event, now, trade.stop_price, stop_reason)
             return
 
+        await self._process_target1(session, trade, ticker, now)
+
+        if trade.secondary_targets_enabled:
+            await self._process_secondary_targets(session, trade, ticker, event, now)
+            if trade.status not in {"OPEN", "PARTIALLY_CLOSED"}:
+                return
+
+        if trade.trailing_enabled and trade.partial_closed:
+            await self._process_trailing_stop(session, trade, ticker, now)
+            if trade.status not in {"OPEN", "PARTIALLY_CLOSED"}:
+                return
+
+        if trade.status in {"OPEN", "PARTIALLY_CLOSED"} and trade.actual_entry is not None:
+            trade.unrealized_pnl = (ticker.last_price - trade.actual_entry) * (
+                trade.remaining_quantity or Decimal("0")
+            )
+
+    async def _process_target1(
+        self,
+        session: AsyncSession,
+        trade: Trade,
+        ticker: TickerSnapshot,
+        now: datetime,
+    ) -> None:
+        """Target 1 closes the configured slice and moves the stop to break-even."""
+        if trade.partial_closed or trade.target1_price is None:
+            return
+        slice_quantity = trade.target1_quantity or Decimal("0")
+        if slice_quantity <= 0 or ticker.last_price < trade.target1_price:
+            return
+        if slice_quantity > (trade.remaining_quantity or Decimal("0")):
+            raise RuntimeError("target 1 slice exceeds remaining paper position")
+        await self._close_paper_quantity(
+            session,
+            trade,
+            slice_quantity,
+            trade.target1_price,
+            "TARGET_1",
+            now,
+            taker=False,
+        )
+        trade.partial_closed = True
+        trade.target_progress = max(trade.target_progress, 1)
+        trade.status = "PARTIALLY_CLOSED"
+        stop_floor = trade.actual_entry or trade.planned_entry
+        tick = trade.price_tick
+        break_even = round_up_to_step(stop_floor, tick) if tick and tick > 0 else stop_floor
+        if trade.stop_price is None or trade.stop_price < break_even:
+            trade.stop_price = break_even
+        trade.stop_stage = "BREAK_EVEN"
+        trade.trailing_active = bool(trade.trailing_enabled)
+        trade.trailing_high_price = max(trade.trailing_high_price or break_even, ticker.last_price)
+        await self._amend_paper_stop(session, trade)
+        session.add(
+            AuditEvent(
+                action="PAPER_TARGET_1_FILLED",
+                entity_type="trade",
+                entity_id=trade.id,
+                details={
+                    "price": str(trade.target1_price),
+                    "closed_quantity": str(slice_quantity),
+                    "remaining_quantity": str(trade.remaining_quantity or Decimal("0")),
+                    "next_stop": str(trade.stop_price),
+                    "trailing_percent": str(trade.trailing_stop_percent),
+                },
+            )
+        )
+        await enqueue_unique_job(
+            session,
+            kind="TELEGRAM_SIGNAL",
+            event_id=trade.event_id,
+            idempotency_key=f"notify:{trade.event_id}:TARGET_1",
+            priority=20,
+        )
+
+    async def _process_secondary_targets(
+        self,
+        session: AsyncSession,
+        trade: Trade,
+        ticker: TickerSnapshot,
+        event: SignalEvent | None,
+        now: datetime,
+    ) -> None:
+        """Optional fixed Target 2/3 exits. Disabled by default: the runner trails instead."""
         target_prices = (trade.target1_price, trade.target2_price, trade.target3_price)
         target_quantities = (trade.target1_quantity, trade.target2_quantity, trade.target3_quantity)
         while trade.target_progress < 3:
             index = trade.target_progress
+            if index == 0:
+                break
             target_price = target_prices[index]
             slice_quantity = target_quantities[index]
             if target_price is None or slice_quantity is None or ticker.last_price < target_price:
@@ -292,14 +416,7 @@ class PaperExecutionAdapter:
                 taker=False,
             )
             trade.target_progress = index + 1
-            if trade.target_progress == 1:
-                trade.stop_price = trade.actual_entry
-                trade.stop_stage = "BREAK_EVEN_BEFORE_FEES"
-                trade.status = "PARTIALLY_CLOSED"
-            elif trade.target_progress == 2:
-                trade.stop_price = trade.target1_price
-                trade.stop_stage = "TARGET_1"
-                trade.status = "PARTIALLY_CLOSED"
+            trade.status = "PARTIALLY_CLOSED"
             if trade.target_progress < 3:
                 await self._amend_paper_stop(session, trade)
             session.add(
@@ -326,10 +443,60 @@ class PaperExecutionAdapter:
                 await self._mark_closed(session, trade, event, now, target_price, "TARGET_3")
                 break
 
-        if trade.status in {"OPEN", "PARTIALLY_CLOSED"} and trade.actual_entry is not None:
-            trade.unrealized_pnl = (ticker.last_price - trade.actual_entry) * (
-                trade.remaining_quantity or Decimal("0")
+    async def _process_trailing_stop(
+        self,
+        session: AsyncSession,
+        trade: Trade,
+        ticker: TickerSnapshot,
+        now: datetime,
+    ) -> None:
+        """Ratchet the protective stop: every 1% upward move lifts the stop by 1%."""
+        percent = trade.trailing_stop_percent
+        tick = trade.price_tick
+        floor_price = trade.actual_entry or trade.planned_entry
+        if percent is None or percent <= 0 or tick is None or tick <= 0:
+            return
+        high_water = max(trade.trailing_high_price or floor_price, ticker.last_price)
+        trade.trailing_high_price = high_water
+        try:
+            candidate = next_trailing_stop(
+                high_water=high_water,
+                current_stop=trade.stop_price,
+                floor_price=floor_price,
+                trailing_percent=percent,
+                price_tick=tick,
+                reference_price=ticker.last_price,
             )
+        except ValidationProblem:
+            return
+        if trade.stop_price is not None and candidate <= trade.stop_price:
+            return
+        previous_stop = trade.stop_price
+        trade.stop_price = candidate
+        trade.stop_stage = "TRAILING"
+        trade.trailing_active = True
+        await self._amend_paper_stop(session, trade)
+        session.add(
+            AuditEvent(
+                action="PAPER_TRAILING_STOP_UPDATED",
+                entity_type="trade",
+                entity_id=trade.id,
+                details={
+                    "previous_stop": str(previous_stop) if previous_stop is not None else None,
+                    "new_stop": str(candidate),
+                    "high_water": str(high_water),
+                    "trailing_percent": str(percent),
+                    "remaining_quantity": str(trade.remaining_quantity or Decimal("0")),
+                },
+            )
+        )
+        await enqueue_unique_job(
+            session,
+            kind="TELEGRAM_SIGNAL",
+            event_id=trade.event_id,
+            idempotency_key=f"notify:{trade.event_id}:TRAILING:{candidate}",
+            priority=30,
+        )
 
     async def _amend_paper_stop(self, session: AsyncSession, trade: Trade) -> None:
         if not trade.protective_stop_order_id:

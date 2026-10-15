@@ -13,7 +13,8 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy.ext.asyncio import AsyncEngine
 from starlette.middleware.cors import CORSMiddleware
 
-from app.api import public_router, router
+from app.accounts import ensure_bootstrap_user, ensure_subscription
+from app.api import auth_router, public_router, router
 from app.config import Settings, get_settings
 from app.db import make_engine, make_session_factory
 from app.runtime import build_context
@@ -68,6 +69,8 @@ def create_app(
             app_settings.webhook_rate_limit_per_minute
         )
         application.state.wallet_cache = None
+        if app_settings.environment == "production" and app_settings.require_disclaimer_ack is False:
+            log.warning("Risk disclaimer acknowledgement is disabled in production")
         context = build_context(
             app_settings,
             session_factory,
@@ -78,6 +81,8 @@ def create_app(
 
         async with session_factory() as session:
             await ensure_risk_control(session, app_settings)
+            await ensure_subscription(session, app_settings)
+            await ensure_bootstrap_user(session, app_settings)
             await session.commit()
 
         stop = asyncio.Event()
@@ -119,7 +124,7 @@ def create_app(
         allow_origins=app_settings.cors_origins_list,
         allow_credentials=False,
         allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
-        allow_headers=["Content-Type", "X-Dashboard-Token"],
+        allow_headers=["Content-Type", "X-Dashboard-Token", "X-Session-Token"],
         max_age=600,
     )
 
@@ -127,7 +132,11 @@ def create_app(
     async def secure_response_headers(request: Request, call_next: Any) -> Any:
         response = await call_next(request)
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
-        response.headers.setdefault("X-Frame-Options", "DENY")
+        frame_ancestors = app_settings.frame_ancestors_policy
+        # `X-Frame-Options` is only sent when the CSP policy denies framing, so the two
+        # headers never contradict each other.
+        if frame_ancestors in {"'none'", "none"}:
+            response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers.setdefault("Referrer-Policy", "no-referrer")
         response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
         if request.url.path.startswith("/api/") or request.url.path.startswith("/assets/") or request.url.path in ("/", "/index.html"):
@@ -138,7 +147,7 @@ def create_app(
             "Content-Security-Policy",
             "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
             "img-src 'self' data:; connect-src 'self'; font-src 'self'; object-src 'none'; "
-            "base-uri 'self'; frame-ancestors 'none'",
+            f"base-uri 'self'; frame-ancestors {frame_ancestors}",
         )
         if app_settings.environment == "production" and request.url.scheme == "https":
             response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
@@ -152,6 +161,7 @@ def create_app(
         return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
     application.include_router(public_router)
+    application.include_router(auth_router)
     application.include_router(router)
     application.include_router(webhook_router)
     if FRONTEND_DIR.is_dir():

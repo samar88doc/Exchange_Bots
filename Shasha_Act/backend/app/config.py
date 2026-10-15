@@ -30,16 +30,52 @@ class Settings(BaseSettings):
     dashboard_api_token: str = ""
     tradingview_webhook_token: str = ""
 
+    # Dashboard username/password sign-in (session cookie) ---------------------------------
+    dashboard_username: str = "admin"
+    dashboard_password: str = ""
+    dashboard_session_hours: int = 12
+    dashboard_session_cookie: str = "shasha_act_session"
+    dashboard_csrf_cookie: str = "shasha_act_csrf"
+    dashboard_allow_framing: bool = True
+    dashboard_frame_ancestors: str = ""
+    password_hash_iterations: int = 240_000
+    login_max_failures: int = 8
+    login_lockout_minutes: int = 15
+
+    # Service subscription + disclaimer ------------------------------------------------------
+    subscription_plan_name: str = "SHASHA ACT PRO"
+    subscription_fee: Decimal = Decimal("999")
+    subscription_currency: str = "INR"
+    subscription_billing_cycle: str = "MONTHLY"
+    subscription_started_at: str = ""
+    subscription_expires_at: str = ""
+    enforce_subscription: bool = False
+    require_disclaimer_ack: bool = False
+
     margin_per_trade: Decimal = Decimal("100")
     leverage: int = 10
     max_open_positions: int = 3
-    target1_percent: Decimal = Decimal("1")
-    target2_percent: Decimal = Decimal("2")
-    target3_percent: Decimal = Decimal("3")
+    target1_percent: Decimal = Decimal("2")
+    target2_percent: Decimal = Decimal("3")
+    target3_percent: Decimal = Decimal("4")
     stop_loss_percent: Decimal = Decimal("2")
     max_notional_per_trade: Decimal = Decimal("1000")
     max_daily_loss: Decimal = Decimal("200")
-    entry_price_source: str = "SHARK_15M_CLOSE"
+
+    # SHASHA strategy ------------------------------------------------------------------------
+    # Entry is the close of the last *completed* Shark candle for the symbol (default 5m),
+    # not the TradingView (Binance) price. TradingView only triggers the signal.
+    entry_price_source: Literal["SHARK_CLOSED_CANDLE", "SIGNAL_PAYLOAD"] = "SHARK_CLOSED_CANDLE"
+    entry_candle_interval: str = "5m"
+    entry_candle_max_age_seconds: int = 1800
+    # Strict by default: the entry price must be the Shark closed-candle close. A stale or
+    # unavailable candle feed rejects the signal (and its outbox job retries) instead of
+    # silently entering at a live tick that can differ from the documented candle close.
+    entry_allow_live_ticker_fallback: bool = False
+    target1_close_percent: Decimal = Decimal("50")
+    trailing_stop_percent: Decimal = Decimal("1")
+    trailing_enabled: bool = True
+    enable_secondary_targets: bool = False
     limit_entry_expiry_seconds: int = 900
     cancel_stale_entry_orders: bool = True
     emergency_trading_disabled: bool = False
@@ -79,6 +115,22 @@ class Settings(BaseSettings):
     @property
     def cors_origins_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
+
+    @property
+    def frame_ancestors_policy(self) -> str:
+        """CSP `frame-ancestors` source list.
+
+        Production defaults to `'none'` (dashboard cannot be framed). Development and test
+        permit framing so the console can be embedded in a trusted local preview surface.
+        `DASHBOARD_FRAME_ANCESTORS` overrides this explicitly.
+        """
+        if self.dashboard_frame_ancestors.strip():
+            return self.dashboard_frame_ancestors.strip()
+        return "*" if self.dashboard_allow_framing else "'none'"
+
+    @property
+    def dashboard_password_configured(self) -> bool:
+        return bool(self.dashboard_api_token or self.dashboard_password)
 
     @property
     def allow_symbols_list(self) -> list[str]:

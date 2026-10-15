@@ -12,7 +12,6 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
-    Numeric,
     String,
     Text,
     UniqueConstraint,
@@ -21,10 +20,11 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.db import Base, utcnow
+from app.db import Base, ExactDecimal, utcnow
 
 TS = DateTime(timezone=True)
-PRICE = Numeric(28, 12, asdecimal=True)
+# Exact Decimal storage: see ExactDecimal for why SQLite needs the re-quantize step.
+PRICE = ExactDecimal()
 
 
 class TimestampMixin:
@@ -110,6 +110,16 @@ class Trade(Base, TimestampMixin):
     target2_price: Mapped[Decimal | None] = mapped_column(PRICE, nullable=True)
     target3_price: Mapped[Decimal | None] = mapped_column(PRICE, nullable=True)
     target_progress: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    partial_closed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    trailing_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    trailing_high_price: Mapped[Decimal | None] = mapped_column(PRICE, nullable=True)
+    trailing_stop_percent: Mapped[Decimal | None] = mapped_column(PRICE, nullable=True)
+    partial_close_percent: Mapped[Decimal | None] = mapped_column(PRICE, nullable=True)
+    price_tick: Mapped[Decimal | None] = mapped_column(PRICE, nullable=True)
+    trailing_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    secondary_targets_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    entry_price_source: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    entry_candle_time: Mapped[datetime | None] = mapped_column(TS, nullable=True)
     stop_stage: Mapped[str] = mapped_column(String(24), nullable=False, default="INITIAL")
     protection_state: Mapped[str] = mapped_column(String(48), nullable=False, default="NOT_ESTABLISHED")
     entry_order_id: Mapped[str | None] = mapped_column(String(96), nullable=True)
@@ -218,10 +228,15 @@ class RiskControl(Base, TimestampMixin):
     max_open_positions: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
     margin_per_trade: Mapped[Decimal] = mapped_column(PRICE, nullable=False, default=Decimal("100"))
     leverage: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
-    target1_percent: Mapped[Decimal] = mapped_column(PRICE, nullable=False, default=Decimal("1"))
-    target2_percent: Mapped[Decimal] = mapped_column(PRICE, nullable=False, default=Decimal("2"))
-    target3_percent: Mapped[Decimal] = mapped_column(PRICE, nullable=False, default=Decimal("3"))
+    target1_percent: Mapped[Decimal] = mapped_column(PRICE, nullable=False, default=Decimal("2"))
+    target2_percent: Mapped[Decimal] = mapped_column(PRICE, nullable=False, default=Decimal("3"))
+    target3_percent: Mapped[Decimal] = mapped_column(PRICE, nullable=False, default=Decimal("4"))
     stop_loss_percent: Mapped[Decimal] = mapped_column(PRICE, nullable=False, default=Decimal("2"))
+    target1_close_percent: Mapped[Decimal] = mapped_column(PRICE, nullable=False, default=Decimal("50"))
+    trailing_stop_percent: Mapped[Decimal] = mapped_column(PRICE, nullable=False, default=Decimal("1"))
+    trailing_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    enable_secondary_targets: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    entry_candle_interval: Mapped[str] = mapped_column(String(16), nullable=False, default="5m")
     max_notional_per_trade: Mapped[Decimal] = mapped_column(PRICE, nullable=False, default=Decimal("1000"))
     max_daily_loss: Mapped[Decimal] = mapped_column(PRICE, nullable=False, default=Decimal("200"))
     limit_entry_expiry_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=900)
@@ -257,6 +272,73 @@ class MarketSnapshot(Base):
     low_24h: Mapped[Decimal | None] = mapped_column(PRICE, nullable=True)
     source: Mapped[str] = mapped_column(String(24), nullable=False, default="SHARK_LAST")
     updated_at: Mapped[datetime] = mapped_column(TS, nullable=False, default=utcnow)
+
+
+class DashboardUser(Base, TimestampMixin):
+    """Operator account: username/password sign-in, role, and subscription window."""
+
+    __tablename__ = "shasha_act_users"
+    __table_args__ = (
+        UniqueConstraint("username", name="uq_shasha_act_users_username"),
+        Index("ix_shasha_act_users_active", "is_active"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    username: Mapped[str] = mapped_column(String(64), nullable=False)
+    display_name: Mapped[str] = mapped_column(String(96), nullable=False, default="")
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    role: Mapped[str] = mapped_column(String(16), nullable=False, default="OPERATOR")
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    subscription_plan: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    subscription_fee: Mapped[Decimal] = mapped_column(PRICE, nullable=False, default=Decimal("0"))
+    subscription_currency: Mapped[str] = mapped_column(String(8), nullable=False, default="INR")
+    subscription_cycle: Mapped[str] = mapped_column(String(16), nullable=False, default="MONTHLY")
+    subscription_started_at: Mapped[datetime | None] = mapped_column(TS, nullable=True)
+    subscription_expires_at: Mapped[datetime | None] = mapped_column(TS, nullable=True)
+    disclaimer_accepted_at: Mapped[datetime | None] = mapped_column(TS, nullable=True)
+    last_login_at: Mapped[datetime | None] = mapped_column(TS, nullable=True)
+    failed_login_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    locked_until: Mapped[datetime | None] = mapped_column(TS, nullable=True)
+
+
+class DashboardSession(Base):
+    """Server-issued session for cookie sign-in; only the token hash is stored."""
+
+    __tablename__ = "shasha_act_sessions"
+    __table_args__ = (
+        UniqueConstraint("token_hash", name="uq_shasha_act_sessions_token"),
+        Index("ix_shasha_act_sessions_user", "user_id"),
+        Index("ix_shasha_act_sessions_expiry", "expires_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[str] = mapped_column(
+        ForeignKey("shasha_act_users.id", ondelete="CASCADE"), nullable=False
+    )
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    csrf_token_hash: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(TS, nullable=False, default=utcnow)
+    expires_at: Mapped[datetime] = mapped_column(TS, nullable=False)
+    last_seen_at: Mapped[datetime | None] = mapped_column(TS, nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(TS, nullable=True)
+    user_agent: Mapped[str] = mapped_column(String(160), nullable=False, default="")
+
+
+class ServiceSubscription(Base, TimestampMixin):
+    """Single-row service plan shown in the dashboard (fee, cycle, expiry, status)."""
+
+    __tablename__ = "shasha_act_subscription"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    plan_name: Mapped[str] = mapped_column(String(64), nullable=False, default="SHASHA ACT PRO")
+    fee: Mapped[Decimal] = mapped_column(PRICE, nullable=False, default=Decimal("0"))
+    currency: Mapped[str] = mapped_column(String(8), nullable=False, default="INR")
+    billing_cycle: Mapped[str] = mapped_column(String(16), nullable=False, default="MONTHLY")
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="ACTIVE")
+    started_at: Mapped[datetime | None] = mapped_column(TS, nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(TS, nullable=True)
+    contact: Mapped[str] = mapped_column(String(160), nullable=False, default="")
+    notes: Mapped[str] = mapped_column(Text, nullable=False, default="")
 
 
 class SentimentHistory(Base):

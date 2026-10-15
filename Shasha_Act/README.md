@@ -1,6 +1,10 @@
 # Shasha_Act
 
-**PAPER-first TradingView SHASHA signal receiver for Shark Exchange** — an isolated project inside the existing `Exchange_Bots` repository. It does not replace or modify `Shark_Automate/`, `mudrex_auto/`, `mudrex_roi/`, or `pi42_roi/`.
+**PAPER-first TradingView SHASHA signal executor for Shark Exchange** — an isolated project inside the existing `Exchange_Bots` repository. It does not replace or modify `Shark_Automate/`, `mudrex_auto/`, `mudrex_roi/`, or `pi42_roi/`.
+
+TradingView (Binance prices) is only a **trigger**. The traded price is the Shark Exchange price:
+the close of the last **completed 5-minute candle** for that contract, quantized to the contract's
+exact price fraction (for example `0.00239`).
 
 > **Safety status:** PAPER is the only mode that can currently execute the strategy. LIVE activation is intentionally blocked. Current official Shark material does not provide enough verified detail for exact contract tick/quantity-step rules and split TP/SL replacement/OCO behavior. Do not set either `SHARK_CONTRACT_RULES_VERIFIED` or `SHARK_SPLIT_PROTECTION_VERIFIED` to `true` until those rules are independently verified against current official documentation and a non-production account. This project never submits real orders in tests or its default configuration.
 
@@ -9,11 +13,27 @@
 - Tokenized TradingView webhook (`/api/webhooks/tradingview/{token}`), bounded request size, per-process rate limit, JSON plus constrained legacy-text parsing, stable deduplication, and durable event persistence.
 - Strict `.P`-suffix normalization only; no automatic `USDT` suffixing. Shark exchange metadata must match an active USDT-quoted perpetual contract. TradingView and Shark symbols are stored separately.
 - Server-side risk gates: reserved position slots, one active exposure per contract, symbol allow/deny filters, notional limits, market-local day-loss check, emergency pause, and stale-entry handling.
-- Decimal-based order levels and `Q1 + Q2 + Q3 = Q` sizing. Previous-candle close is stored as planned limit entry; signal-candle close remains separate.
+- Exact-Decimal order levels: stop at **2% below** the Shark entry price, **Target 1 at +2% closing 50%** of the position, then the stop moves to **break-even** and **trails 1% behind every new 1% high**. Optional fixed Target 2/3 ladder remains available but is off by default.
+- Entry provenance is stored per trade (`entry_price_source`, `entry_candle_time`, `price_tick`) so the dashboard can always show where the executed price came from.
+- Dashboard sign-in with **username and password** (PBKDF2-hashed, opaque `X-Session-Token` sessions), a **subscription** record with plan/fee/expiry, and an operator **risk disclaimer** gate.
 - PAPER simulator whose code has no Shark private-order client. PAPER fills are explicitly simulated from Shark public last-price data and are not real execution.
 - Durable SQL outbox with leases, idempotent work keys and retry states for trade processing, Telegram, reconciliation and cancellation.
 - Authenticated dashboard/API, operator actions with typed confirmations, event/order/audit history, CSV export, health status, and explicit stale/unavailable market and P&L states.
 - PostgreSQL migrations with tables scoped to the `shasha_act_*` namespace.
+
+## Strategy (the exact rules)
+
+| Step | Rule |
+|---|---|
+| 1. Trigger | A TradingView alert arrives (Binance-based price). The alert is only a trigger; its price is recorded as `signal_close`, never traded. |
+| 2. Entry | The bot immediately reads the last **completed** 5-minute candle for that contract on Shark and uses its close as the entry price, quantized to the contract's exact price fraction (e.g. `0.00239`). A stale or unavailable candle rejects the signal instead of guessing a price (`ENTRY_ALLOW_LIVE_TICKER_FALLBACK=false` by default). |
+| 3. Stop loss | 2% below the entry price, submitted reduce-only together with the entry and confirmed before the position is reported as protected. |
+| 4. Target 1 | 2% above the entry price, closing **50%** of the position. |
+| 5. Break-even | As soon as Target 1 is filled, the stop moves to the entry price, so the runner cannot lose money on the trade. |
+| 6. Trailing stop | Thereafter the stop trails **1% behind every new 1% high** (high-water mark stored per trade). The stop only ever ratchets upward and never moves down. |
+
+Secondary fixed Target 2 / Target 3 exits exist but are disabled by default, so the runner follows
+the trailing stop instead. Percentages apply to the underlying price, not to leveraged account ROI.
 
 ## Architecture and state flow
 
@@ -31,7 +51,7 @@ PostgreSQL: signal event + trade reservation + outbox jobs
                  dashboard + health API
 ```
 
-For PAPER, an accepted signal is queued as a limit entry at the supplied previous-candle close. A simulated entry is created only when a fresh public last-price update is at or below that limit; this is a simulation rule, not proof that a real order would fill. Targets/stop changes and simulated fills are stored with audit records.
+For PAPER, an accepted signal is queued as a limit entry at the **Shark 5-minute closed-candle close** (never the TradingView price). A simulated entry is created only when a fresh public last-price update is at or below that limit; this is a simulation rule, not proof that a real order would fill. After the fill, the 2% stop, the 50% Target 1 slice, the break-even step and the 1% trailing ratchet are all simulated from fresh public prices and recorded with audit events.
 
 LIVE controls require all of the following: the server-side `LIVE_TRADING_ENABLED` gate, configured Shark private credentials, deliberate dashboard confirmation, verified Shark contract rules, verified split-protection semantics, and an exchange metadata match. **The current implementation fails those verification gates closed, and the dashboard LIVE action returns HTTP 409.** Do not bypass this by editing the database.
 
@@ -54,7 +74,7 @@ pip install -e '.[dev]'
 cp .env.example .env
 ```
 
-Edit only your local `backend/.env` file. Never commit it. Use a PostgreSQL database dedicated to this application and a least-privilege database role. Generate two unrelated random tokens locally, for example with `python -c 'import secrets; print(secrets.token_urlsafe(32))'`, and set them as `DASHBOARD_API_TOKEN` and `TRADINGVIEW_WEBHOOK_TOKEN`. The dashboard token is entered into the browser at sign-in and held in memory only; it is not written to browser storage.
+Edit only your local `backend/.env` file. Never commit it. Use a PostgreSQL database dedicated to this application and a least-privilege database role. Generate two unrelated random tokens locally, for example with `python -c 'import secrets; print(secrets.token_urlsafe(32))'`, and set them as `DASHBOARD_API_TOKEN` and `TRADINGVIEW_WEBHOOK_TOKEN`. Also set `DASHBOARD_USERNAME` and a strong `DASHBOARD_PASSWORD`: the console signs in with those credentials, and the first account is bootstrapped with the `OWNER` role. The server token stays available for automation. A browser session token is only written to `localStorage` when the operator keeps the "keep me signed in" box checked, and it can be cleared from **Settings → Dashboard access** or revoked server-side.
 
 Set up the PostgreSQL database/role using your normal secrets manager, then set `DATABASE_URL` to a SQLAlchemy async URL, for example:
 
@@ -74,7 +94,7 @@ Run the application locally (PAPER remains the default):
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --no-access-log
 ```
 
-Open `http://localhost:8000/`, enter the dashboard token, and use **Settings → Risk parameters** to review the server-enforced limits. `/api/health` and `/api/ready` are safe health endpoints; all dashboard data/actions require `X-Dashboard-Token`.
+Open `http://localhost:8000/` and sign in with `DASHBOARD_USERNAME` / `DASHBOARD_PASSWORD` (or the server token). The first sign-in asks for the risk disclaimer, then use **Playbook** and **Settings → Risk parameters** to review the server-enforced rules. `/api/health` and `/api/ready` are safe health endpoints; all dashboard data/actions require `X-Dashboard-Token`.
 
 For production, set `ENVIRONMENT=production`, use PostgreSQL, configure the dashboard and webhook tokens, terminate HTTPS at a trusted proxy, and ensure the proxy/ASGI server correctly sets the external HTTPS scheme. Do not trust arbitrary forwarded headers from the public internet. Keep access logging disabled or configure the reverse proxy to redact the tokenized webhook path; the webhook token is part of the URL. Do not enable a broad CORS policy.
 
@@ -98,7 +118,7 @@ The receiver strips only one case-insensitive trailing `.P`, then requires exact
 
 ## Dashboard and controls
 
-The dashboard provides overview, positions, public markets, signal/outbox log, history/CSV, risk settings and service health. It displays prices as public **last price**, not mark price. Day P&L is based on the configured market-local calendar day (default `Asia/Kolkata`), uses persisted fills/fees, and labels unavailable funding separately. It does not use the exchange's rolling 24-hour percentage change as day P&L.
+The console is a single-page **neural-schema dashboard**: an animated overview with a live execution-path schema, KPI cards, a performance chart, a system-status matrix, positions with a visual protection rail (stop / entry / target / last price), pending entries, public markets with market-day change, the signal/outbox log, history with CSV export, the strategy playbook with a worked example, account/subscription, settings and operator access control. It displays prices as public **last price**, not mark price. Day P&L is based on the configured market-local calendar day (default `Asia/Kolkata`), uses persisted fills/fees, and labels unavailable funding separately. It does not use the exchange's rolling 24-hour percentage change as day P&L.
 
 Operator controls include:
 
@@ -107,12 +127,14 @@ Operator controls include:
 - **Close position** with typed confirmation. PAPER closes are simulated at a fresh last price; any future LIVE close remains pending until Shark confirms its final state.
 - **Edit PAPER risk levels** with typed confirmation and validation against a fresh last price. LIVE position-level risk edits are disabled while exchange protection rules remain unverified.
 - **Retry failed Telegram delivery** without creating a new trade.
+- **Strategy rules** (entry candle interval, stop %, Target 1 %, Target 1 close %, trailing %) with server-side validation and an audit entry for every change.
+- **Manage the subscription** (plan, fee, currency, cycle) and **operator accounts** (create, role, enable/disable, per-account plan and expiry) when the signed-in role allows it.
 
 A status such as `ENTRY_PENDING` is not an open position. `UNKNOWN`, `PROTECTION_ERROR`, stale prices, missing fee/funding data and failed outbox work remain visible rather than being replaced with fabricated values.
 
 ## Risk defaults
 
-Initial database settings are PAPER, 100 USDT margin/trade, 10x leverage, 3 open slots, 1%/2%/3% underlying price targets, 2% stop, 1,000 USDT notional/trade cap, 200 USDT daily loss cap, and 15-minute pending-entry expiry. These are editable from the authenticated dashboard. They are guardrails, not a promise of execution or P&L. Target percentages apply to the underlying price, not leveraged account ROI.
+Initial database settings are PAPER, 100 USDT margin/trade, 10x leverage, 3 open slots, a **2% stop**, **Target 1 at +2% closing 50%**, break-even then a **1% trailing stop**, secondary Target 2/3 exits disabled, 1,000 USDT notional/trade cap, 200 USDT daily loss cap, and a 15-minute pending-entry expiry. These are editable from the authenticated dashboard. They are guardrails, not a promise of execution or P&L. Percentages apply to the underlying price, not leveraged account ROI; fees, funding and slippage are excluded from strategy illustrations.
 
 ## Checks
 
@@ -130,7 +152,7 @@ The test suite uses fake tokens, SQLite and mocked HTTP. It does not call Telegr
 
 ## Documentation
 
-- [`docs/tradingview.md`](docs/tradingview.md) — Pine alert template and receiver contract
+- [`docs/tradingview.md`](docs/tradingview.md) — Pine alert template and receiver contract (TradingView triggers; Shark prices execute)
 - [`docs/api.md`](docs/api.md) — endpoints, auth and response semantics
 - [`docs/shark-api-verification.md`](docs/shark-api-verification.md) — official documentation inspected and fail-closed gaps
 - [`docs/operations.md`](docs/operations.md) — runbook, state model, troubleshooting and security

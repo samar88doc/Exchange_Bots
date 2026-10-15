@@ -12,6 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import Settings
+from app.domain import ValidationProblem, next_trailing_stop
 from app.market_data import MarketDataService, TickerSnapshot
 from app.models import AuditEvent, Fill, Order, SignalEvent, Trade
 from app.services.outbox import enqueue_unique_job
@@ -430,13 +431,18 @@ class ReconciliationService:
 
     async def _reconcile_protective_orders(self, session: AsyncSession, trade: Trade) -> None:
         target_ids = list(trade.target_order_ids or [])
-        if len(target_ids) != 3 or not trade.protective_stop_order_id:
-            await self._set_protection_alarm(session, trade, "PROTECTIVE_ORDER_IDS_INCOMPLETE")
-            return
         target_prices = (trade.target1_price, trade.target2_price, trade.target3_price)
         target_quantities = (trade.target1_quantity, trade.target2_quantity, trade.target3_quantity)
+        expected_targets = sum(
+            1
+            for price, quantity in zip(target_prices, target_quantities, strict=True)
+            if price is not None and quantity is not None and quantity > 0
+        )
+        if len(target_ids) != expected_targets or not trade.protective_stop_order_id:
+            await self._set_protection_alarm(session, trade, "PROTECTIVE_ORDER_IDS_INCOMPLETE")
+            return
         active_statuses = {"NEW", "OPEN", "PENDING", "SUBMITTED"}
-        for index in range(trade.target_progress, 3):
+        for index in range(trade.target_progress, expected_targets):
             order_id = target_ids[index]
             try:
                 state = _data(await self.shark.order(order_id))
@@ -460,7 +466,11 @@ class ReconciliationService:
                     await self._set_protection_alarm(session, trade, "TARGET_FILL_QUANTITY_NOT_CONFIRMED")
                     return
                 await self._sync_trade_history(session, trade)
-                if index < 2:
+                if index < expected_targets - 1:
+                    await self._move_live_stop_after_target(session, trade, index)
+                elif trade.trailing_enabled and not trade.secondary_targets_enabled:
+                    # Target 1 is the partial exit; the runner is protected by the
+                    # break-even stop and then by the trailing stop ratchet.
                     await self._move_live_stop_after_target(session, trade, index)
                 else:
                     await self._finish_live_trade(session, trade)
@@ -506,6 +516,97 @@ class ReconciliationService:
             or confirmed_stop_quantity != expected_stop_quantity
         ):
             await self._set_protection_alarm(session, trade, "PROTECTIVE_STOP_NOT_ACTIVE_OR_MISMATCHED")
+            return
+        if trade.trailing_enabled and trade.partial_closed and trade.trailing_stop_percent:
+            await self._apply_live_trailing_stop(session, trade, expected_stop_quantity)
+
+    async def _apply_live_trailing_stop(
+        self, session: AsyncSession, trade: Trade, protected_quantity: Decimal
+    ) -> None:
+        """Ratchet the exchange stop upward after Target 1 (1% up move → 1% higher stop).
+
+        Only ever amends the stop upward and only after the exchange confirmed the current
+        stop. A failed amendment raises a protection alarm instead of being retried blindly.
+        """
+        percent = trade.trailing_stop_percent
+        tick = trade.price_tick
+        floor_price = trade.actual_entry
+        if percent is None or percent <= 0 or tick is None or tick <= 0 or floor_price is None:
+            return
+        ticker = self.market.tickers.get(trade.symbol)
+        if ticker is None or ticker.is_stale(self.settings.market_data_stale_seconds):
+            return
+        high_water = max(trade.trailing_high_price or floor_price, ticker.last_price)
+        trade.trailing_high_price = high_water
+        try:
+            candidate = next_trailing_stop(
+                high_water=high_water,
+                current_stop=trade.stop_price,
+                floor_price=floor_price,
+                trailing_percent=percent,
+                price_tick=tick,
+                reference_price=ticker.last_price,
+            )
+        except ValidationProblem:
+            return
+        if trade.stop_price is not None and candidate <= trade.stop_price:
+            return
+        previous_stop = trade.stop_price
+        try:
+            await self.shark.edit_order(
+                trade.protective_stop_order_id or "",
+                quantity=protected_quantity,
+                stop_price=candidate,
+            )
+            confirmed = _data(await self.shark.order(trade.protective_stop_order_id or ""))
+        except Exception as exc:
+            await self._set_protection_alarm(
+                session, trade, f"TRAILING_STOP_AMENDMENT_FAILED_{type(exc).__name__}"
+            )
+            return
+        if not isinstance(confirmed, dict):
+            await self._set_protection_alarm(session, trade, "TRAILING_STOP_AMENDMENT_UNCONFIRMED")
+            return
+        status = str(confirmed.get("status") or "").upper()
+        confirmed_price = _order_price(confirmed, stop=True)
+        confirmed_quantity = _dec(confirmed.get("quantity") or confirmed.get("orderAmount"))
+        if (
+            status not in {"NEW", "OPEN", "PENDING", "SUBMITTED"}
+            or confirmed_price != candidate
+            or confirmed_quantity != protected_quantity
+        ):
+            await self._set_protection_alarm(session, trade, "TRAILING_STOP_AMENDMENT_UNCONFIRMED")
+            return
+        trade.stop_price = candidate
+        trade.stop_stage = "TRAILING"
+        trade.trailing_active = True
+        stop_order = await session.scalar(
+            select(Order).where(Order.client_order_id == trade.protective_stop_order_id)
+        )
+        if stop_order is not None:
+            stop_order.price = candidate
+            stop_order.quantity = protected_quantity
+            stop_order.status = "NEW"
+        session.add(
+            AuditEvent(
+                action="SHARK_TRAILING_STOP_UPDATED",
+                entity_type="trade",
+                entity_id=trade.id,
+                details={
+                    "previous_stop": str(previous_stop) if previous_stop is not None else None,
+                    "new_stop": str(candidate),
+                    "high_water": str(high_water),
+                    "trailing_percent": str(percent),
+                },
+            )
+        )
+        await enqueue_unique_job(
+            session,
+            kind="TELEGRAM_SIGNAL",
+            event_id=trade.event_id,
+            idempotency_key=f"notify:{trade.event_id}:TRAILING:{candidate}",
+            priority=30,
+        )
 
     async def _move_live_stop_after_target(
         self, session: AsyncSession, trade: Trade, target_index: int
@@ -597,7 +698,7 @@ class ReconciliationService:
             await self._set_protection_alarm(session, trade, "TARGET_FILLED_BUT_POSITION_REMAINS_OPEN")
             return
         target_ids = list(trade.target_order_ids or [])
-        if not trade.protective_stop_order_id or len(target_ids) != 3:
+        if not trade.protective_stop_order_id or not target_ids:
             await self._set_protection_alarm(session, trade, "PROTECTIVE_ORDER_IDS_INCOMPLETE_AFTER_EXIT")
             return
         order_ids = [trade.protective_stop_order_id, *target_ids]
@@ -733,9 +834,62 @@ class ReconciliationService:
             priority=1,
         )
 
+    async def expire_stale_queued_trades(self) -> int:
+        """Cancel QUEUED reservations whose entry price never resolved inside the window.
+
+        Without this sweep a signal that repeatedly fails to resolve a Shark entry price
+        would hold its position slot and the per-symbol exposure lock indefinitely.
+        """
+        window = max(int(self.settings.limit_entry_expiry_seconds), 60)
+        now = datetime.now(UTC)
+        expired = 0
+        async with self.session_factory() as session:
+            trades = list(
+                (await session.scalars(select(Trade).where(Trade.status == "QUEUED"))).all()
+            )
+            for trade in trades:
+                created = trade.created_at
+                if created is None:
+                    continue
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=UTC)
+                if (now - created).total_seconds() < window:
+                    continue
+                trade.status = "CANCELLED"
+                trade.status_reason = (
+                    "QUEUED_ENTRY_EXPIRED_WITHOUT_CONFIRMED_SHARK_ENTRY_PRICE: the signal could "
+                    "not resolve a fresh Shark closed-candle price before the entry window ended."
+                )
+                trade.closed_at = now
+                trade.protection_state = "NOT_APPLICABLE"
+                event = await session.get(SignalEvent, trade.event_id)
+                if event is not None and event.status in {"QUEUED", "RECEIVED"}:
+                    event.status = "CANCELLED"
+                    event.status_reason = trade.status_reason
+                session.add(
+                    AuditEvent(
+                        action="QUEUED_ENTRY_EXPIRED",
+                        entity_type="trade",
+                        entity_id=trade.id,
+                        details={"window_seconds": window},
+                    )
+                )
+                await enqueue_unique_job(
+                    session,
+                    kind="TELEGRAM_SIGNAL",
+                    event_id=trade.event_id,
+                    idempotency_key=f"notify:{trade.event_id}:QUEUED_ENTRY_EXPIRED",
+                    priority=20,
+                )
+                expired += 1
+            if expired:
+                await session.commit()
+        return expired
+
     async def run(self, stop: asyncio.Event) -> None:
         while not stop.is_set():
             try:
+                await self.expire_stale_queued_trades()
                 async with self.session_factory() as session:
                     rows = await session.scalars(
                         select(Trade.event_id).where(Trade.status.in_(ACTIVE_STATES))

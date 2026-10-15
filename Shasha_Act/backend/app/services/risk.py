@@ -9,6 +9,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.accounts import ensure_subscription, subscription_state
 from app.config import Settings
 from app.domain import ParsedSignal
 from app.market_data import MarketDataService
@@ -47,6 +48,11 @@ async def ensure_risk_control(session: AsyncSession, settings: Settings) -> Risk
             target2_percent=settings.target2_percent,
             target3_percent=settings.target3_percent,
             stop_loss_percent=settings.stop_loss_percent,
+            target1_close_percent=settings.target1_close_percent,
+            trailing_stop_percent=settings.trailing_stop_percent,
+            trailing_enabled=settings.trailing_enabled,
+            enable_secondary_targets=settings.enable_secondary_targets,
+            entry_candle_interval=settings.entry_candle_interval,
             max_notional_per_trade=settings.max_notional_per_trade,
             max_daily_loss=settings.max_daily_loss,
             limit_entry_expiry_seconds=settings.limit_entry_expiry_seconds,
@@ -82,6 +88,13 @@ async def reserve_trade_slot(
             control = await ensure_risk_control(session, settings)
         if settings.emergency_trading_disabled or control.kill_switch:
             raise RiskRejected("EMERGENCY_TRADING_DISABLED")
+        if settings.enforce_subscription:
+            state = subscription_state(await ensure_subscription(session, settings))
+            if state.get("expired") is True or str(state.get("stored_status")) in {
+                "SUSPENDED",
+                "CANCELLED",
+            }:
+                raise RiskRejected("SUBSCRIPTION_INACTIVE_NEW_SIGNALS_BLOCKED")
         if control.allow_symbols and parsed.symbol not in control.allow_symbols:
             raise RiskRejected("SYMBOL_NOT_ALLOWLISTED")
         if parsed.symbol in (control.deny_symbols or []):

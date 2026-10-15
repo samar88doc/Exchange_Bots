@@ -108,7 +108,7 @@ def parse_kline(data: Any, symbol: str | None = None) -> DayKlineSnapshot | None
             return None
         o = _decimal(k.get("o"))
         h = _decimal(k.get("h"))
-        l = _decimal(k.get("l"))
+        low_value = _decimal(k.get("l"))
         c = _decimal(k.get("c"))
         v = _decimal(k.get("v"))
         t = _decimal(k.get("t"))
@@ -118,7 +118,7 @@ def parse_kline(data: Any, symbol: str | None = None) -> DayKlineSnapshot | None
         sym = str(symbol or data.get("symbol") or data.get("pair") or "").upper()
         o = _decimal(data.get("open"))
         h = _decimal(data.get("high"))
-        l = _decimal(data.get("low"))
+        low_value = _decimal(data.get("low"))
         c = _decimal(data.get("close"))
         v = _decimal(data.get("volume"))
         t = _decimal(data.get("startTime"))
@@ -147,7 +147,7 @@ def parse_kline(data: Any, symbol: str | None = None) -> DayKlineSnapshot | None
         symbol=sym,
         open_price=o,
         high_price=h if h is not None and h > 0 else o,
-        low_price=l if l is not None and l > 0 else o,
+        low_price=low_value if low_value is not None and low_value > 0 else o,
         close_price=c if c is not None and c > 0 else o,
         volume=v,
         start_time=start_dt,
@@ -257,24 +257,24 @@ class MarketDataService:
             if spec.contract_type in {"PERPETUAL", "TRADIFI_PERPETUAL"}
         ][: self.settings.market_data_max_subscriptions]
 
-        sem = asyncio.Semaphore(25)
+        semaphore = asyncio.Semaphore(25)
+        await asyncio.gather(*(self._poll_symbol(symbol, semaphore) for symbol in chosen))
 
-        async def fetch_item(symbol: str) -> None:
-            async with sem:
-                try:
-                    await self.get_ticker(symbol, refresh=True)
-                except Exception:
-                    pass
-                try:
-                    raw_kline = await self.shark.klines(symbol, interval="1d", limit=1)
-                    if isinstance(raw_kline, list) and raw_kline:
-                        kline = parse_kline(raw_kline[0], symbol=symbol)
-                        if kline is not None:
-                            self.accept_kline(kline)
-                except Exception:
-                    pass
-
-        await asyncio.gather(*(fetch_item(symbol) for symbol in chosen))
+    async def _poll_symbol(self, symbol: str, semaphore: asyncio.Semaphore) -> None:
+        """Fetch one symbol's ticker and market-day kline, ignoring individual failures."""
+        async with semaphore:
+            try:
+                await self.get_ticker(symbol, refresh=True)
+            except Exception:
+                pass
+            try:
+                raw_kline = await self.shark.klines(symbol, interval="1d", limit=1)
+                if isinstance(raw_kline, list) and raw_kline:
+                    kline = parse_kline(raw_kline[0], symbol=symbol)
+                    if kline is not None:
+                        self.accept_kline(kline)
+            except Exception:
+                pass
 
     def health(self) -> str:
         now = datetime.now(UTC)
@@ -431,23 +431,8 @@ class MarketDataService:
                     if spec.contract_type in {"PERPETUAL", "TRADIFI_PERPETUAL"}
                 ][: self.settings.market_data_max_subscriptions]
                 
-                sem = asyncio.Semaphore(20)
-                async def poll_one(symbol: str) -> None:
-                    async with sem:
-                        try:
-                            await self.get_ticker(symbol, refresh=True)
-                        except Exception:
-                            pass
-                        try:
-                            raw = await self.shark.klines(symbol, interval="1d", limit=1)
-                            if isinstance(raw, list) and raw:
-                                kline = parse_kline(raw[0], symbol=symbol)
-                                if kline is not None:
-                                    self.accept_kline(kline)
-                        except Exception:
-                            pass
-
-                await asyncio.gather(*(poll_one(s) for s in symbols))
+                semaphore = asyncio.Semaphore(20)
+                await asyncio.gather(*(self._poll_symbol(symbol, semaphore) for symbol in symbols))
             except Exception as exc:
                 self.last_error = type(exc).__name__
             try:

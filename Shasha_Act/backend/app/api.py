@@ -16,42 +16,63 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.accounts import (
+    DEFAULT_DISCLAIMER,
+    SUBSCRIPTION_PLANS,
+    authenticate_user,
+    current_user,
+    ensure_subscription,
+    get_user_by_username,
+    issue_session,
+    require_dashboard_auth,
+    require_mutation_allowed,
+    revoke_session,
+    role_at_least,
+    subscription_state,
+    user_payload,
+    user_subscription_state,
+    writable_user,
+)
 from app.config import Settings
 from app.db import session_dependency
-from app.models import AuditEvent, Fill, Order, OutboxJob, RiskControl, SentimentHistory, SignalEvent, Trade
+from app.domain import normalize_interval
+from app.models import (
+    AuditEvent,
+    DashboardUser,
+    Fill,
+    Order,
+    OutboxJob,
+    RiskControl,
+    SentimentHistory,
+    SignalEvent,
+    Trade,
+)
 from app.schemas import (
     CancelPendingRequest,
     CloseTradeRequest,
     DashboardAuthToggleRequest,
     LiveActivationRequest,
+    LoginRequest,
     SettingsUpdate,
+    SubscriptionUpdate,
     TradeRiskUpdate,
     TradingPauseRequest,
+    UserCreateRequest,
+    UserUpdateRequest,
 )
-from app.security import constant_time_equals, redact_text
-from app.services.pnl import long_unrealized_pnl, realized_pnl_for_day, realized_pnl_breakdown_for_day
-
+from app.security import hash_password, redact_text
+from app.services.pnl import long_unrealized_pnl, realized_pnl_breakdown_for_day
 from app.services.risk import ACTIVE_TRADE_STATES, ensure_risk_control
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 public_router = APIRouter(prefix="/api", tags=["Status"])
+auth_router = APIRouter(prefix="/api/auth", tags=["Authentication"])
 
-
-async def require_dashboard_auth(request: Request) -> None:
-    settings: Settings = request.app.state.settings
-    if not getattr(settings, "dashboard_auth_enabled", True):
-        return
-    expected = settings.dashboard_api_token
-    if not expected:
-        raise HTTPException(status_code=503, detail="Dashboard authentication is not configured")
-    if settings.environment == "production" and request.url.scheme != "https":
-        raise HTTPException(status_code=400, detail="HTTPS is required")
-    supplied = request.headers.get("x-dashboard-token", "")
-    if not constant_time_equals(supplied, expected):
-        raise HTTPException(status_code=401, detail="Dashboard authentication failed")
-
-
-router = APIRouter(prefix="/api", tags=["Dashboard"], dependencies=[Depends(require_dashboard_auth)])
+router = APIRouter(
+    prefix="/api",
+    tags=["Dashboard"],
+    dependencies=[Depends(require_dashboard_auth), Depends(require_mutation_allowed)],
+)
 
 
 def _decimal(value: Any) -> Decimal | None:
@@ -96,14 +117,71 @@ def _audit(
     entity_type: str,
     entity_id: str,
     details: dict[str, Any] | None = None,
+    actor: str = "dashboard",
 ) -> AuditEvent:
     return AuditEvent(
-        actor="dashboard",
+        actor=actor,
         action=action,
         entity_type=entity_type,
         entity_id=entity_id,
         details=details or {},
     )
+
+
+def _require_role(request: Request, minimum: str) -> None:
+    """Enforce an operator role on a mutating dashboard route.
+
+    A resolved session must satisfy the minimum role. The server automation token — and a
+    deployment that has deliberately set ``DASHBOARD_AUTH_ENABLED=false`` — carries no operator
+    identity and keeps owner-level access, which is the same convention the account endpoints
+    already use.
+    """
+    user = getattr(request.state, "user", None)
+    if not isinstance(user, DashboardUser):
+        return
+    if not role_at_least(user.role, minimum):
+        raise HTTPException(
+            status_code=403,
+            detail=f"{minimum} role required for this action",
+        )
+
+
+def _actor(request: Request) -> str:
+    user = getattr(request.state, "user", None)
+    if user is not None and getattr(user, "username", None):
+        return str(user.username)[:64]
+    method = getattr(request.state, "auth_method", "dashboard")
+    return "server-token" if method == "SERVER_TOKEN" else "dashboard"
+
+
+def _plain(value: Any) -> str:
+    """Render a Decimal percentage/quantity without trailing storage zeros (2.000000000000 → 2)."""
+    return _money(value) or ""
+
+
+def _money(value: Any) -> str | None:
+    """Format a Decimal money/price value without storage artefacts (999.000000000000 → 999)."""
+    parsed = _decimal(value)
+    if parsed is None:
+        return None
+    normalized = parsed.normalize()
+    if normalized == normalized.to_integral_value():
+        normalized = normalized.quantize(Decimal(1))
+    return format(normalized, "f")
+
+
+def _risk_reward(trade: Trade) -> str | None:
+    """Reward:risk of the planned Target 1 against the initial stop, as a decimal string."""
+    entry = trade.actual_entry or trade.planned_entry
+    stop = trade.initial_stop_price or trade.stop_price
+    target = trade.target1_price
+    if entry is None or stop is None or target is None:
+        return None
+    risk = entry - stop
+    reward = target - entry
+    if risk <= 0 or reward <= 0:
+        return None
+    return _str((reward / risk).quantize(Decimal("0.01")))
 
 
 def _trade_payload(trade: Trade, ticker: Any | None, stale_after: int) -> dict[str, Any]:
@@ -112,10 +190,13 @@ def _trade_payload(trade: Trade, ticker: Any | None, stale_after: int) -> dict[s
     last_price = fresh_ticker.last_price if fresh_ticker is not None else None
     unrealized = None
     roi = None
+    realized = trade.net_realized_pnl or Decimal("0")
     if last_price is not None and trade.actual_entry is not None and trade.remaining_quantity is not None:
         unrealized = long_unrealized_pnl(trade.actual_entry, last_price, trade.remaining_quantity)
         if trade.margin > 0:
             roi = unrealized / trade.margin * Decimal("100")
+    net_profit = (realized + unrealized) if unrealized is not None else realized
+    net_roi = (net_profit / trade.margin * Decimal("100")) if trade.margin > 0 else None
     return {
         "id": trade.id,
         "event_id": trade.event_id,
@@ -140,10 +221,13 @@ def _trade_payload(trade: Trade, ticker: Any | None, stale_after: int) -> dict[s
         "price_source": fresh_ticker.source if fresh_ticker is not None else None,
         "price_updated_at": _iso(fresh_ticker.received_at) if fresh_ticker is not None else None,
         "price_stale": not fresh,
-        "unrealized_pnl": _str(unrealized),
-        "roi_percent_on_margin": _str(roi),
+        "realized_pnl": _str(trade.net_realized_pnl),
         "gross_realized_pnl": _str(trade.gross_realized_pnl),
         "net_realized_pnl": _str(trade.net_realized_pnl),
+        "unrealized_pnl": _str(unrealized),
+        "net_profit_pnl": _str(net_profit),
+        "roi_percent_on_margin": _str(roi),
+        "net_profit_roi_percent": _str(net_roi),
         "fees_paid": _str(trade.fees_paid),
         "fee_data_available": trade.fee_data_available,
         "funding_paid": _str(trade.funding_paid),
@@ -154,7 +238,18 @@ def _trade_payload(trade: Trade, ticker: Any | None, stale_after: int) -> dict[s
         "target2_price": _str(trade.target2_price),
         "target3_price": _str(trade.target3_price),
         "target_progress": trade.target_progress,
+        "partial_closed": trade.partial_closed,
+        "partial_close_percent": _str(trade.partial_close_percent),
+        "trailing_enabled": trade.trailing_enabled,
+        "trailing_active": trade.trailing_active,
+        "trailing_stop_percent": _str(trade.trailing_stop_percent),
+        "trailing_high_price": _str(trade.trailing_high_price),
+        "secondary_targets_enabled": trade.secondary_targets_enabled,
+        "entry_price_source": trade.entry_price_source or "",
+        "entry_candle_time": _iso(trade.entry_candle_time),
+        "price_tick": _str(trade.price_tick),
         "stop_stage": trade.stop_stage,
+        "risk_reward": _risk_reward(trade),
         "protection_state": trade.protection_state,
         "liquidation_price": _str(
             trade.liquidation_price
@@ -263,6 +358,272 @@ async def _wallet_snapshot(request: Request, session: AsyncSession, mode: str) -
         }
 
 
+@public_router.get("/public/config")
+async def public_config(request: Request) -> dict[str, Any]:
+    """Unauthenticated login-screen metadata: no secrets, no internal state beyond this."""
+    settings: Settings = request.app.state.settings
+    return {
+        "app_name": settings.app_name,
+        "environment": settings.environment,
+        "auth_enabled": getattr(settings, "dashboard_auth_enabled", True),
+        "username_signin_available": True,
+        "server_token_signin_available": bool(settings.dashboard_api_token),
+        "disclaimer_required": settings.require_disclaimer_ack,
+        "disclaimer": DEFAULT_DISCLAIMER,
+        "subscription": {
+            "plan_name": settings.subscription_plan_name,
+            "fee": _money(settings.subscription_fee),
+            "currency": settings.subscription_currency,
+            "billing_cycle": settings.subscription_billing_cycle,
+            "enforced": settings.enforce_subscription,
+        },
+    }
+
+
+@auth_router.post("/login")
+async def login(
+    body: LoginRequest,
+    request: Request,
+    session: AsyncSession = Depends(session_dependency),
+) -> dict[str, Any]:
+    settings: Settings = request.app.state.settings
+    user = await authenticate_user(session, settings, body.username, body.password)
+    token, record = await issue_session(
+        session,
+        settings,
+        user,
+        user_agent=request.headers.get("user-agent", ""),
+    )
+    subscription = await ensure_subscription(session, settings)
+    await session.commit()
+    request.state.user = user
+    return {
+        "authenticated": True,
+        "session_token": token,
+        "session_expires_at": _iso(record.expires_at),
+        "user": user_payload(user),
+        "subscription": subscription_state(subscription),
+        "disclaimer": {
+            "required": settings.require_disclaimer_ack,
+            "accepted_at": user_payload(user)["disclaimer_accepted_at"],
+            "text": DEFAULT_DISCLAIMER,
+        },
+        "permissions": {
+            "can_manage_users": role_at_least(user.role, "ADMIN"),
+            "can_change_settings": role_at_least(user.role, "OPERATOR"),
+            "can_trade": role_at_least(user.role, "OPERATOR"),
+        },
+    }
+
+
+@auth_router.post("/logout")
+async def logout(request: Request, session: AsyncSession = Depends(session_dependency)) -> dict[str, Any]:
+    token = request.headers.get("x-session-token", "")
+    actor = _actor(request)
+    revoked = await revoke_session(session, token, actor=actor)
+    return {"revoked": revoked, "message": "Session revoked" if revoked else "No active session"}
+
+
+@router.get("/auth/me")
+async def auth_me(
+    request: Request,
+    session: AsyncSession = Depends(session_dependency),
+) -> dict[str, Any]:
+    settings: Settings = request.app.state.settings
+    user = await current_user(request)
+    subscription = await ensure_subscription(session, settings)
+    disclaimer_required = bool(settings.require_disclaimer_ack)
+    if user is None:
+        return {
+            "auth_method": getattr(request.state, "auth_method", "UNKNOWN"),
+            "user": None,
+            "subscription": subscription_state(subscription),
+            "disclaimer": {"required": False, "accepted_at": None, "text": DEFAULT_DISCLAIMER},
+            "permissions": {"can_manage_users": True, "can_change_settings": True, "can_trade": True},
+        }
+    return {
+        "auth_method": getattr(request.state, "auth_method", "SESSION"),
+        "user": user_payload(user),
+        "subscription": subscription_state(subscription),
+        "disclaimer": {
+            "required": disclaimer_required,
+            "accepted_at": user_payload(user)["disclaimer_accepted_at"],
+            "text": DEFAULT_DISCLAIMER,
+        },
+        "permissions": {
+            "can_manage_users": role_at_least(user.role, "ADMIN"),
+            "can_change_settings": role_at_least(user.role, "OPERATOR"),
+            "can_trade": role_at_least(user.role, "OPERATOR"),
+        },
+    }
+
+
+@router.post("/auth/disclaimer")
+async def accept_disclaimer(
+    request: Request,
+    session: AsyncSession = Depends(session_dependency),
+) -> dict[str, Any]:
+    user = await writable_user(session, request)
+    if user is None:
+        raise HTTPException(status_code=400, detail="Disclaimer acknowledgement requires a sign-in session")
+    user.disclaimer_accepted_at = datetime.now(UTC)
+    session.add(
+        _audit(
+            action="DISCLAIMER_ACCEPTED",
+            entity_type="user",
+            entity_id=user.id,
+            details={},
+            actor=_actor(request),
+        )
+    )
+    await session.flush()
+    return {"accepted": True, "accepted_at": _iso(user.disclaimer_accepted_at)}
+
+
+@router.get("/subscription")
+async def read_subscription(
+    request: Request,
+    session: AsyncSession = Depends(session_dependency),
+) -> dict[str, Any]:
+    settings: Settings = request.app.state.settings
+    subscription = await ensure_subscription(session, settings)
+    user = await current_user(request)
+    return {
+        "service": subscription_state(subscription),
+        "user": user_subscription_state(user) if user is not None else None,
+        "enforced": settings.enforce_subscription,
+        "plans": list(SUBSCRIPTION_PLANS),
+        "billing_cycles": ["MONTHLY", "QUARTERLY", "YEARLY", "LIFETIME"],
+    }
+
+
+@router.patch("/subscription")
+async def update_subscription(
+    body: SubscriptionUpdate,
+    request: Request,
+    session: AsyncSession = Depends(session_dependency),
+) -> dict[str, Any]:
+    settings: Settings = request.app.state.settings
+    user = await current_user(request)
+    if user is not None and not role_at_least(user.role, "ADMIN"):
+        raise HTTPException(status_code=403, detail="Admin role required to change the subscription")
+    subscription = await ensure_subscription(session, settings)
+    values = body.model_dump(exclude_unset=True, exclude_none=True)
+    if not values:
+        raise HTTPException(status_code=422, detail="No subscription fields were supplied")
+    previous = {key: str(getattr(subscription, key)) for key in values}
+    for key, value in values.items():
+        setattr(subscription, key, value)
+    if subscription.status not in {"ACTIVE", "SUSPENDED", "CANCELLED", "TRIAL"}:
+        raise HTTPException(status_code=422, detail="Unsupported subscription status")
+    session.add(
+        _audit(
+            action="SUBSCRIPTION_UPDATED",
+            entity_type="subscription",
+            entity_id="1",
+            details={"changed": {k: str(v) for k, v in values.items()}, "previous": previous},
+            actor=_actor(request),
+        )
+    )
+    await session.flush()
+    return {"updated": True, "service": subscription_state(subscription)}
+
+
+@router.get("/users")
+async def list_users(
+    request: Request,
+    session: AsyncSession = Depends(session_dependency),
+) -> dict[str, Any]:
+    user = await current_user(request)
+    if user is not None and not role_at_least(user.role, "ADMIN"):
+        raise HTTPException(status_code=403, detail="Admin role required")
+    rows = list((await session.scalars(select(DashboardUser).order_by(DashboardUser.created_at))).all())
+    return {"items": [user_payload(item) for item in rows], "count": len(rows)}
+
+
+@router.post("/users")
+async def create_user(
+    body: UserCreateRequest,
+    request: Request,
+    session: AsyncSession = Depends(session_dependency),
+) -> dict[str, Any]:
+    actor = await writable_user(session, request)
+    if actor is not None and not role_at_least(actor.role, "ADMIN"):
+        raise HTTPException(status_code=403, detail="Admin role required")
+    username = body.username.strip().lower()
+    if not re.fullmatch(r"[a-z0-9._-]{3,64}", username):
+        raise HTTPException(status_code=422, detail="Username must be 3-64 characters [a-z0-9._-]")
+    if await get_user_by_username(session, username) is not None:
+        raise HTTPException(status_code=409, detail="That username already exists")
+    settings: Settings = request.app.state.settings
+    created = DashboardUser(
+        id=str(uuid4()),
+        username=username,
+        display_name=(body.display_name or body.username).strip()[:96],
+        password_hash=hash_password(body.password, settings.password_hash_iterations),
+        role=body.role,
+        is_active=body.is_active,
+        subscription_plan=body.subscription_plan or settings.subscription_plan_name,
+        subscription_fee=body.subscription_fee if body.subscription_fee is not None else settings.subscription_fee,
+        subscription_currency=body.subscription_currency or settings.subscription_currency,
+        subscription_cycle=body.subscription_cycle,
+        subscription_started_at=datetime.now(UTC),
+        subscription_expires_at=body.subscription_expires_at,
+    )
+    session.add(created)
+    session.add(
+        _audit(
+            action="USER_CREATED",
+            entity_type="user",
+            entity_id=created.id,
+            details={"username": username, "role": body.role},
+            actor=_actor(request),
+        )
+    )
+    await session.flush()
+    return {"created": True, "user": user_payload(created)}
+
+
+@router.patch("/users/{user_id}")
+async def update_user(
+    user_id: str,
+    body: UserUpdateRequest,
+    request: Request,
+    session: AsyncSession = Depends(session_dependency),
+) -> dict[str, Any]:
+    actor = await writable_user(session, request)
+    if actor is not None and not role_at_least(actor.role, "ADMIN"):
+        raise HTTPException(status_code=403, detail="Admin role required")
+    target = await session.get(DashboardUser, user_id)
+    if target is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    settings: Settings = request.app.state.settings
+    values = body.model_dump(exclude_unset=True, exclude_none=True)
+    if "password" in values:
+        target.password_hash = hash_password(str(values.pop("password")), settings.password_hash_iterations)
+        target.failed_login_count = 0
+        target.locked_until = None
+    if "is_active" in values and target.username == (actor.username if actor else ""):
+        if values["is_active"] is False:
+            raise HTTPException(status_code=422, detail="You cannot disable your own account")
+    if "role" in values and not role_at_least(values["role"], "VIEWER"):
+        raise HTTPException(status_code=422, detail="Unsupported role")
+    previous = {key: str(getattr(target, key)) for key in values}
+    for key, value in values.items():
+        setattr(target, key, value)
+    session.add(
+        _audit(
+            action="USER_UPDATED",
+            entity_type="user",
+            entity_id=target.id,
+            details={"changed": sorted(values), "previous": previous},
+            actor=_actor(request),
+        )
+    )
+    await session.flush()
+    return {"updated": True, "user": user_payload(target)}
+
+
 @public_router.get("/health")
 async def health(request: Request) -> dict[str, Any]:
     context = request.app.state.context
@@ -358,6 +719,11 @@ async def read_settings(
             "target2_percent": _str(control.target2_percent),
             "target3_percent": _str(control.target3_percent),
             "stop_loss_percent": _str(control.stop_loss_percent),
+            "target1_close_percent": _str(control.target1_close_percent),
+            "trailing_stop_percent": _str(control.trailing_stop_percent),
+            "trailing_enabled": control.trailing_enabled,
+            "enable_secondary_targets": control.enable_secondary_targets,
+            "entry_candle_interval": control.entry_candle_interval,
             "max_notional_per_trade": _str(control.max_notional_per_trade),
             "max_daily_loss": _str(control.max_daily_loss),
             "limit_entry_expiry_seconds": control.limit_entry_expiry_seconds,
@@ -365,12 +731,39 @@ async def read_settings(
             "allow_symbols": control.allow_symbols or [],
             "deny_symbols": control.deny_symbols or [],
         },
+        "strategy": {
+            "entry_price_source": settings.entry_price_source,
+            "entry_candle_interval": control.entry_candle_interval,
+            "entry_candle_max_age_seconds": settings.entry_candle_max_age_seconds,
+            "entry_allow_live_ticker_fallback": settings.entry_allow_live_ticker_fallback,
+            "stop_loss_percent": _str(control.stop_loss_percent),
+            "target1_percent": _str(control.target1_percent),
+            "target1_close_percent": _str(control.target1_close_percent),
+            "trailing_stop_percent": _str(control.trailing_stop_percent),
+            "trailing_enabled": control.trailing_enabled,
+            "enable_secondary_targets": control.enable_secondary_targets,
+            "description": (
+                "TradingView alert is only a trigger. Entry = close of the last completed Shark "
+                f"{control.entry_candle_interval} candle. Stop = entry -{_plain(control.stop_loss_percent)}%. "
+                f"Target 1 = entry +{_plain(control.target1_percent)}% closing "
+                f"{_plain(control.target1_close_percent)}% of the position, then the stop moves to "
+                "break-even and trails "
+                f"{_plain(control.trailing_stop_percent)}% behind every new high."
+            ),
+        },
         "market_day_timezone": settings.timezone,
         "market_day": datetime.now(ZoneInfo(settings.timezone)).date().isoformat(),
         "paper_initial_balance": _str(settings.paper_initial_balance),
         "paper_maker_fee_bps": _str(settings.paper_maker_fee_bps),
         "paper_taker_fee_bps": _str(settings.paper_taker_fee_bps),
+        "risk_reward_ratio": _risk_reward_ratio(control),
     }
+
+
+def _risk_reward_ratio(control: RiskControl) -> str | None:
+    if control.stop_loss_percent <= 0 or control.target1_percent <= 0:
+        return None
+    return _str((control.target1_percent / control.stop_loss_percent).quantize(Decimal("0.01")))
 
 
 @router.patch("/settings")
@@ -379,13 +772,16 @@ async def update_settings(
     request: Request,
     session: AsyncSession = Depends(session_dependency),
 ) -> dict[str, Any]:
+    _require_role(request, "OPERATOR")
     settings: Settings = request.app.state.settings
     control = await session.scalar(select(RiskControl).where(RiskControl.id == 1).with_for_update())
     if control is None:
         control = await ensure_risk_control(session, settings)
     values = body.model_dump(exclude_unset=True, exclude_none=True)
+    confirmation = values.pop("confirmation_phrase", None)
     if not values:
         raise HTTPException(status_code=422, detail="No settings were supplied")
+    del confirmation
     merged = {
         "target1_percent": values.get("target1_percent", control.target1_percent),
         "target2_percent": values.get("target2_percent", control.target2_percent),
@@ -393,14 +789,33 @@ async def update_settings(
         "margin_per_trade": values.get("margin_per_trade", control.margin_per_trade),
         "leverage": values.get("leverage", control.leverage),
         "max_notional_per_trade": values.get("max_notional_per_trade", control.max_notional_per_trade),
+        "enable_secondary_targets": values.get(
+            "enable_secondary_targets", control.enable_secondary_targets
+        ),
+        "entry_candle_interval": values.get("entry_candle_interval", control.entry_candle_interval),
     }
-    if not merged["target1_percent"] < merged["target2_percent"] < merged["target3_percent"]:
-        raise HTTPException(status_code=422, detail="Targets must satisfy T1 < T2 < T3")
+    targets_supplied = any(
+        key in values for key in ("target1_percent", "target2_percent", "target3_percent")
+    )
+    if (targets_supplied or merged["enable_secondary_targets"]) and not (
+        merged["target1_percent"] < merged["target2_percent"] < merged["target3_percent"]
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Targets must satisfy T1 < T2 < T3 (secondary targets stay disabled by default)",
+        )
     if merged["margin_per_trade"] * Decimal(merged["leverage"]) > merged["max_notional_per_trade"]:
         raise HTTPException(status_code=422, detail="Margin × leverage exceeds the per-trade notional cap")
+    normalized_interval = normalize_interval(str(merged["entry_candle_interval"]), "5m")
+    if normalized_interval != str(merged["entry_candle_interval"]).strip().lower():
+        raise HTTPException(
+            status_code=422,
+            detail="Entry candle interval must be one of 1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 12h, 1d",
+        )
+    values["entry_candle_interval"] = normalized_interval
     previous: dict[str, Any] = {}
     for key, value in values.items():
-        previous[key] = getattr(control, key)
+        previous[key] = getattr(control, key, None)
         setattr(control, key, value)
     session.add(
         _audit(
@@ -469,18 +884,50 @@ async def overview(
     pnl_breakdown = await realized_pnl_breakdown_for_day(session, settings.timezone, today, mode=mode)
     daily_pnl = pnl_breakdown["net"]
 
-    closed_rows = await session.execute(
-        select(Trade.net_realized_pnl).where(
-            Trade.mode == mode,
-            Trade.status == "CLOSED",
-            Trade.closed_at >= start_utc,
-            Trade.closed_at < end_utc,
-        )
+    # Include both fully closed trades and trades with exit fills today (e.g. target 1 partial closes)
+    exit_fill_trade_ids = list(
+        (
+            await session.scalars(
+                select(Fill.trade_id)
+                .where(
+                    Fill.mode == mode,
+                    Fill.entry_exit == "EXIT",
+                    Fill.fill_time >= start_utc,
+                    Fill.fill_time < end_utc,
+                )
+                .distinct()
+            )
+        ).all()
     )
-    closed_values = [row[0] or Decimal("0") for row in closed_rows.all()]
-    closed_today = len(closed_values)
-    wins = sum(1 for value in closed_values if value > 0)
-    losses = sum(1 for value in closed_values if value < 0)
+    closed_trade_ids = list(
+        (
+            await session.scalars(
+                select(Trade.id)
+                .where(
+                    Trade.mode == mode,
+                    Trade.status == "CLOSED",
+                    Trade.closed_at >= start_utc,
+                    Trade.closed_at < end_utc,
+                )
+            )
+        ).all()
+    )
+    all_exited_ids = set(exit_fill_trade_ids) | set(closed_trade_ids)
+    if all_exited_ids:
+        trades_for_pnl = list(
+            (
+                await session.scalars(
+                    select(Trade).where(Trade.id.in_(all_exited_ids))
+                )
+            ).all()
+        )
+        wins = sum(1 for t in trades_for_pnl if (t.net_realized_pnl or Decimal("0")) > 0)
+        losses = sum(1 for t in trades_for_pnl if (t.net_realized_pnl or Decimal("0")) < 0)
+        closed_today = len(trades_for_pnl)
+    else:
+        wins = 0
+        losses = 0
+        closed_today = 0
     trades_today = int(
         await session.scalar(
             select(func.count()).select_from(Trade).where(
@@ -597,18 +1044,51 @@ async def positions(
         )
         .order_by(Trade.created_at.desc())
     )
+    all_trades = rows.all()
     output = []
-    for trade in rows.all():
+    total_realized = Decimal("0")
+    total_unrealized = Decimal("0")
+    total_margin = Decimal("0")
+    has_unrealized = False
+
+    for trade in all_trades:
         ticker = request.app.state.context.market.tickers.get(trade.symbol)
-        output.append(_trade_payload(trade, ticker, settings.market_data_stale_seconds))
-    return {"items": output, "count": len(output), "updated_at": datetime.now(UTC).isoformat()}
+        item = _trade_payload(trade, ticker, settings.market_data_stale_seconds)
+        output.append(item)
+        if trade.margin:
+            total_margin += trade.margin
+        if trade.net_realized_pnl:
+            total_realized += trade.net_realized_pnl
+        if item.get("unrealized_pnl") is not None:
+            try:
+                total_unrealized += Decimal(str(item["unrealized_pnl"]))
+                has_unrealized = True
+            except (InvalidOperation, ValueError, TypeError):
+                pass
+
+    total_net_profit = total_realized + total_unrealized
+
+    return {
+        "items": output,
+        "count": len(output),
+        "summary": {
+            "total_realized_pnl": _str(total_realized),
+            "total_unrealized_pnl": _str(total_unrealized) if has_unrealized else "0.00",
+            "total_net_profit_pnl": _str(total_net_profit),
+            "total_margin": _str(total_margin),
+        },
+        "updated_at": datetime.now(UTC).isoformat(),
+    }
 
 
 @router.get("/market")
 async def market_data(
     request: Request,
     q: str = Query(default="", max_length=64),
-    sort: str = Query(default="symbol", pattern="^(symbol|last_price|change_24h_percent|volume_24h|day_change_pct)$"),
+    sort: str = Query(
+        default="symbol",
+        pattern="^(symbol|last_price|change_24h_percent|volume_24h|day_change_pct|high_24h|low_24h|day_high|day_low)$",
+    ),
     order: str = Query(default="asc", pattern="^(asc|desc)$"),
 ) -> dict[str, Any]:
     state = request.app.state.context.market.state()
@@ -927,6 +1407,7 @@ async def update_trade_risk(
     request: Request,
     session: AsyncSession = Depends(session_dependency),
 ) -> dict[str, Any]:
+    _require_role(request, "OPERATOR")
     if body.confirmation_phrase != "CONFIRM RISK CHANGE":
         raise HTTPException(status_code=422, detail="Type CONFIRM RISK CHANGE to apply position-level edits")
     trade = await session.scalar(select(Trade).where(Trade.id == trade_id).with_for_update())
@@ -1005,6 +1486,7 @@ async def close_trade(
     body: CloseTradeRequest,
     request: Request,
 ) -> dict[str, Any]:
+    _require_role(request, "OPERATOR")
     if body.confirmation_phrase != "CLOSE POSITION":
         raise HTTPException(status_code=422, detail="Type CLOSE POSITION to confirm the reduce-only close")
     async with request.app.state.session_factory() as session:
@@ -1028,6 +1510,7 @@ async def cancel_entry(
     body: CancelPendingRequest,
     request: Request,
 ) -> dict[str, Any]:
+    _require_role(request, "OPERATOR")
     if body.confirmation_phrase != "CANCEL PENDING ENTRIES":
         raise HTTPException(status_code=422, detail="Type CANCEL PENDING ENTRIES to confirm")
     async with request.app.state.session_factory() as session:
@@ -1049,6 +1532,7 @@ async def cancel_pending(
     body: CancelPendingRequest,
     request: Request,
 ) -> dict[str, Any]:
+    _require_role(request, "OPERATOR")
     if body.confirmation_phrase != "CANCEL PENDING ENTRIES":
         raise HTTPException(status_code=422, detail="Type CANCEL PENDING ENTRIES to confirm")
     count = await request.app.state.context.executor.cancel_pending_entries()
@@ -1061,6 +1545,7 @@ async def pause_trading(
     request: Request,
     session: AsyncSession = Depends(session_dependency),
 ) -> dict[str, Any]:
+    _require_role(request, "OPERATOR")
     settings: Settings = request.app.state.settings
     control = await session.scalar(select(RiskControl).where(RiskControl.id == 1).with_for_update())
     if control is None:
@@ -1090,6 +1575,7 @@ async def switch_to_paper(
     request: Request,
     session: AsyncSession = Depends(session_dependency),
 ) -> dict[str, Any]:
+    _require_role(request, "OPERATOR")
     if body.confirmation_phrase != "SWITCH TO PAPER":
         raise HTTPException(status_code=422, detail="Type SWITCH TO PAPER to confirm")
     control = await session.scalar(select(RiskControl).where(RiskControl.id == 1).with_for_update())
@@ -1117,6 +1603,7 @@ async def activate_live(
     request: Request,
     session: AsyncSession = Depends(session_dependency),
 ) -> dict[str, Any]:
+    _require_role(request, "ADMIN")
     settings: Settings = request.app.state.settings
     if body.confirmation_phrase != "ENABLE LIVE TRADING" or not body.acknowledge_exchange_risk:
         raise HTTPException(status_code=422, detail="Deliberate confirmation and exchange-risk acknowledgement are required")
@@ -1168,6 +1655,7 @@ async def retry_notification(
     request: Request,
     session: AsyncSession = Depends(session_dependency),
 ) -> dict[str, Any]:
+    _require_role(request, "OPERATOR")
     event = await session.get(SignalEvent, event_id)
     if event is None:
         raise HTTPException(status_code=404, detail="Signal event not found")
@@ -1204,6 +1692,7 @@ async def toggle_dashboard_auth(
     request: Request,
     session: AsyncSession = Depends(session_dependency),
 ) -> dict[str, Any]:
+    _require_role(request, "ADMIN")
     settings: Settings = request.app.state.settings
     settings.dashboard_auth_enabled = body.enabled
 

@@ -144,8 +144,9 @@ async def test_uncertain_order_submission_is_not_returned_as_a_retryable_http_er
 
 
 def test_parse_kline_and_day_change_calculation() -> None:
-    from app.market_data import DayKlineSnapshot, MarketDataService, TickerSnapshot, parse_kline
     from datetime import UTC, datetime
+
+    from app.market_data import MarketDataService, TickerSnapshot, parse_kline
 
     # 1. Parse REST format
     rest_kline = {

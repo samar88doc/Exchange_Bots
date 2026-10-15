@@ -3,13 +3,35 @@
 ## Deployment checklist
 
 1. Use a dedicated PostgreSQL database, least-privilege role, encrypted backups and a separate database URL for this service.
-2. Copy `backend/.env.example` to a local `backend/.env`; it is ignored by Git. Generate independent high-entropy dashboard and TradingView tokens. Never put Shark keys or the Telegram bot token in source, a Pine script, alert JSON, screenshots or the dashboard.
+2. Copy `backend/.env.example` to a local `backend/.env`; it is ignored by Git. Generate independent high-entropy dashboard and TradingView tokens, and set a strong `DASHBOARD_USERNAME` / `DASHBOARD_PASSWORD` for the first `OWNER` account. Keep `DASHBOARD_AUTH_ENABLED=true`. Review the subscription block (`SUBSCRIPTION_FEE`, `SUBSCRIPTION_CURRENCY`, `ENFORCE_SUBSCRIPTION`) and the disclaimer gate (`REQUIRE_DISCLAIMER_ACK`) before exposing the console. Never put Shark keys or the Telegram bot token in source, a Pine script, alert JSON, screenshots or the dashboard.
 3. Keep `TRADING_MODE=PAPER`, `LIVE_TRADING_ENABLED=false`, and both Shark verification flags false.
 4. Run `alembic upgrade head` before starting the API. Migrations are explicit; runtime does not create tables.
 5. Terminate TLS at a trusted reverse proxy. Configure the ASGI server to trust forwarded scheme/client headers only from that proxy. Disable access logs or redact the tokenized webhook path at every hop.
 6. Expose only the required HTTPS endpoints. Set a restrictive `CORS_ORIGINS` list; use a network allowlist/rate limit at the proxy in addition to the in-process webhook limiter.
-7. Confirm `/api/ready`, dashboard authentication, TradingView URL/token, PostgreSQL, worker and Telegram configuration. Never use a real signal as a smoke test unless all order execution remains PAPER and the server LIVE gate is closed.
+7. Confirm `/api/ready`, that sign-in with the bootstrap account works and is rate-limited, that an unacknowledged disclaimer blocks mutations (`403 DISCLAIMER_NOT_ACCEPTED`), that the subscription state is what you expect, plus the TradingView URL/token, PostgreSQL, worker and Telegram configuration. Never use a real signal as a smoke test unless all order execution remains PAPER and the server LIVE gate is closed.
 8. Back up PostgreSQL and test restore/reconciliation procedures before production use.
+
+## Accounts, sessions, subscription and disclaimer
+
+- The first `OWNER` account is created at startup from `DASHBOARD_USERNAME` / `DASHBOARD_PASSWORD`
+  when no operator account exists yet. The plain password is never stored or logged; only a
+  PBKDF2-HMAC-SHA256 hash with `PASSWORD_HASH_ITERATIONS` rounds.
+- Browser sign-in issues an opaque session token kept server-side as a hash. The browser holds it
+  in `localStorage` only when the operator opts into "keep me signed in" and sends it as
+  `X-Session-Token`; nothing is stored in a cookie, so there is no CSRF surface. **Settings →
+  Dashboard access → Clear saved browser session** removes it locally, `POST /api/auth/logout`
+  revokes it server-side, and expiry is `DASHBOARD_SESSION_HOURS`.
+- `DASHBOARD_API_TOKEN` (sent as `X-Dashboard-Token`) remains the owner-level automation path and is
+  unaffected by disclaimer or subscription state.
+- Repeated failed sign-ins lock the account for `LOGIN_LOCKOUT_MINUTES` after
+  `LOGIN_MAX_FAILURES` attempts, and an unknown username still performs a dummy hash so timing does
+  not disclose whether the account exists.
+- Mutating calls (anything other than `GET`/`HEAD`/`OPTIONS`) require an acknowledged disclaimer
+  when `REQUIRE_DISCLAIMER_ACK=true`; with `ENFORCE_SUBSCRIPTION=true` an expired, suspended or
+  cancelled plan returns `402` and new signals are refused at the risk gate. Read-only routes stay
+  open so an operator can always inspect account and audit state.
+- Subscription plan, fee, currency, cycle and expiry are per service record and per operator
+  account, and every change is written to the audit trail.
 
 ## Mode and order states
 
@@ -62,5 +84,5 @@ PAPER protection is simulated and is not an exchange-side stop. LIVE remains blo
 - Never echo `.env` values in terminal output, issue text, docs, tests, screenshots or commit messages.
 - Use distinct dashboard/webhook tokens and rotate them through your secrets manager. Webhook tokens in paths can be captured by access logs; redact them.
 - Keep API keys server-side with the least possible permissions. PAPER does not require private Shark keys.
-- The browser holds the dashboard token in memory only, and no third-party JavaScript/CDN is used by the dashboard.
+- The browser holds only the session/automation token it was given (optionally in `localStorage`), and no third-party JavaScript, font or CDN is used by the dashboard. The Content-Security-Policy is `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'`, so the console ships a single local script and stylesheet.
 - Keep production HTTPS, proxy trust, firewall and database TLS controls enabled; do not expose PostgreSQL publicly.

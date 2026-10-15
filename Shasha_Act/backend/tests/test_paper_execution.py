@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 import pytest
 from sqlalchemy import select
@@ -72,6 +73,10 @@ async def test_paper_limit_and_target_fills_conserve_quantity_and_never_need_pri
             target1_price=levels.target1,
             target2_price=levels.target2,
             target3_price=levels.target3,
+            # Optional legacy mode: fixed Target 2/3 exits on top of Target 1.
+            secondary_targets_enabled=True,
+            trailing_enabled=False,
+            price_tick=Decimal("1"),
             entry_expires_at=datetime.now(UTC) + timedelta(minutes=5),
         )
         session.add_all([event, trade])
@@ -220,7 +225,9 @@ async def test_realized_pnl_breakdown_deducts_trading_fees_and_funding(tmp_path)
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
     sessions = async_sessionmaker(engine, expire_on_commit=False)
+    zone = ZoneInfo("Asia/Kolkata")
     now = datetime.now(UTC)
+    target_date = now.astimezone(zone).date()
 
     async with sessions() as session:
         # Create an entry fill with trading fee
@@ -259,7 +266,7 @@ async def test_realized_pnl_breakdown_deducts_trading_fees_and_funding(tmp_path)
         )
         await session.commit()
 
-        breakdown = await realized_pnl_breakdown_for_day(session, "Asia/Kolkata", now.date(), mode="PAPER")
+        breakdown = await realized_pnl_breakdown_for_day(session, "Asia/Kolkata", target_date, mode="PAPER")
         assert breakdown["gross"] == Decimal("10.00")
         assert breakdown["fees_paid"] == Decimal("0.11")
         assert breakdown["funding_paid"] == Decimal("0.02")
@@ -267,7 +274,7 @@ async def test_realized_pnl_breakdown_deducts_trading_fees_and_funding(tmp_path)
         assert breakdown["net"] == Decimal("9.87")
 
         # Also backwards-compat realized_pnl_for_day matches net
-        net = await realized_pnl_for_day(session, "Asia/Kolkata", now.date(), mode="PAPER")
+        net = await realized_pnl_for_day(session, "Asia/Kolkata", target_date, mode="PAPER")
         assert net == Decimal("9.87")
     await engine.dispose()
 

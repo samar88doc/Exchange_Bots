@@ -70,6 +70,7 @@ Thumbs.db
 
 # Git backups of previous sub-repos
 .git_backup*
+*_backup_*
 nohup.out
 *.out
 

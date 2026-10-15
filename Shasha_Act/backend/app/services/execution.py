@@ -11,10 +11,16 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import Settings
 from app.domain import (
+    Candle,
     ValidationProblem,
-    compute_long_levels,
+    compute_strategy_levels,
+    last_closed_candle,
+    normalize_interval,
+    parse_candles,
     quantity_from_notional,
+    quantize_price,
     round_down_to_step,
+    split_partial_quantity,
     split_quantity,
 )
 from app.market_data import MarketDataService
@@ -26,20 +32,16 @@ from app.symbols import ContractSpec, ContractUnavailable
 
 
 def _normalize_shark_interval(timeframe: str | None) -> str:
-    tf = (timeframe or "15m").strip().lower()
-    if tf in {"15", "15m"}:
-        return "15m"
-    if tf in {"1h", "60", "60m"}:
-        return "1h"
-    if tf in {"4h", "240", "240m"}:
-        return "4h"
-    if tf in {"1d", "d"}:
-        return "1d"
-    if tf in {"5", "5m"}:
-        return "5m"
-    if tf in {"30", "30m"}:
-        return "30m"
-    return "15m"
+    """Kept for backwards compatibility; interval spellings normalize through the domain."""
+    return normalize_interval(timeframe, "15m")
+
+
+class EntryPriceUnavailable(RuntimeError):
+    """Shark could not supply a fresh closed-candle entry price.
+
+    Deliberately *not* a `ValidationProblem`: the durable outbox retries the signal instead of
+    trading the TradingView/Binance price or rejecting the signal permanently.
+    """
 
 
 class TradeExecutor:
@@ -56,31 +58,65 @@ class TradeExecutor:
         self.market = market
         self.shark = shark
         self.paper = paper
+        self.last_entry_price_error: str = ""
 
     async def _resolve_entry_price(
-        self, symbol: str, timeframe: str | None, fallback_price: Decimal
-    ) -> tuple[Decimal, str]:
-        source_mode = getattr(self.settings, "entry_price_source", "SHARK_15M_CLOSE").upper()
+        self,
+        symbol: str,
+        timeframe: str | None,
+        fallback_price: Decimal,
+        *,
+        interval: str | None = None,
+    ) -> tuple[Decimal, str, Candle | None]:
+        """Resolve the SHASHA entry price from Shark Exchange data.
+
+        TradingView prices come from Binance, so the alert price is only a trigger. The entry
+        is the close of the last *completed* Shark candle (5m by default) for that symbol.
+        Ordering of the kline response is never trusted: the newest fully-closed candle is
+        selected from parsed timestamps. If Shark cannot supply a fresh closed candle the
+        function raises `EntryPriceUnavailable` instead of silently trading a Binance price.
+        """
+        source_mode = str(
+            getattr(self.settings, "entry_price_source", "SHARK_CLOSED_CANDLE") or ""
+        ).upper()
         if source_mode == "SIGNAL_PAYLOAD":
-            return fallback_price, "TradingView signal close"
+            return fallback_price, "TradingView signal close (SIGNAL_PAYLOAD mode)", None
 
-        interval = _normalize_shark_interval(timeframe)
+        candle_interval = normalize_interval(
+            interval or getattr(self.settings, "entry_candle_interval", "5m")
+            or timeframe,
+            "5m",
+        )
+        max_age = int(getattr(self.settings, "entry_candle_max_age_seconds", 1800) or 0)
         try:
-            klines = await self.shark.klines(symbol, interval=interval, limit=2)
-            if isinstance(klines, list) and len(klines) >= 1:
-                completed = klines[0]
-                if isinstance(completed, dict) and completed.get("close"):
-                    close_dec = Decimal(str(completed["close"]))
-                    if close_dec > 0:
-                        return close_dec, f"Shark {interval} completed candle close"
-        except Exception:
-            pass
+            response = await self.shark.klines(symbol, interval=candle_interval, limit=12)
+            candles = parse_candles(response, candle_interval)
+        except Exception as exc:
+            self.last_entry_price_error = f"SHARK_KLINES_UNAVAILABLE:{type(exc).__name__}"
+            candles = []
+        if candles:
+            closed = last_closed_candle(candles, max_age_seconds=max_age or None)
+            if closed is not None and closed.close > 0:
+                return (
+                    closed.close,
+                    f"Shark {candle_interval} closed-candle close",
+                    closed,
+                )
+            self.last_entry_price_error = "SHARK_CLOSED_CANDLE_STALE_OR_UNAVAILABLE"
 
-        ticker = self.market.tickers.get(symbol)
-        if ticker and ticker.last_price > 0:
-            return ticker.last_price, "Shark live ticker last price"
+        if getattr(self.settings, "entry_allow_live_ticker_fallback", True):
+            ticker = self.market.tickers.get(symbol)
+            if (
+                ticker is not None
+                and ticker.last_price > 0
+                and not ticker.is_stale(self.settings.market_data_stale_seconds)
+            ):
+                return ticker.last_price, "Shark live last price (candle feed unavailable)", None
 
-        return fallback_price, "TradingView signal close fallback"
+        raise EntryPriceUnavailable(
+            self.last_entry_price_error
+            or "SHARK_ENTRY_PRICE_UNAVAILABLE_NO_FALLBACK_TO_TRADINGVIEW_PRICE"
+        )
 
     async def process_signal(self, event_id: str) -> None:
         async with self.session_factory() as session:
@@ -157,14 +193,23 @@ class TradeExecutor:
                 if event is None or trade is None or control is None or trade.status != "QUEUED":
                     return
 
-                # Resolve entry price directly from Shark Exchange completed candle close
-                resolved_entry, entry_source = await self._resolve_entry_price(
-                    trade.symbol, event.timeframe, trade.planned_entry
+                # Resolve entry price from the last completed Shark candle (5m default).
+                # TradingView/Binance prices are never used as the execution price.
+                resolved_entry, entry_source, entry_candle = await self._resolve_entry_price(
+                    trade.symbol,
+                    event.timeframe,
+                    trade.planned_entry,
+                    interval=control.entry_candle_interval,
                 )
 
                 # A long limit buy is rounded down so the submitted limit does not exceed
-                # the resolved candle close.
-                trade.planned_entry = round_down_to_step(resolved_entry, tick)
+                # the resolved candle close, and the price always carries the contract's
+                # exact decimal fraction (for example 0.00239).
+                trade.planned_entry = quantize_price(resolved_entry, spec.price_precision)
+                trade.planned_entry = round_down_to_step(trade.planned_entry, tick)
+                trade.entry_price_source = entry_source
+                trade.entry_candle_time = entry_candle.close_time if entry_candle else None
+                trade.price_tick = tick
                 event.entry_price = trade.planned_entry
                 trade.margin = control.margin_per_trade
                 trade.leverage = control.leverage
@@ -178,32 +223,54 @@ class TradeExecutor:
                     await self._reject(session, event, trade, "ORDER_NOTIONAL_BELOW_CONTRACT_MINIMUM")
                     await session.commit()
                     return
-                split = split_quantity(quantity, step, spec.minimum_quantity)
-                levels = compute_long_levels(
+                secondary_targets = bool(control.enable_secondary_targets)
+                levels = compute_strategy_levels(
                     trade.planned_entry,
                     tick,
                     control.stop_loss_percent,
                     control.target1_percent,
-                    control.target2_percent,
-                    control.target3_percent,
+                    control.target2_percent if secondary_targets else None,
+                    control.target3_percent if secondary_targets else None,
                 )
+                target1_quantity: Decimal | None
+                target2_quantity: Decimal | None
+                target3_quantity: Decimal | None
+                slice_levels: tuple[Decimal | None, ...]
+                if secondary_targets:
+                    split = split_quantity(quantity, step, spec.minimum_quantity)
+                    target1_quantity = split.target1
+                    target2_quantity = split.target2
+                    target3_quantity = split.target3
+                    slice_levels = (levels.target1, levels.target2, levels.target3)
+                else:
+                    partial = split_partial_quantity(
+                        quantity, step, spec.minimum_quantity, control.target1_close_percent
+                    )
+                    target1_quantity = partial.partial
+                    target2_quantity = None
+                    target3_quantity = None
+                    slice_levels = (levels.target1,)
                 for piece, target in zip(
-                    (split.target1, split.target2, split.target3),
-                    (levels.target1, levels.target2, levels.target3),
-                    strict=True,
+                    [target1_quantity, target2_quantity, target3_quantity],
+                    slice_levels,
+                    strict=False,
                 ):
-                    if piece * target < spec.minimum_notional:
+                    if piece is not None and target is not None and piece * target < spec.minimum_notional:
                         raise ValidationProblem("TARGET_SLICE_BELOW_MINIMUM_NOTIONAL")
                 trade.quantity = quantity
                 trade.remaining_quantity = quantity
-                trade.target1_quantity = split.target1
-                trade.target2_quantity = split.target2
-                trade.target3_quantity = split.target3
+                trade.target1_quantity = target1_quantity
+                trade.target2_quantity = target2_quantity
+                trade.target3_quantity = target3_quantity
                 trade.stop_price = levels.stop
                 trade.initial_stop_price = levels.stop
                 trade.target1_price = levels.target1
                 trade.target2_price = levels.target2
                 trade.target3_price = levels.target3
+                trade.trailing_enabled = bool(control.trailing_enabled)
+                trade.secondary_targets_enabled = secondary_targets
+                trade.trailing_stop_percent = control.trailing_stop_percent
+                trade.partial_close_percent = control.target1_close_percent
                 expiry = control.limit_entry_expiry_seconds
                 trade.entry_expires_at = datetime.now(UTC) + timedelta(seconds=expiry)
                 trade.status_reason = ""
@@ -471,15 +538,33 @@ class TradeExecutor:
             if control is None or event is None or trade is None:
                 return
             try:
-                levels = compute_long_levels(
+                secondary = bool(trade.secondary_targets_enabled or control.enable_secondary_targets)
+                levels = compute_strategy_levels(
                     actual_entry,
                     spec.price_tick,
                     control.stop_loss_percent,
                     control.target1_percent,
-                    control.target2_percent,
-                    control.target3_percent,
+                    control.target2_percent if secondary else None,
+                    control.target3_percent if secondary else None,
                 )
-                split = split_quantity(filled_qty, spec.quantity_step, spec.minimum_quantity)
+                t1_qty: Decimal | None
+                t2_qty: Decimal | None
+                t3_qty: Decimal | None
+                if secondary:
+                    split = split_quantity(filled_qty, spec.quantity_step, spec.minimum_quantity)
+                    t1_qty = split.target1
+                    t2_qty = split.target2
+                    t3_qty = split.target3
+                else:
+                    partial = split_partial_quantity(
+                        filled_qty,
+                        spec.quantity_step,
+                        spec.minimum_quantity,
+                        control.target1_close_percent,
+                    )
+                    t1_qty = partial.partial
+                    t2_qty = None
+                    t3_qty = None
             except ValidationProblem as exc:
                 await self._protection_alarm_in_session(session, event, trade, str(exc))
                 await session.commit()
@@ -490,14 +575,19 @@ class TradeExecutor:
             trade.exchange_position_id = position_id
             trade.liquidation_price = _as_decimal(position.get("liquidationPrice"))
             trade.last_price = _as_decimal(position.get("markPrice") or position.get("lastPrice"))
-            trade.target1_quantity = split.target1
-            trade.target2_quantity = split.target2
-            trade.target3_quantity = split.target3
+            trade.target1_quantity = t1_qty
+            trade.target2_quantity = t2_qty
+            trade.target3_quantity = t3_qty
             trade.stop_price = levels.stop
             trade.initial_stop_price = levels.stop
             trade.target1_price = levels.target1
             trade.target2_price = levels.target2
             trade.target3_price = levels.target3
+            trade.trailing_enabled = bool(control.trailing_enabled)
+            trade.secondary_targets_enabled = secondary
+            trade.trailing_stop_percent = control.trailing_stop_percent
+            trade.partial_close_percent = control.target1_close_percent
+            trade.price_tick = spec.price_tick
             trade.status = "OPEN" if str(order_state.get("status")).upper() == "FILLED" else "ENTRY_PARTIAL"
             trade.opened_at = trade.opened_at or datetime.now(UTC)
             trade.protection_state = "ESTABLISHING"
@@ -561,21 +651,32 @@ class TradeExecutor:
                 return
             current_trade.protection_state = "TARGETS_SUBMITTING"
             await session.commit()
+        target_plan = [
+            (kind, quantity, price)
+            for kind, quantity, price in (
+                ("TARGET_1", t1_qty, levels.target1),
+                ("TARGET_2", t2_qty, levels.target2),
+                ("TARGET_3", t3_qty, levels.target3),
+            )
+            if quantity is not None and price is not None and quantity > 0
+        ]
+        if not target_plan:
+            await self._protection_alarm(event_id, "NO_ACTIVE_TARGET_SLICE_DEFINED", keep_stop_id=stop_id)
+            return
         try:
             tp_response = _unwrap(
                 await self.shark.split_take_profit_stop_loss(
                     position_id,
                     take_profits=[
-                        {"quantity": split.target1, "price": levels.target1},
-                        {"quantity": split.target2, "price": levels.target2},
-                        {"quantity": split.target3, "price": levels.target3},
+                        {"quantity": quantity, "price": price} for _, quantity, price in target_plan
                     ],
                 )
             )
             tp_ids = self._collect_accepted_order_ids(tp_response)
+            expected_targets = len(target_plan)
             accepted_count = int(tp_response.get("acceptedOrderCount") or 0) if isinstance(tp_response, dict) else 0
             rejected_count = int(tp_response.get("rejectedOrderCount") or 0) if isinstance(tp_response, dict) else 0
-            if len(tp_ids) != 3 or accepted_count != 3 or rejected_count != 0:
+            if len(tp_ids) != expected_targets or accepted_count != expected_targets or rejected_count != 0:
                 for partial_id in tp_ids:
                     try:
                         await self.shark.cancel_order(partial_id)
@@ -588,13 +689,7 @@ class TradeExecutor:
                 if current_trade is None:
                     return
                 current_trade.target_order_ids = tp_ids
-                for kind, order_id, quantity, price in zip(
-                    ("TARGET_1", "TARGET_2", "TARGET_3"),
-                    tp_ids,
-                    (split.target1, split.target2, split.target3),
-                    (levels.target1, levels.target2, levels.target3),
-                    strict=True,
-                ):
+                for (kind, quantity, price), order_id in zip(target_plan, tp_ids, strict=True):
                     session.add(
                         Order(
                             id=str(uuid4()),
@@ -613,15 +708,15 @@ class TradeExecutor:
                         )
                     )
                 await session.commit()
-            for order_id, target_price, quantity in zip(
-                tp_ids,
-                (levels.target1, levels.target2, levels.target3),
-                (split.target1, split.target2, split.target3),
-                strict=True,
-            ):
+            for order_id, (_, quantity, target_price) in zip(tp_ids, target_plan, strict=True):
                 confirmed = _unwrap(await self.shark.order(order_id))
                 if not _order_matches(confirmed, target_price, quantity, stop=False):
                     raise RuntimeError("SHARK_TAKE_PROFIT_NOT_CONFIRMED")
+            # Submitting the profit targets must not have silently replaced or cancelled the
+            # protective stop. Re-confirm it before the trade is ever reported as protected.
+            stop_after_targets = _unwrap(await self.shark.order(stop_id))
+            if not _order_matches(stop_after_targets, levels.stop, filled_qty, stop=True):
+                raise RuntimeError("SHARK_STOP_LOST_AFTER_TARGET_SUBMISSION")
         except Exception as exc:
             await self._protection_alarm(event_id, str(exc)[:120] or "SHARK_TARGET_SETUP_FAILED", keep_stop_id=stop_id)
             return
@@ -634,12 +729,11 @@ class TradeExecutor:
             trade.protective_stop_order_id = stop_id
             trade.target_order_ids = tp_ids
             trade.protection_state = "ACTIVE"
-            protection_rows = [
-                ("STOP_LOSS", stop_id, filled_qty, levels.stop),
-                ("TARGET_1", tp_ids[0], split.target1, levels.target1),
-                ("TARGET_2", tp_ids[1], split.target2, levels.target2),
-                ("TARGET_3", tp_ids[2], split.target3, levels.target3),
-            ]
+            protection_rows = [("STOP_LOSS", stop_id, filled_qty, levels.stop)]
+            protection_rows.extend(
+                (kind, order_id, quantity, price)
+                for (kind, quantity, price), order_id in zip(target_plan, tp_ids, strict=True)
+            )
             for kind, client_id, quantity, price in protection_rows:
                 existing_order = await session.scalar(
                     select(Order).where(Order.client_order_id == client_id).limit(1)
