@@ -162,6 +162,16 @@ class SharkClient:
             raise ValueError("invalid Shark symbol")
         return await self._request("GET", f"/v1/market/ticker24Hr/{clean}")
 
+    async def klines(self, symbol: str, interval: str = "1d", limit: int = 1) -> Any:
+        clean = symbol.upper()
+        if not clean.isalnum():
+            raise ValueError("invalid Shark symbol")
+        return await self._request(
+            "POST",
+            "/v1/market/klines",
+            body={"pair": clean, "interval": interval, "limit": limit},
+        )
+
     # ----------------------------------------- private account read APIs
     async def futures_wallet(self, margin_asset: str = "USDT") -> Any:
         return await self._request(

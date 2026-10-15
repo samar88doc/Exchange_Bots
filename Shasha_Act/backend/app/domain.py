@@ -163,9 +163,10 @@ def parse_alert(body: bytes) -> ParsedSignal:
         fields = payload
         raw_payload = _redact(payload)
 
-    strategy = str(fields.get("strategy") or "SHASHA").strip().upper()
-    if strategy != "SHASHA":
-        errors.append("UNSUPPORTED_STRATEGY")
+    raw_action = str(fields.get("action") or fields.get("side") or "").strip().upper()
+    strategy = str(fields.get("strategy") or (raw_action if raw_action not in ("BUY", "LONG") else "") or "SHASHA").strip().upper()
+    if not strategy:
+        strategy = "SHASHA"
 
     raw_symbol = str(fields.get("symbol") or fields.get("ticker") or "").strip()
     canonical_symbol: str | None = None
@@ -177,17 +178,34 @@ def parse_alert(body: bytes) -> ParsedSignal:
     else:
         errors.append("MISSING_SYMBOL")
 
-    direction = str(fields.get("direction") or "LONG").strip().upper()
+    direction = str(fields.get("direction") or "").strip().upper()
+    if not direction:
+        if raw_action in ("BUY", "LONG", "OPEN_LONG", "BUY_LONG") or "BUY" in raw_action or "LONG" in raw_action:
+            direction = "LONG"
+        elif raw_action in ("SELL", "SHORT", "OPEN_SHORT", "CLOSE"):
+            direction = "SHORT"
+        else:
+            direction = "LONG"
+    elif direction in ("BUY", "BUY_LONG"):
+        direction = "LONG"
+
     if direction != "LONG":
         errors.append("ONLY_LONG_SIGNALS_SUPPORTED")
 
-    timeframe = str(fields.get("timeframe") or "").strip()
+    timeframe = str(fields.get("timeframe") or fields.get("interval") or "").strip()
     if not timeframe:
-        errors.append("MISSING_TIMEFRAME")
+        if "4H" in raw_action:
+            timeframe = "4h"
+        elif "1H" in raw_action:
+            timeframe = "1h"
+        elif "15" in raw_action:
+            timeframe = "15"
+        else:
+            timeframe = "15"
 
     bar_time = parse_bar_time(fields.get("bar_time") or fields.get("time"))
     if bar_time is None:
-        errors.append("MISSING_OR_INVALID_BAR_TIME")
+        bar_time = datetime.now(UTC)
 
     event_value = fields.get("event_id")
     supplied_event_id = str(event_value).strip() if event_value not in (None, "") else None
@@ -211,8 +229,8 @@ def parse_alert(body: bytes) -> ParsedSignal:
             errors.append(str(exc))
             return None
 
-    signal_close = parse_required("signal_close", ("close",))
-    entry_price = parse_required("entry_price", ("previous_close",))
+    signal_close = parse_required("signal_close", ("close", "price", "alert_price", "last_price"))
+    entry_price = parse_required("entry_price", ("previous_close", "price", "close", "alert_price", "last_price"))
     idempotency_key = _make_idempotency_key(
         supplied_event_id,
         strategy,

@@ -149,6 +149,9 @@ class PaperExecutionAdapter:
         order.filled_at = now
         trade.actual_entry = entry_price
         trade.remaining_quantity = quantity
+        if trade.leverage and trade.leverage > 0:
+            lev = Decimal(str(trade.leverage))
+            trade.liquidation_price = max(entry_price * (Decimal("1") - (Decimal("1") / lev) + Decimal("0.005")), Decimal("0"))
         trade.status = "OPEN"
         trade.status_reason = "PAPER simulated limit fill; no exchange order was sent."
         trade.protection_state = "SIMULATED_ACTIVE"
@@ -204,12 +207,12 @@ class PaperExecutionAdapter:
                 client_order_id=f"paper-{uuid4().hex}",
                 kind="STOP_LOSS",
                 side="SELL",
-                order_type="STOP_MARKET",
+                order_type="LIMIT",
                 status="NEW",
                 quantity=trade.remaining_quantity or Decimal("0"),
                 price=trade.stop_price,
                 reduce_only=True,
-                request_summary={"paper": True, "protective": True},
+                request_summary={"paper": True, "protective": True, "type": "LIMIT"},
                 submitted_at=now,
             )
             session.add(stop_order)
@@ -378,12 +381,12 @@ class PaperExecutionAdapter:
                 client_order_id=f"paper-{uuid4().hex}",
                 kind=reason,
                 side="SELL",
-                order_type="STOP_MARKET" if taker else "LIMIT",
+                order_type="LIMIT",
                 status="NEW",
                 quantity=quantity,
                 price=price,
                 reduce_only=True,
-                request_summary={"paper": True, "reason": reason},
+                request_summary={"paper": True, "reason": reason, "type": "LIMIT"},
                 submitted_at=now,
             )
             session.add(exit_order)

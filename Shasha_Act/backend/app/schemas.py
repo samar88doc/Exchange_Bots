@@ -72,3 +72,10 @@ class TradeRiskUpdate(BaseModel):
     target2_price: Decimal | None = Field(default=None, gt=0)
     target3_price: Decimal | None = Field(default=None, gt=0)
     confirmation_phrase: Annotated[str, Field(min_length=1, max_length=64)]
+
+
+class DashboardAuthToggleRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+

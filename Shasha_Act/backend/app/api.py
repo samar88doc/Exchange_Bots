@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import csv
 import io
+import re
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -20,6 +22,7 @@ from app.models import AuditEvent, Fill, Order, OutboxJob, RiskControl, Sentimen
 from app.schemas import (
     CancelPendingRequest,
     CloseTradeRequest,
+    DashboardAuthToggleRequest,
     LiveActivationRequest,
     SettingsUpdate,
     TradeRiskUpdate,
@@ -29,11 +32,14 @@ from app.security import constant_time_equals, redact_text
 from app.services.pnl import long_unrealized_pnl, realized_pnl_for_day
 from app.services.risk import ACTIVE_TRADE_STATES, ensure_risk_control
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 public_router = APIRouter(prefix="/api", tags=["Status"])
 
 
 async def require_dashboard_auth(request: Request) -> None:
     settings: Settings = request.app.state.settings
+    if not getattr(settings, "dashboard_auth_enabled", True):
+        return
     expected = settings.dashboard_api_token
     if not expected:
         raise HTTPException(status_code=503, detail="Dashboard authentication is not configured")
@@ -149,8 +155,23 @@ def _trade_payload(trade: Trade, ticker: Any | None, stale_after: int) -> dict[s
         "target_progress": trade.target_progress,
         "stop_stage": trade.stop_stage,
         "protection_state": trade.protection_state,
-        "liquidation_price": _str(trade.liquidation_price),
-        "liquidation_price_source": "Shark position response" if trade.liquidation_price is not None else None,
+        "liquidation_price": _str(
+            trade.liquidation_price
+            if trade.liquidation_price is not None
+            else (
+                max(
+                    trade.actual_entry * (Decimal("1") - (Decimal("1") / Decimal(str(trade.leverage))) + Decimal("0.005")),
+                    Decimal("0"),
+                )
+                if trade.actual_entry is not None and (trade.leverage or 0) > 0
+                else None
+            )
+        ),
+        "liquidation_price_source": (
+            "Shark position response"
+            if trade.mode == "LIVE" and trade.liquidation_price is not None
+            else ("Simulated isolated liquidation" if trade.actual_entry is not None else None)
+        ),
         "entry_order_id": trade.entry_order_id,
         "exchange_position_id": trade.exchange_position_id,
         "opened_at": _iso(trade.opened_at),
@@ -324,6 +345,7 @@ async def read_settings(
         "shark_credentials_configured": settings.shark_credentials_configured,
         "telegram_configured": settings.telegram_configured,
         "webhook_configured": bool(settings.tradingview_webhook_token),
+        "dashboard_auth_enabled": getattr(settings, "dashboard_auth_enabled", True),
         "dashboard_auth_configured": bool(settings.dashboard_api_token),
         "trading_paused": control.kill_switch or settings.emergency_trading_disabled,
         "environment_pause": settings.emergency_trading_disabled,
@@ -580,7 +602,7 @@ async def positions(
 async def market_data(
     request: Request,
     q: str = Query(default="", max_length=64),
-    sort: str = Query(default="symbol", pattern="^(symbol|last_price|change_24h_percent|volume_24h)$"),
+    sort: str = Query(default="symbol", pattern="^(symbol|last_price|change_24h_percent|volume_24h|day_change_pct)$"),
     order: str = Query(default="asc", pattern="^(asc|desc)$"),
 ) -> dict[str, Any]:
     state = request.app.state.context.market.state()
@@ -648,6 +670,16 @@ async def market_live_feed(
         low = float(item["low_24h"]) if item.get("low_24h") else 0.0
         vol = float(item["volume_24h"]) if item.get("volume_24h") else 0.0
         change_abs = float(item["change_abs"]) if item.get("change_abs") else 0.0
+
+        # Day metrics (Crypto market day from 05:30 AM IST / 00:00 UTC)
+        day_open = float(item["day_open"]) if item.get("day_open") is not None else 0.0
+        day_high = float(item["day_high"]) if item.get("day_high") is not None else (high if day_open > 0 else 0.0)
+        day_low = float(item["day_low"]) if item.get("day_low") is not None else (low if day_open > 0 else 0.0)
+        day_pct = float(item["day_change_pct"]) if item.get("day_change_pct") is not None else (
+            ((last - day_open) / day_open * 100.0) if day_open > 0 else 0.0
+        )
+        day_abs = float(item["day_change_abs"]) if item.get("day_change_abs") is not None else (last - day_open if day_open > 0 else 0.0)
+
         res.append({
             "symbol": item["symbol"],
             "base_asset": item.get("base_asset") or item["symbol"],
@@ -659,10 +691,11 @@ async def market_live_feed(
             "volume": vol,
             "change_pct": pct,
             "change_abs": change_abs,
-            "day_open": last - change_abs,
-            "day_high": high,
-            "day_low": low,
-            "day_change_pct": pct,
+            "day_open": day_open,
+            "day_high": day_high,
+            "day_low": day_low,
+            "day_change_pct": day_pct,
+            "day_change_abs": day_abs,
             "status": "ok",
             "webhook_status": "",
         })
@@ -722,7 +755,7 @@ async def history_csv(
     columns = [
         "created_at", "mode", "symbol", "status", "planned_entry", "signal_close", "actual_entry",
         "quantity", "remaining_quantity", "stop_price", "target1_price", "target2_price", "target3_price",
-        "gross_realized_pnl", "fees_paid", "net_realized_pnl", "fee_data_available", "funding_data_available",
+        "gross_realized_pnl", "fees_paid", "funding_paid", "net_realized_pnl", "fee_data_available", "funding_data_available",
     ]
     writer.writerow(columns)
     for trade in trades.all():
@@ -1157,3 +1190,46 @@ async def retry_notification(
     session.add(job)
     session.add(_audit(action="TELEGRAM_RETRY_REQUESTED", entity_type="event", entity_id=event_id))
     return {"queued": True, "message": "Notification retry was durably queued."}
+
+
+@router.post("/control/dashboard-auth")
+async def toggle_dashboard_auth(
+    body: DashboardAuthToggleRequest,
+    request: Request,
+    session: AsyncSession = Depends(session_dependency),
+) -> dict[str, Any]:
+    settings: Settings = request.app.state.settings
+    settings.dashboard_auth_enabled = body.enabled
+
+    if settings.environment != "test":
+        env_path = PROJECT_ROOT / "backend" / ".env"
+        if env_path.exists():
+            try:
+                content = env_path.read_text(encoding="utf-8")
+                if re.search(r"^DASHBOARD_AUTH_ENABLED=", content, flags=re.MULTILINE):
+                    content = re.sub(
+                        r"^DASHBOARD_AUTH_ENABLED=.*$",
+                        f"DASHBOARD_AUTH_ENABLED={'true' if body.enabled else 'false'}",
+                        content,
+                        flags=re.MULTILINE,
+                    )
+                else:
+                    content += f"\nDASHBOARD_AUTH_ENABLED={'true' if body.enabled else 'false'}\n"
+                env_path.write_text(content, encoding="utf-8")
+            except Exception:
+                pass
+
+    session.add(
+        _audit(
+            action="DASHBOARD_AUTH_TOGGLED",
+            entity_type="dashboard_auth",
+            entity_id="dashboard_auth",
+            details={"enabled": body.enabled},
+        )
+    )
+    await session.flush()
+    return {
+        "dashboard_auth_enabled": settings.dashboard_auth_enabled,
+        "dashboard_auth_configured": bool(settings.dashboard_api_token),
+    }
+

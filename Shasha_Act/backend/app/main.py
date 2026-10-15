@@ -54,8 +54,8 @@ def create_app(
     @asynccontextmanager
     async def lifespan(application: FastAPI):
         if app_settings.environment == "production":
-            if not app_settings.dashboard_api_token:
-                raise RuntimeError("DASHBOARD_API_TOKEN must be configured in production")
+            if app_settings.dashboard_auth_enabled and not app_settings.dashboard_api_token:
+                raise RuntimeError("DASHBOARD_API_TOKEN must be configured in production when DASHBOARD_AUTH_ENABLED=true")
             if not app_settings.tradingview_webhook_token:
                 raise RuntimeError("TRADINGVIEW_WEBHOOK_TOKEN must be configured in production")
             if app_settings.database_url.startswith("sqlite"):
@@ -130,8 +130,10 @@ def create_app(
         response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers.setdefault("Referrer-Policy", "no-referrer")
         response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
-        if request.url.path.startswith("/api/"):
-            response.headers.setdefault("Cache-Control", "no-store")
+        if request.url.path.startswith("/api/") or request.url.path.startswith("/assets/") or request.url.path in ("/", "/index.html"):
+            response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
         response.headers.setdefault(
             "Content-Security-Policy",
             "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "

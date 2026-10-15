@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     live_trading_enabled: bool = False
     shark_contract_rules_verified: bool = False
     shark_split_protection_verified: bool = False
+    dashboard_auth_enabled: bool = True
     dashboard_api_token: str = ""
     tradingview_webhook_token: str = ""
 
@@ -38,6 +39,7 @@ class Settings(BaseSettings):
     stop_loss_percent: Decimal = Decimal("2")
     max_notional_per_trade: Decimal = Decimal("1000")
     max_daily_loss: Decimal = Decimal("200")
+    entry_price_source: str = "SHARK_15M_CLOSE"
     limit_entry_expiry_seconds: int = 900
     cancel_stale_entry_orders: bool = True
     emergency_trading_disabled: bool = False

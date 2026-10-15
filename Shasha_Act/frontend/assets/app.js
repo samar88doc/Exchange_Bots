@@ -1,6 +1,8 @@
 (() => {
+  const TOKEN_STORAGE_KEY = "shasha_dashboard_token";
   const state = {
     token: "",
+    authenticated: false,
     settings: null,
     overview: null,
     health: null,
@@ -80,8 +82,11 @@
     const contentType = response.headers.get("content-type") || "";
     const body = contentType.includes("application/json") ? await response.json() : await response.text();
     if (response.status === 401) {
-      forgetToken();
-      throw new Error("Dashboard authentication expired. Enter the access token again.");
+      if (!options.silent) {
+        state.authenticated = false;
+        showAuth("Dashboard authentication required. Enter the access token.");
+      }
+      throw new Error("Dashboard authentication required.");
     }
     if (!response.ok) {
       const message = typeof body === "object" && body ? (body.detail || body.message || `Request failed (${response.status})`) : `Request failed (${response.status})`;
@@ -113,24 +118,37 @@
   function showAuth(message = "") {
     $("#auth-overlay").classList.remove("hidden");
     $("#auth-error").textContent = message;
-    $("#auth-token").value = "";
+    const saved = localStorage.getItem(TOKEN_STORAGE_KEY) || "";
+    if (saved && !$("#auth-token").value) {
+      $("#auth-token").value = saved;
+    }
     $("#auth-token").focus();
   }
   function forgetToken() {
     state.token = "";
+    state.authenticated = false;
+    localStorage.removeItem(TOKEN_STORAGE_KEY);
     if (state.pollTimer) clearInterval(state.pollTimer);
     state.pollTimer = null;
     if (state.marketTimer) clearInterval(state.marketTimer);
     state.marketTimer = null;
-    showAuth("");
+    showAuth("Saved token removed.");
   }
 
-  async function authenticate(token) {
-    state.token = token.trim();
+  async function authenticate(token, remember = true, silent = false) {
+    const trimmed = (token || "").trim();
+    state.token = trimmed;
     try {
-      const settings = await api("/api/settings");
+      const settings = await api("/api/settings", { silent });
       state.settings = settings;
+      state.authenticated = true;
+      if (trimmed && remember) {
+        localStorage.setItem(TOKEN_STORAGE_KEY, trimmed);
+      } else if (!remember) {
+        localStorage.removeItem(TOKEN_STORAGE_KEY);
+      }
       $("#auth-overlay").classList.add("hidden");
+      renderSettings(settings);
       await refreshAll(true);
       if (!state.pollTimer) state.pollTimer = setInterval(() => refreshAll(false), 15000);
       if (state.currentView === "markets") {
@@ -140,13 +158,16 @@
       return true;
     } catch (error) {
       state.token = "";
-      showAuth(error.message || "Authentication failed.");
+      state.authenticated = false;
+      if (!silent) {
+        showAuth(error.message || "Authentication failed.");
+      }
       return false;
     }
   }
 
   async function refreshAll(initial = false) {
-    if (!state.token) return;
+    if (!state.authenticated && !state.token) return;
     const jobs = [
       ["settings", api("/api/settings")],
       ["overview", api("/api/overview")],
@@ -159,8 +180,17 @@
     const results = await Promise.allSettled(jobs.map(([, promise]) => promise));
     let failures = 0;
     results.forEach((result, index) => {
-      if (result.status === "fulfilled") state[jobs[index][0]] = result.value;
-      else {
+      if (result.status === "fulfilled") {
+        const key = jobs[index][0];
+        const val = result.value;
+        if (key === "positions") {
+          state.positions = Array.isArray(val) ? val : (val && Array.isArray(val.items)) ? val.items : [];
+        } else if (key === "events") {
+          state.events = Array.isArray(val) ? val : (val && Array.isArray(val.items)) ? val.items : [];
+        } else {
+          state[key] = val;
+        }
+      } else {
         failures += 1;
         if (jobs[index][0] === "pendingEntries") state.pendingEntries = null;
       }
@@ -174,6 +204,7 @@
     renderPerformance();
     if (state.currentView === "markets") await loadMarkets().catch((error) => toast(error.message, "error"));
     if (state.currentView === "history") await loadHistory().catch((error) => toast(error.message, "error"));
+    if (state.currentView === "signals") await loadEvents().catch((error) => toast(error.message, "error"));
     setText("#last-updated", fmtTime(new Date().toISOString()));
     const now = new Date();
     const tz = state.settings?.market_day_timezone || "Asia/Kolkata";
@@ -273,24 +304,29 @@
   }
 
   function renderDashboardPositions() {
-    const items = state.positions || [];
+    const raw = state.positions;
+    const items = Array.isArray(raw) ? raw : (raw && Array.isArray(raw.items)) ? raw.items : [];
     const target = $("#dashboard-position-rows");
+    if (!target) return;
     if (!items.length) {
-      target.innerHTML = blankRow(8, "No open positions or unresolved exposures.");
+      target.innerHTML = blankRow(9, "No open positions or unresolved exposures.");
       return;
     }
     target.innerHTML = items.slice(0, 6).map((item) => {
       const pnl = n(item.unrealized_pnl);
       const pnlClass = pnl === null ? "neutral" : pnl >= 0 ? "positive" : "negative";
+      const rPnl = n(item.net_realized_pnl);
+      const rPnlClass = rPnl === null ? "neutral" : rPnl > 0 ? "positive" : rPnl < 0 ? "negative" : "neutral";
       const protection = item.protection_state || "UNKNOWN";
-      const stop = item.stop_price ? fmtPrice(item.stop_price) : "Unavailable";
-      return `<tr><td><div class="contract-cell">${coinIcon(item.symbol)}<div class="contract-copy"><strong>${esc(item.symbol)}</strong><small>${esc(item.mode)} · ${esc(item.direction)}</small></div></div></td><td><div class="dual-value"><strong>${fmtPrice(item.actual_entry || item.planned_entry)}</strong><small>last ${fmtPrice(item.last_price)}</small></div></td><td><div class="dual-value"><strong>${fmtNum(item.remaining_quantity)}</strong><small>qty left</small></div></td><td>${esc(item.leverage)}×</td><td class="${pnlClass}">${pnl === null ? "Unavailable" : fmtMoney(pnl, "USDT", true)}</td><td>${pill(protection)}</td><td>${pill(item.status)}</td><td><button class="icon-button tiny" title="Trade details" data-action="details" data-id="${esc(item.id)}">···</button></td></tr>`;
+      return `<tr><td><div class="contract-cell">${coinIcon(item.symbol)}<div class="contract-copy"><strong>${esc(item.symbol)}</strong><small>${esc(item.mode)} · ${esc(item.direction)}</small></div></div></td><td><div class="dual-value"><strong>${fmtPrice(item.actual_entry || item.planned_entry)}</strong><small>last ${fmtPrice(item.last_price)}</small></div></td><td><div class="dual-value"><strong>${fmtNum(item.remaining_quantity)}</strong><small>qty left</small></div></td><td>${esc(item.leverage)}×</td><td class="${pnlClass}">${pnl === null ? "Unavailable" : fmtMoney(pnl, "USDT", true)}</td><td class="${rPnlClass}">${rPnl === null ? "0.00 USDT" : fmtMoney(rPnl, "USDT", true)}</td><td>${pill(protection)}</td><td>${pill(item.status)}</td><td><button class="icon-button tiny" title="Trade details" data-action="details" data-id="${esc(item.id)}">···</button></td></tr>`;
     }).join("");
   }
 
   function renderDashboardEvents() {
-    const items = state.events || [];
+    const raw = state.events;
+    const items = Array.isArray(raw) ? raw : (raw && Array.isArray(raw.items)) ? raw.items : [];
     const target = $("#dashboard-event-rows");
+    if (!target) return;
     if (!items.length) {
       target.innerHTML = blankRow(7, "No TradingView events have been recorded yet.");
       return;
@@ -361,25 +397,50 @@
   }
 
   function renderPositions() {
-    const items = state.positions || [];
+    const raw = state.positions;
+    const items = Array.isArray(raw) ? raw : (raw && Array.isArray(raw.items)) ? raw.items : [];
     const target = $("#position-rows");
     const overview = state.overview;
     const summary = $("#position-summary");
     if (summary && overview) {
-      summary.innerHTML = `<div class="summary-card"><span>OPEN / ATTENTION</span><strong>${esc(overview.open_positions ?? "—")}</strong></div><div class="summary-card"><span>PENDING ENTRIES</span><strong>${esc(overview.pending_entries ?? "—")}</strong></div><div class="summary-card"><span>UNRESOLVED</span><strong>${esc(overview.unknown_or_attention ?? "—")}</strong></div><div class="summary-card"><span>MODE</span><strong>${esc(overview.mode || "—")}</strong></div>`;
+      const dayPnl = overview.day_pnl || {};
+      const rPnl = n(dayPnl.realized_net);
+      let uPnl = n(dayPnl.unrealized);
+      if (uPnl === null && items.length) {
+        let sumUnrealized = 0;
+        let anyUnrealized = false;
+        items.forEach((it) => {
+          const v = n(it.unrealized_pnl);
+          if (v !== null) {
+            sumUnrealized += v;
+            anyUnrealized = true;
+          }
+        });
+        if (anyUnrealized) uPnl = sumUnrealized;
+      }
+      const totPnl = (rPnl !== null && uPnl !== null) ? (rPnl + uPnl) : n(dayPnl.total);
+      const rClass = rPnl === null ? "" : rPnl >= 0 ? "positive" : "negative";
+      const uClass = uPnl === null ? "" : uPnl >= 0 ? "positive" : "negative";
+      const totClass = totPnl === null ? "" : totPnl >= 0 ? "positive" : "negative";
+
+      summary.innerHTML = `<div class="summary-card"><span>OPEN POSITIONS</span><strong>${esc(overview.open_positions ?? "—")}</strong></div><div class="summary-card"><span>PENDING ENTRIES</span><strong>${esc(overview.pending_entries ?? "—")}</strong></div><div class="summary-card"><span>UNREALIZED P&L</span><strong class="${uClass}">${uPnl === null ? "—" : fmtMoney(uPnl, "USDT", true)}</strong></div><div class="summary-card"><span>REALIZED P&L (DAY)</span><strong class="${rClass}">${rPnl === null ? "—" : fmtMoney(rPnl, "USDT", true)}</strong></div><div class="summary-card"><span>TOTAL DAY P&L</span><strong class="${totClass}">${totPnl === null ? "—" : fmtMoney(totPnl, "USDT", true)}</strong></div><div class="summary-card"><span>MODE</span><strong>${esc(overview.mode || "—")}</strong></div>`;
     }
     if (!target) return;
     if (!items.length) {
-      target.innerHTML = blankRow(11, "No positions or unresolved trades are currently recorded.");
+      target.innerHTML = blankRow(12, "No positions or unresolved trades are currently recorded.");
       return;
     }
     target.innerHTML = items.map((item) => {
-      const pnl = n(item.unrealized_pnl);
-      const pnlClass = pnl === null ? "neutral" : pnl >= 0 ? "positive" : "negative";
+      const uPnl = n(item.unrealized_pnl);
+      const uPnlClass = uPnl === null ? "neutral" : uPnl >= 0 ? "positive" : "negative";
+      const rPnl = n(item.net_realized_pnl);
+      const rPnlClass = rPnl === null ? "neutral" : rPnl > 0 ? "positive" : rPnl < 0 ? "negative" : "neutral";
+      const feePaid = n(item.fees_paid);
+      const feeText = feePaid ? `fee ${fmtMoney(feePaid, "USDT")}` : (item.target_progress > 0 ? `Target ${item.target_progress} hit` : "no exits yet");
       const targets = `T1 ${fmtPrice(item.target1_price)}<br>T2 ${fmtPrice(item.target2_price)}<br>T3 ${fmtPrice(item.target3_price)}`;
       const isPaperOpen = item.mode === "PAPER" && ["OPEN", "PARTIALLY_CLOSED"].includes(item.status);
       const buttons = `<button class="button button-ghost button-small" data-action="details" data-id="${esc(item.id)}">Details</button>${isPaperOpen ? `<button class="button button-ghost button-small" data-action="edit-risk" data-id="${esc(item.id)}">Edit</button>` : ""}${["OPEN", "PARTIALLY_CLOSED"].includes(item.status) ? `<button class="button button-danger button-small" data-action="close" data-id="${esc(item.id)}">Close</button>` : ""}`;
-      return `<tr><td><div class="contract-cell">${coinIcon(item.symbol)}<div class="contract-copy"><strong>${esc(item.symbol)}</strong><small>${esc(item.mode)} · ${esc(item.direction)}</small></div></div></td><td><div class="dual-value"><strong>${fmtPrice(item.planned_entry)}</strong><small>fill ${fmtPrice(item.actual_entry)}</small></div></td><td><div class="dual-value"><strong>${fmtPrice(item.last_price)}</strong><small>${item.price_stale ? "stale / unavailable" : esc(item.price_source || "last price")}</small></div></td><td>${fmtNum(item.remaining_quantity)}</td><td><div class="dual-value"><strong>${fmtMoney(item.margin)}</strong><small>notional ${fmtMoney(item.notional)}</small></div></td><td class="${pnlClass}"><div class="dual-value"><strong>${pnl === null ? "Unavailable" : fmtMoney(pnl, "USDT", true)}</strong><small>${item.roi_percent_on_margin === null ? "ROI unavailable" : `${fmtNum(item.roi_percent_on_margin, 2)}% on margin`}</small></div></td><td>${fmtPrice(item.liquidation_price)}</td><td><div class="dual-value"><strong>SL ${fmtPrice(item.stop_price)}</strong><small>${targets}</small></div></td><td>${pill(item.protection_state)}</td><td>${pill(item.status)}</td><td><div class="row-actions">${buttons}</div></td></tr>`;
+      return `<tr><td><div class="contract-cell">${coinIcon(item.symbol)}<div class="contract-copy"><strong>${esc(item.symbol)}</strong><small>${esc(item.mode)} · ${esc(item.direction)}</small></div></div></td><td><div class="dual-value"><strong>${fmtPrice(item.planned_entry)}</strong><small>fill ${fmtPrice(item.actual_entry)}</small></div></td><td><div class="dual-value"><strong>${fmtPrice(item.last_price)}</strong><small>${item.price_stale ? "stale / unavailable" : esc(item.price_source || "last price")}</small></div></td><td>${fmtNum(item.remaining_quantity)}</td><td><div class="dual-value"><strong>${fmtMoney(item.margin)}</strong><small>notional ${fmtMoney(item.notional)}</small></div></td><td class="${uPnlClass}"><div class="dual-value"><strong>${uPnl === null ? "Unavailable" : fmtMoney(uPnl, "USDT", true)}</strong><small>${item.roi_percent_on_margin === null ? "ROI unavailable" : `${fmtNum(item.roi_percent_on_margin, 2)}% on margin`}</small></div></td><td class="${rPnlClass}"><div class="dual-value"><strong>${rPnl === null ? "0.00 USDT" : fmtMoney(rPnl, "USDT", true)}</strong><small>${feeText}</small></div></td><td>${fmtPrice(item.liquidation_price)}</td><td><div class="dual-value"><strong>SL ${fmtPrice(item.stop_price)}</strong><small>${targets}</small></div></td><td>${pill(item.protection_state)}</td><td>${pill(item.status)}</td><td><div class="row-actions">${buttons}</div></td></tr>`;
     }).join("");
   }
 
@@ -552,10 +613,13 @@
 
     let rows = feed.filter((r) => r.status === "ok" && Number(r.last_price) > 0);
     
+    // Determine active metric for gainers / losers filter
+    const activeChangeKey = (sortKey === "day_change_pct" || sortKey === "day_hl_range") ? "day_change_pct" : "change_pct";
+
     // Summary metrics before search filter
     const totalValid = rows.length;
-    const gainers = rows.filter((r) => Number(r.change_pct) > 0).length;
-    const losers = rows.filter((r) => Number(r.change_pct) < 0).length;
+    const gainers = rows.filter((r) => Number(r[activeChangeKey]) > 0).length;
+    const losers = rows.filter((r) => Number(r[activeChangeKey]) < 0).length;
     const totalVol = rows.reduce((s, r) => s + (Number(r.volume) || 0), 0);
     
     const sentiment = updateSentiment(gainers, losers, totalValid);
@@ -570,8 +634,8 @@
     setText("#market-total-vol", fmtVol(totalVol));
 
     // Filter by direction
-    if (filterDir === "up") rows = rows.filter((r) => Number(r.change_pct) > 0);
-    if (filterDir === "down") rows = rows.filter((r) => Number(r.change_pct) < 0);
+    if (filterDir === "up") rows = rows.filter((r) => Number(r[activeChangeKey]) > 0);
+    if (filterDir === "down") rows = rows.filter((r) => Number(r[activeChangeKey]) < 0);
 
     // Filter by search
     if (search) {
@@ -680,15 +744,16 @@
     if (status) params.set("status", status);
     if (symbol) params.set("symbol", symbol.toUpperCase());
     const data = await api(`/api/events?${params.toString()}`);
-    state.events = data.items || [];
+    state.events = Array.isArray(data) ? data : (data && Array.isArray(data.items)) ? data.items : [];
     renderEvents();
     renderDashboardEvents();
-    setText("#signal-total", `${data.total ?? 0} event(s)`);
+    setText("#signal-total", `${data.total ?? state.events.length} event(s)`);
   }
   function renderEvents() {
     const rows = $("#signal-rows");
     if (!rows) return;
-    const items = state.events || [];
+    const raw = state.events;
+    const items = Array.isArray(raw) ? raw : (raw && Array.isArray(raw.items)) ? raw.items : [];
     if (!items.length) {
       rows.innerHTML = blankRow(8, "No signal events match this filter.");
       return;
@@ -774,18 +839,46 @@
     button.textContent = paused ? "Resume new trades" : "Pause new trades";
     button.className = `button ${paused ? "button-primary" : "button-danger"} full-width`;
     button.disabled = Boolean(settings.environment_pause) && paused;
+
+    const authEnabled = settings.dashboard_auth_enabled !== false;
+    const authConfigured = Boolean(settings.dashboard_auth_configured);
+    const authBadge = $("#auth-status-badge");
+    const authDesc = $("#auth-status-description");
+    const toggleBtn = $("#toggle-auth-btn");
+    if (authBadge && authDesc && toggleBtn) {
+      if (authEnabled) {
+        authBadge.textContent = "ENABLED";
+        authBadge.className = "badge badge-green";
+        authDesc.innerHTML = `Dashboard token authentication is currently <strong>ENABLED</strong>. Requests to the console and API require <code>X-Dashboard-Token</code>.`;
+        toggleBtn.textContent = "Disable token requirement";
+        toggleBtn.className = "button button-secondary";
+      } else {
+        authBadge.textContent = "DISABLED";
+        authBadge.className = "badge badge-blue";
+        authDesc.innerHTML = `Dashboard token authentication is currently <strong>DISABLED</strong>. The console opens immediately without asking for a token.`;
+        toggleBtn.textContent = "Enable token requirement";
+        toggleBtn.className = "button button-secondary";
+      }
+    }
+
     const services = [
-      ["Dashboard authentication", settings.dashboard_auth_configured],
-      ["TradingView webhook", settings.webhook_configured],
-      ["Telegram", settings.telegram_configured],
-      ["Shark private credentials", settings.shark_credentials_configured],
+      ["Dashboard authentication", authEnabled ? (authConfigured ? "ENABLED (CONFIGURED)" : "ENABLED (NO TOKEN)") : "DISABLED (OPEN ACCESS)"],
+      ["TradingView webhook", settings.webhook_configured ? "CONFIGURED" : "NOT CONFIGURED"],
+      ["Telegram", settings.telegram_configured ? "CONFIGURED" : "NOT CONFIGURED"],
+      ["Shark private credentials", settings.shark_credentials_configured ? "CONFIGURED" : "NOT CONFIGURED"],
     ];
-    $("#config-service-list").innerHTML = services.map(([name, configured]) => `<div class="config-service"><span>${esc(name)}</span><strong class="${configured ? "ok" : "no"}">${configured ? "CONFIGURED" : "NOT CONFIGURED"}</strong></div>`).join("");
+    $("#config-service-list").innerHTML = services.map(([name, val]) => {
+      const cls = String(val).includes("DISABLED") ? "warn" : String(val).includes("CONFIGURED") ? "ok" : "no";
+      return `<div class="config-service"><span>${esc(name)}</span><strong class="${cls}">${esc(val)}</strong></div>`;
+    }).join("");
   }
 
   function switchView(view) {
     if (!$("#view-" + view)) return;
     state.currentView = view;
+    if (window.location.hash !== `#${view}`) {
+      window.history.replaceState(null, "", `#${view}`);
+    }
     $$(".page").forEach((page) => page.classList.toggle("active", page.id === `view-${view}`));
     $$(".nav-item[data-view]").forEach((item) => item.classList.toggle("active", item.dataset.view === view));
     const labels = { dashboard: "Overview", positions: "Positions", markets: "Markets", signals: "Signal log", history: "Trade history", settings: "Settings" };
@@ -808,6 +901,13 @@
     if (view === "signals") loadEvents().catch((error) => toast(error.message, "error"));
     if (view === "positions") renderPositions();
   }
+
+  window.addEventListener("hashchange", () => {
+    const pathView = window.location.hash.slice(1);
+    if (["dashboard", "positions", "markets", "signals", "history", "settings"].includes(pathView)) {
+      switchView(pathView);
+    }
+  });
 
   function openConfirm({ title, copy, phrase, confirmText = "Confirm", acknowledge = false, onConfirm }) {
     const modal = $("#modal-backdrop");
@@ -863,7 +963,7 @@
       const auditRows = (audit.items || []).map((entry) => row(`${entry.action} · ${fmtDateTime(entry.created_at)}`, JSON.stringify(entry.details || {}))).join("") || `<div class="drawer-empty">No audit events.</div>`;
       const canEdit = item.mode === "PAPER" && ["OPEN", "PARTIALLY_CLOSED"].includes(item.status);
       const riskForm = canEdit ? `<section class="drawer-section"><h3>EDIT PAPER RISK LEVELS</h3><form id="drawer-risk-form" class="settings-form"><label class="phrase-label">Stop price<input name="stop_price" type="number" min="0.00000001" step="any" value="${esc(item.stop_price || "")}"></label><label class="phrase-label">Target 1<input name="target1_price" type="number" min="0.00000001" step="any" value="${esc(item.target1_price || "")}"></label><label class="phrase-label">Target 2<input name="target2_price" type="number" min="0.00000001" step="any" value="${esc(item.target2_price || "")}"></label><label class="phrase-label">Target 3<input name="target3_price" type="number" min="0.00000001" step="any" value="${esc(item.target3_price || "")}"></label><label class="phrase-label">Type CONFIRM RISK CHANGE<input name="confirmation_phrase" type="text" autocomplete="off"></label><button class="button button-secondary" type="submit">Apply risk edits</button></form></section>` : "";
-      $("#drawer-body").innerHTML = `<section class="drawer-section"><h3>POSITION</h3>${row("Mode / status", `${item.mode} / ${item.status}`)}${row("TradingView → Shark", `${item.tradingview_symbol} → ${item.symbol}`)}${row("Signal close", fmtPrice(item.signal_close))}${row("Planned entry", fmtPrice(item.planned_entry))}${row("Actual entry", fmtPrice(item.actual_entry))}${row("Quantity / remaining", `${fmtNum(item.quantity)} / ${fmtNum(item.remaining_quantity)}`)}${row("Margin / notional", `${fmtMoney(item.margin)} / ${fmtMoney(item.notional)}`)}${row("Last price", fmtPrice(item.last_price))}${row("Unrealized P&L", item.unrealized_pnl === null ? "Unavailable" : fmtMoney(item.unrealized_pnl, "USDT", true))}${row("Protection", `${item.protection_state} · ${item.stop_stage}`)}${row("Active stop", fmtPrice(item.stop_price))}${row("Targets", `T1 ${fmtPrice(item.target1_price)} · T2 ${fmtPrice(item.target2_price)} · T3 ${fmtPrice(item.target3_price)}`)}${row("Liquidation price", fmtPrice(item.liquidation_price))}${row("Exchange position ID", item.exchange_position_id)}</section>${riskForm}<section class="drawer-section"><h3>ORDER HISTORY</h3>${orderRows}</section><section class="drawer-section"><h3>AUDIT TRAIL</h3>${auditRows}</section>`;
+      $("#drawer-body").innerHTML = `<section class="drawer-section"><h3>POSITION</h3>${row("Mode / status", `${item.mode} / ${item.status}`)}${row("TradingView → Shark", `${item.tradingview_symbol} → ${item.symbol}`)}${row("Signal close", fmtPrice(item.signal_close))}${row("Planned entry", fmtPrice(item.planned_entry))}${row("Actual entry", fmtPrice(item.actual_entry))}${row("Quantity / remaining", `${fmtNum(item.quantity)} / ${fmtNum(item.remaining_quantity)}`)}${row("Margin / notional", `${fmtMoney(item.margin)} / ${fmtMoney(item.notional)}`)}${row("Last price", fmtPrice(item.last_price))}${row("Unrealized P&L", item.unrealized_pnl === null ? "Unavailable" : fmtMoney(item.unrealized_pnl, "USDT", true))}${row("Gross Realized P&L", item.gross_realized_pnl === null ? "0.00 USDT" : fmtMoney(item.gross_realized_pnl, "USDT", true))}${row("Transaction fees paid", item.fees_paid === null ? "0.00 USDT" : fmtMoney(item.fees_paid, "USDT"))}${row("Funding fee", item.funding_paid ? fmtMoney(item.funding_paid, "USDT", true) : (item.funding_data_available ? "0.00 USDT" : "0.00 USDT (no 8h rollover)"))}${row("Realized P&L (Net)", item.net_realized_pnl === null ? "0.00 USDT" : fmtMoney(item.net_realized_pnl, "USDT", true))}${row("Protection", `${item.protection_state} · ${item.stop_stage}`)}${row("Active stop", fmtPrice(item.stop_price))}${row("Targets", `T1 ${fmtPrice(item.target1_price)} · T2 ${fmtPrice(item.target2_price)} · T3 ${fmtPrice(item.target3_price)}`)}${row("Liquidation price", fmtPrice(item.liquidation_price))}${row("Exchange position ID", item.exchange_position_id)}</section>${riskForm}<section class="drawer-section"><h3>ORDER HISTORY</h3>${orderRows}</section><section class="drawer-section"><h3>AUDIT TRAIL</h3>${auditRows}</section>`;
       const form = $("#drawer-risk-form");
       if (form) form.onsubmit = async (event) => {
         event.preventDefault();
@@ -960,7 +1060,41 @@
   }
 
   function bindEvents() {
-    $("#auth-form").addEventListener("submit", (event) => { event.preventDefault(); authenticate($("#auth-token").value); });
+    $("#auth-form").addEventListener("submit", (event) => {
+      event.preventDefault();
+      const remember = $("#auth-remember") ? $("#auth-remember").checked : true;
+      authenticate($("#auth-token").value, remember);
+    });
+    $("#toggle-auth-btn")?.addEventListener("click", () => {
+      const currentlyEnabled = state.settings?.dashboard_auth_enabled !== false;
+      const targetState = !currentlyEnabled;
+      const actionName = targetState ? "ENABLE" : "DISABLE";
+      openConfirm({
+        title: targetState ? "Enable Dashboard Token" : "Disable Dashboard Token",
+        copy: targetState
+          ? "Enabling token authentication will require X-Dashboard-Token to access the dashboard API and console."
+          : "Disabling token authentication allows immediate access to the dashboard console without entering a token.",
+        phrase: `${actionName} TOKEN`,
+        confirmText: `${targetState ? "Enable" : "Disable"} token`,
+        onConfirm: async () => {
+          try {
+            const result = await api("/api/control/dashboard-auth", {
+              method: "POST",
+              body: { enabled: targetState },
+            });
+            if (state.settings) state.settings.dashboard_auth_enabled = result.dashboard_auth_enabled;
+            renderSettings(state.settings);
+            toast(`Dashboard token requirement ${targetState ? "enabled" : "disabled"}.`);
+          } catch (err) {
+            toast(err.message || "Failed to update auth setting", "error");
+          }
+        },
+      });
+    });
+    $("#clear-saved-token-btn")?.addEventListener("click", () => {
+      localStorage.removeItem(TOKEN_STORAGE_KEY);
+      toast("Saved browser token removed.");
+    });
     $("#signout-button").addEventListener("click", forgetToken);
     $("#refresh-button").addEventListener("click", () => refreshAll(true));
     $("#mobile-menu").addEventListener("click", () => $("#sidebar").classList.toggle("open"));
@@ -1022,7 +1156,8 @@
     $("#csv-export").addEventListener("click", async (event) => {
       event.preventDefault();
       try {
-        const response = await fetch(event.currentTarget.href, { headers: { "X-Dashboard-Token": state.token }, credentials: "same-origin", cache: "no-store" });
+        const headers = state.token ? { "X-Dashboard-Token": state.token } : {};
+        const response = await fetch(event.currentTarget.href, { headers, credentials: "same-origin", cache: "no-store" });
         if (!response.ok) throw new Error(`CSV export failed (${response.status})`);
         const blob = await response.blob();
         const url = URL.createObjectURL(blob);
@@ -1102,10 +1237,14 @@
     });
   }
 
-  document.addEventListener("DOMContentLoaded", () => {
+  document.addEventListener("DOMContentLoaded", async () => {
     bindEvents();
     const pathView = window.location.hash.slice(1);
     if (["dashboard", "positions", "markets", "signals", "history", "settings"].includes(pathView)) switchView(pathView);
-    showAuth("");
+    const savedToken = localStorage.getItem(TOKEN_STORAGE_KEY) || "";
+    const ok = await authenticate(savedToken, Boolean(savedToken), true);
+    if (!ok) {
+      showAuth("");
+    }
   });
 })();

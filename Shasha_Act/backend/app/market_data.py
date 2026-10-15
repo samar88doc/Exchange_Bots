@@ -78,6 +78,84 @@ def parse_ticker(data: Any, source: str = "SHARK_LAST") -> TickerSnapshot | None
     )
 
 
+@dataclass
+class DayKlineSnapshot:
+    """Crypto market day candlestick (starts 00:00:00 UTC = 05:30:00 AM IST)."""
+    symbol: str
+    open_price: Decimal
+    high_price: Decimal
+    low_price: Decimal
+    close_price: Decimal
+    volume: Decimal | None
+    start_time: datetime
+    end_time: datetime | None = None
+    received_at: datetime = datetime.now(UTC)
+
+
+def parse_kline(data: Any, symbol: str | None = None) -> DayKlineSnapshot | None:
+    """Parse 1d candlestick (kline) data from Shark's public WebSocket or REST API."""
+    if isinstance(data, dict) and isinstance(data.get("data"), dict):
+        data = data["data"]
+    if not isinstance(data, dict):
+        return None
+
+    # WebSocket format: {"e": "continuous_kline", "ps": "BTCUSDT", "k": {"t": 1792022400000, "o": "...", ...}}
+    if "k" in data and isinstance(data["k"], dict):
+        k = data["k"]
+        sym = str(data.get("ps") or data.get("s") or symbol or "").upper()
+        interval = str(k.get("i") or "")
+        if interval and interval != "1d":
+            return None
+        o = _decimal(k.get("o"))
+        h = _decimal(k.get("h"))
+        l = _decimal(k.get("l"))
+        c = _decimal(k.get("c"))
+        v = _decimal(k.get("v"))
+        t = _decimal(k.get("t"))
+        T = _decimal(k.get("T"))
+    else:
+        # REST format: {"startTime": "1792022400000", "open": "...", "high": "...", "low": "...", "close": "...", "endTime": "..."}
+        sym = str(symbol or data.get("symbol") or data.get("pair") or "").upper()
+        o = _decimal(data.get("open"))
+        h = _decimal(data.get("high"))
+        l = _decimal(data.get("low"))
+        c = _decimal(data.get("close"))
+        v = _decimal(data.get("volume"))
+        t = _decimal(data.get("startTime"))
+        T = _decimal(data.get("endTime"))
+
+    if not sym or o is None or o <= 0:
+        return None
+
+    start_dt = None
+    if t is not None and t > 0:
+        try:
+            start_dt = datetime.fromtimestamp(float(t / Decimal("1000")), tz=UTC)
+        except (ValueError, OverflowError, OSError):
+            start_dt = None
+    if start_dt is None:
+        start_dt = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    end_dt = None
+    if T is not None and T > 0:
+        try:
+            end_dt = datetime.fromtimestamp(float(T / Decimal("1000")), tz=UTC)
+        except (ValueError, OverflowError, OSError):
+            end_dt = None
+
+    return DayKlineSnapshot(
+        symbol=sym,
+        open_price=o,
+        high_price=h if h is not None and h > 0 else o,
+        low_price=l if l is not None and l > 0 else o,
+        close_price=c if c is not None and c > 0 else o,
+        volume=v,
+        start_time=start_dt,
+        end_time=end_dt,
+        received_at=datetime.now(UTC),
+    )
+
+
 class MarketDataService:
     def __init__(self, settings: Settings, shark: SharkClient, on_ticker: TickerCallback | None = None) -> None:
         self.settings = settings
@@ -85,6 +163,7 @@ class MarketDataService:
         self.on_ticker = on_ticker
         self.resolver = SymbolResolver()
         self.tickers: dict[str, TickerSnapshot] = {}
+        self.day_klines: dict[str, DayKlineSnapshot] = {}
         self.last_success: datetime | None = None
         self.last_error: str = ""
         self.websocket_connected = False
@@ -128,12 +207,42 @@ class MarketDataService:
             self.last_error = type(exc).__name__
             return cached if cached and not cached.is_stale(self.settings.market_data_stale_seconds) else None
 
+    def accept_kline(self, kline: DayKlineSnapshot) -> None:
+        self.day_klines[kline.symbol] = kline
+
     async def accept_ticker(self, ticker: TickerSnapshot) -> None:
         self.tickers[ticker.symbol] = ticker
         self.last_success = ticker.received_at
         self.last_error = ""
         if ticker.source.startswith("SHARK_WS"):
             self.websocket_last_message = ticker.received_at
+
+        # Real-time maintenance of Day % from 05:30 AM IST / 00:00 UTC
+        now_utc = datetime.now(UTC)
+        day_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+        existing_kline = self.day_klines.get(ticker.symbol)
+        if existing_kline is not None:
+            if existing_kline.start_time < day_start:
+                # Calendar day rollover
+                self.day_klines[ticker.symbol] = DayKlineSnapshot(
+                    symbol=ticker.symbol,
+                    open_price=ticker.last_price,
+                    high_price=ticker.last_price,
+                    low_price=ticker.last_price,
+                    close_price=ticker.last_price,
+                    volume=Decimal("0"),
+                    start_time=day_start,
+                    end_time=day_start.replace(hour=23, minute=59, second=59, microsecond=999000),
+                    received_at=now_utc,
+                )
+            else:
+                existing_kline.close_price = ticker.last_price
+                if ticker.last_price > existing_kline.high_price:
+                    existing_kline.high_price = ticker.last_price
+                if existing_kline.low_price <= 0 or (0 < ticker.last_price < existing_kline.low_price):
+                    existing_kline.low_price = ticker.last_price
+                existing_kline.received_at = now_utc
+
         if self.on_ticker is not None:
             await self.on_ticker(ticker)
 
@@ -146,9 +255,26 @@ class MarketDataService:
         chosen = symbols or [
             name for name, spec in self.resolver_contracts.items()
             if spec.contract_type in {"PERPETUAL", "TRADIFI_PERPETUAL"}
-        ]
-        for symbol in chosen[: self.settings.market_data_max_subscriptions]:
-            await self.get_ticker(symbol, refresh=True)
+        ][: self.settings.market_data_max_subscriptions]
+
+        sem = asyncio.Semaphore(25)
+
+        async def fetch_item(symbol: str) -> None:
+            async with sem:
+                try:
+                    await self.get_ticker(symbol, refresh=True)
+                except Exception:
+                    pass
+                try:
+                    raw_kline = await self.shark.klines(symbol, interval="1d", limit=1)
+                    if isinstance(raw_kline, list) and raw_kline:
+                        kline = parse_kline(raw_kline[0], symbol=symbol)
+                        if kline is not None:
+                            self.accept_kline(kline)
+                except Exception:
+                    pass
+
+        await asyncio.gather(*(fetch_item(symbol) for symbol in chosen))
 
     def health(self) -> str:
         now = datetime.now(UTC)
@@ -179,6 +305,20 @@ class MarketDataService:
                     open_approx = ticker.last_price / divisor
                     change_abs = ticker.last_price - open_approx
 
+            # Crypto Market Day stats (starts 00:00:00 UTC = 05:30:00 AM IST)
+            kline = self.day_klines.get(ticker.symbol)
+            day_open = None
+            day_high = None
+            day_low = None
+            day_pct = None
+            day_abs = None
+            if kline is not None and kline.open_price > 0:
+                day_open = kline.open_price
+                day_high = max(kline.high_price, ticker.last_price)
+                day_low = min(kline.low_price, ticker.last_price) if kline.low_price > 0 else ticker.last_price
+                day_pct = ((ticker.last_price - day_open) / day_open) * Decimal("100")
+                day_abs = ticker.last_price - day_open
+
             items.append(
                 {
                     "symbol": ticker.symbol,
@@ -193,6 +333,11 @@ class MarketDataService:
                     "volume_24h": str(ticker.volume_24h) if ticker.volume_24h is not None else None,
                     "high_24h": str(ticker.high_24h) if ticker.high_24h is not None else None,
                     "low_24h": str(ticker.low_24h) if ticker.low_24h is not None else None,
+                    "day_open": str(day_open) if day_open is not None else None,
+                    "day_high": str(day_high) if day_high is not None else None,
+                    "day_low": str(day_low) if day_low is not None else None,
+                    "day_change_pct": str(day_pct) if day_pct is not None else None,
+                    "day_change_abs": str(day_abs) if day_abs is not None else None,
                     "status": "ok",
                     "source": ticker.source,
                     "updated_at": ticker.received_at.isoformat(),
@@ -208,7 +353,7 @@ class MarketDataService:
                 self.websocket_last_message.isoformat() if self.websocket_last_message else None
             ),
             "error": self.last_error or self.websocket_error,
-            "note": "Change is Shark 24-hour ticker change; prices are last prices, not mark prices.",
+            "note": "24h % is rolling 24-hour ticker; Day % is crypto market day change since 05:30 AM IST (00:00 UTC).",
         }
 
     async def run_public_stream(self, stop: asyncio.Event) -> None:
@@ -228,6 +373,12 @@ class MarketDataService:
                     if parsed is not None:
                         await self.accept_ticker(parsed)
 
+                @client.on("kline")
+                async def handle_kline(data: Any) -> None:
+                    parsed = parse_kline(data)
+                    if parsed is not None:
+                        self.accept_kline(parsed)
+
                 @client.event
                 async def connect(*_args: Any, socket_client: Any = client) -> None:
                     self.websocket_connected = True
@@ -236,7 +387,7 @@ class MarketDataService:
                         name for name, spec in self.resolver_contracts.items()
                         if spec.contract_type in {"PERPETUAL", "TRADIFI_PERPETUAL"}
                     ][: self.settings.market_data_max_subscriptions]
-                    topics = [f"{symbol.lower()}@ticker" for symbol in symbols]
+                    topics = [f"{symbol.lower()}@ticker" for symbol in symbols] + [f"{symbol.lower()}@kline_1d" for symbol in symbols]
                     if topics:
                         await socket_client.emit("subscribe", {"params": topics})
 
@@ -279,8 +430,24 @@ class MarketDataService:
                     name for name, spec in self.resolver_contracts.items()
                     if spec.contract_type in {"PERPETUAL", "TRADIFI_PERPETUAL"}
                 ][: self.settings.market_data_max_subscriptions]
-                for symbol in symbols:
-                    await self.get_ticker(symbol, refresh=True)
+                
+                sem = asyncio.Semaphore(20)
+                async def poll_one(symbol: str) -> None:
+                    async with sem:
+                        try:
+                            await self.get_ticker(symbol, refresh=True)
+                        except Exception:
+                            pass
+                        try:
+                            raw = await self.shark.klines(symbol, interval="1d", limit=1)
+                            if isinstance(raw, list) and raw:
+                                kline = parse_kline(raw[0], symbol=symbol)
+                                if kline is not None:
+                                    self.accept_kline(kline)
+                        except Exception:
+                            pass
+
+                await asyncio.gather(*(poll_one(s) for s in symbols))
             except Exception as exc:
                 self.last_error = type(exc).__name__
             try:

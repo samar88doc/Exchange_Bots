@@ -141,3 +141,83 @@ async def test_uncertain_order_submission_is_not_returned_as_a_retryable_http_er
     with pytest.raises(SharkOutcomeUnknown):
         await shark.place_limit_buy("BTCUSDT", Decimal("1"), Decimal("100"))
     await client.aclose()
+
+
+def test_parse_kline_and_day_change_calculation() -> None:
+    from app.market_data import DayKlineSnapshot, MarketDataService, TickerSnapshot, parse_kline
+    from datetime import UTC, datetime
+
+    # 1. Parse REST format
+    rest_kline = {
+        "startTime": "1792022400000",
+        "open": "81641.8",
+        "high": "81894.0",
+        "low": "80187.8",
+        "close": "81080.3",
+        "endTime": "1792108799999",
+        "volume": "94765.636",
+    }
+    parsed = parse_kline(rest_kline, symbol="BTCUSDT")
+    assert parsed is not None
+    assert parsed.symbol == "BTCUSDT"
+    assert parsed.open_price == Decimal("81641.8")
+    assert parsed.high_price == Decimal("81894.0")
+    assert parsed.low_price == Decimal("80187.8")
+
+    # 2. Parse WebSocket continuous_kline format
+    ws_kline = {
+        "e": "continuous_kline",
+        "E": 1792064897208,
+        "ps": "ETHUSDT",
+        "ct": "PERPETUAL",
+        "k": {
+            "t": 1792022400000,
+            "T": 1792108799999,
+            "i": "1d",
+            "o": "2420.9",
+            "c": "2450.0",
+            "h": "2465.0",
+            "l": "2400.0",
+            "v": "15000",
+        },
+    }
+    parsed_ws = parse_kline(ws_kline)
+    assert parsed_ws is not None
+    assert parsed_ws.symbol == "ETHUSDT"
+    assert parsed_ws.open_price == Decimal("2420.9")
+    assert parsed_ws.high_price == Decimal("2465.0")
+    assert parsed_ws.low_price == Decimal("2400.0")
+
+    # 3. MarketDataService Day % vs 24h % distinction
+    settings = Settings(_env_file=None, environment="test")
+    service = MarketDataService(settings, None)  # type: ignore[arg-type]
+    service.accept_kline(parsed)
+
+    # Simulated ticker with 24h % = +5.0% and last_price = 82458.218 (which is +1.0% from 5:30am open of 81641.8)
+    now = datetime.now(UTC)
+    ticker = TickerSnapshot(
+        symbol="BTCUSDT",
+        last_price=Decimal("82458.218"),
+        change_24h_percent=Decimal("5.0"),
+        volume_24h=Decimal("12345"),
+        high_24h=Decimal("83000"),
+        low_24h=Decimal("78000"),
+        source="SHARK_WS_LAST",
+        received_at=now,
+    )
+    import asyncio
+    asyncio.run(service.accept_ticker(ticker))
+
+    state = service.state()
+    items = state["items"]
+    assert len(items) == 1
+    item = items[0]
+    assert item["symbol"] == "BTCUSDT"
+    # 24h % is 5.0
+    assert item["change_24h_percent"] == "5.0"
+    # Day % is from 5:30 AM open (81641.8) -> (82458.218 - 81641.8) / 81641.8 * 100 = 1.0%
+    assert item["day_open"] == "81641.8"
+    assert Decimal(item["day_change_pct"]).quantize(Decimal("0.01")) == Decimal("1.00")
+    # Day High updated to last_price because 82458.218 > 81894.0
+    assert item["day_high"] == "82458.218"
+    assert item["day_low"] == "80187.8"

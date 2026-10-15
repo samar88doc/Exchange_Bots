@@ -6,8 +6,8 @@
   <meta name="color-scheme" content="dark">
   <meta name="theme-color" content="#0a1020">
   <title>Shasha Act — Trading Operations</title>
-  <link rel="stylesheet" href="/assets/styles.css">
-  <script defer src="/assets/app.js"></script>
+  <link rel="stylesheet" href="/assets/styles.css?v=20261015_02">
+  <script defer src="/assets/app.js?v=20261015_02"></script>
 </head>
 <body>
   <div class="app-shell">
@@ -85,7 +85,7 @@
 
         <section class="panel table-panel positions-panel">
           <div class="panel-head table-panel-head"><div><div class="panel-title">Open positions</div><div class="panel-caption">Exchange-confirmed status · stale prices are marked unavailable</div></div><div class="panel-actions"><span class="count-chip" id="positions-count">—</span><button class="button button-secondary button-small" data-view="positions">All positions <span>→</span></button></div></div>
-          <div class="table-scroll"><table><thead><tr><th>CONTRACT</th><th>ENTRY / LAST</th><th>SIZE</th><th>LEVERAGE</th><th>UNREALIZED P&L</th><th>PROTECTION</th><th>STATUS</th><th></th></tr></thead><tbody id="dashboard-position-rows"><tr><td colspan="8" class="empty-cell"><span class="spinner"></span>Loading positions</td></tr></tbody></table></div>
+          <div class="table-scroll"><table><thead><tr><th>CONTRACT</th><th>ENTRY / LAST</th><th>SIZE</th><th>LEVERAGE</th><th>UNREALIZED P&L</th><th>REALIZED P&L</th><th>PROTECTION</th><th>STATUS</th><th></th></tr></thead><tbody id="dashboard-position-rows"><tr><td colspan="9" class="empty-cell"><span class="spinner"></span>Loading positions</td></tr></tbody></table></div>
           <div class="table-footer"><span id="positions-footer">No position snapshot</span><span>Public last price · not mark price</span></div>
         </section>
 
@@ -101,7 +101,7 @@
         <div class="page-heading compact-heading"><div><div class="eyebrow">RISK & EXPOSURE</div><h1>Positions</h1><p class="subheading">Only confirmed or unresolved exposure is shown. No price is fabricated.</p></div><div class="heading-actions"><button class="button button-secondary" id="cancel-pending-button">Cancel pending entries</button></div></div>
         <div class="positions-summary" id="position-summary"></div>
         <section class="panel table-panel"><div class="panel-head table-panel-head"><div><div class="panel-title">Pending limit entries</div><div class="panel-caption">Queued/submitted entries are not open positions; cancel only after checking the state.</div></div><span class="count-chip" id="pending-entry-count">—</span></div><div class="table-scroll"><table><thead><tr><th>CONTRACT</th><th>LIMIT PLAN</th><th>QTY</th><th>EXPIRES</th><th>MODE</th><th>STATUS</th><th>ACTION</th></tr></thead><tbody id="pending-entry-rows"><tr><td colspan="7" class="empty-cell">Loading pending entries.</td></tr></tbody></table></div></section>
-        <section class="panel table-panel"><div class="panel-head table-panel-head"><div><div class="panel-title">Position ledger</div><div class="panel-caption">Open, partially closed and attention-required trades</div></div></div><div class="table-scroll"><table class="wide-table"><thead><tr><th>CONTRACT</th><th>ENTRY PLAN / FILL</th><th>LAST PRICE</th><th>QTY LEFT</th><th>MARGIN / NOTIONAL</th><th>U-P&L / ROI</th><th>LIQ. PRICE</th><th>STOP / TARGETS</th><th>PROTECTION</th><th>STATUS</th><th>ACTIONS</th></tr></thead><tbody id="position-rows"><tr><td colspan="11" class="empty-cell"><span class="spinner"></span>Loading positions</td></tr></tbody></table></div></section>
+        <section class="panel table-panel"><div class="panel-head table-panel-head"><div><div class="panel-title">Position ledger</div><div class="panel-caption">Open, partially closed and attention-required trades</div></div></div><div class="table-scroll"><table class="wide-table"><thead><tr><th>CONTRACT</th><th>ENTRY PLAN / FILL</th><th>LAST PRICE</th><th>QTY LEFT</th><th>MARGIN / NOTIONAL</th><th>UNREALIZED P&L</th><th>REALIZED P&L</th><th>LIQ. PRICE</th><th>STOP / TARGETS</th><th>PROTECTION</th><th>STATUS</th><th>ACTIONS</th></tr></thead><tbody id="position-rows"><tr><td colspan="12" class="empty-cell"><span class="spinner"></span>Loading positions</td></tr></tbody></table></div></section>
         <section class="panel attention-panel"><div class="panel-head"><div><div class="panel-title">Safety notes</div><div class="panel-caption">Execution behavior</div></div><span class="badge badge-amber">READ BEFORE ACTION</span></div><ul class="safety-list"><li>Pending LIMIT orders are not open positions; fill state is confirmed separately.</li><li>Cancel and close actions remain pending until Shark confirms the final order state.</li><li>LIVE position-level risk edits stay disabled until contract filters and split protection semantics are verified.</li><li>Unrealized P&amp;L uses the last public price where fresh; it is not a mark-price or liquidation estimate.</li></ul></section>
       </section>
 
@@ -179,13 +179,13 @@
                   <th class="w-num">#</th>
                   <th class="sortable" data-sort="symbol"><span>Symbol <span class="sort-arr">↕</span></span></th>
                   <th class="sortable" data-sort="last_price"><span>Last Price <span class="sort-arr">↕</span></span></th>
-                  <th class="sortable" data-sort="change_pct"><span>24h % <span class="sort-arr">↕</span></span></th>
-                  <th class="sortable" data-sort="high"><span>24h High <span class="sort-arr">↕</span></span></th>
-                  <th class="sortable" data-sort="low"><span>24h Low <span class="sort-arr">↕</span></span></th>
-                  <th class="sortable" data-sort="hl_range"><span>H/L Range <span class="sort-arr">↕</span></span></th>
-                  <th class="sortable" data-sort="day_change_pct"><span>Day % <span class="sort-arr">↕</span></span></th>
-                  <th class="sortable" data-sort="day_hl_range"><span>Day H/L <span class="sort-arr">↕</span></span></th>
-                  <th class="sortable" data-sort="volume"><span>24h Volume <span class="sort-arr">↕</span></span></th>
+                  <th class="sortable" data-sort="change_pct" title="Rolling 24-hour price change percentage"><span>24h % <span class="sort-arr">↕</span></span></th>
+                  <th class="sortable" data-sort="high" title="Highest price in the rolling 24 hours"><span>24h High <span class="sort-arr">↕</span></span></th>
+                  <th class="sortable" data-sort="low" title="Lowest price in the rolling 24 hours"><span>24h Low <span class="sort-arr">↕</span></span></th>
+                  <th class="sortable" data-sort="hl_range" title="Current price position within rolling 24-hour High/Low range"><span>24h Range <span class="sort-arr">↕</span></span></th>
+                  <th class="sortable" data-sort="day_change_pct" title="Day Change % since crypto market day open at 05:30 AM IST (00:00 UTC)"><span>Day % <span class="sort-arr">↕</span></span></th>
+                  <th class="sortable" data-sort="day_hl_range" title="Day Low / High range since crypto market day open at 05:30 AM IST (00:00 UTC)"><span>Day H/L <span class="sort-arr">↕</span></span></th>
+                  <th class="sortable" data-sort="volume" title="Rolling 24-hour trading volume"><span>24h Volume <span class="sort-arr">↕</span></span></th>
                   <th>Webhook Status</th>
                 </tr>
               </thead>
@@ -195,7 +195,7 @@
             </table>
           </div>
         </section>
-        <div class="inline-note"><span class="note-icon">i</span><span>Live tick data streamed from Shark public WebSocket &amp; REST fallback. Prices flash green on tick up and red on tick down.</span></div>
+        <div class="inline-note"><span class="note-icon">i</span><span>Live tick data streamed from Shark public WebSocket &amp; REST fallback. <strong>Day %</strong> and <strong>Day H/L</strong> represent the crypto market day reset from <strong>05:30 AM IST (00:00 UTC)</strong>. <strong>24h %</strong> is the rolling 24-hour ticker change. Prices flash green on tick up and red on tick down.</span></div>
       </section>
 
       <section class="page" id="view-signals">
@@ -215,6 +215,24 @@
           <div class="settings-main">
             <section class="panel settings-panel"><div class="panel-head"><div><div class="panel-title">Risk parameters</div><div class="panel-caption">Applied to future reservations only</div></div><span class="badge badge-green">SERVER ENFORCED</span></div><form id="risk-form" class="settings-form"><div class="form-grid"><label>Margin per trade <span>USDT</span><input name="margin_per_trade" type="number" min="0.01" step="0.01" required></label><label>Leverage <span>×</span><input name="leverage" type="number" min="1" max="200" step="1" required></label><label>Max open slots <span>trades</span><input name="max_open_positions" type="number" min="1" max="20" step="1" required></label><label>Max notional per trade <span>USDT</span><input name="max_notional_per_trade" type="number" min="0.01" step="0.01" required></label><label>Target 1 <span>% underlying</span><input name="target1_percent" type="number" min="0.01" step="0.01" required></label><label>Target 2 <span>% underlying</span><input name="target2_percent" type="number" min="0.01" step="0.01" required></label><label>Target 3 <span>% underlying</span><input name="target3_percent" type="number" min="0.01" step="0.01" required></label><label>Stop loss <span>% underlying</span><input name="stop_loss_percent" type="number" min="0.01" step="0.01" required></label><label>Max daily loss <span>USDT</span><input name="max_daily_loss" type="number" min="0.01" step="0.01" required></label><label>Limit entry expiry <span>seconds</span><input name="limit_entry_expiry_seconds" type="number" min="60" max="86400" step="1" required></label></div><label class="checkbox-row"><input type="checkbox" name="cancel_stale_entry_orders"><span>Cancel a stale LIMIT entry after its configured expiry (only report confirmed exchange cancellation)</span></label><div class="form-actions"><button type="submit" class="button button-primary">Save risk parameters <span>→</span></button><span id="risk-save-status" class="form-status"></span></div></form></section>
             <section class="panel settings-panel"><div class="panel-head"><div><div class="panel-title">Trading mode</div><div class="panel-caption">PAPER is the default. LIVE activation is guarded by server and dashboard confirmation.</div></div><span class="mode-pill paper" id="settings-mode-pill"><i></i><span>PAPER MODE</span></span></div><div class="mode-card"><div class="mode-card-copy"><strong>Paper simulation</strong><p>Uses Shark public last prices for simulated fills. It cannot call private order placement.</p></div><button class="button button-secondary" id="switch-paper-button">Stay / switch to PAPER</button></div><div class="live-blocker" id="live-blocker"><div class="blocker-icon">!</div><div><strong>LIVE is fail-closed</strong><p id="live-blocker-copy">Official Shark contract filters and protection semantics must be verified before LIVE can be enabled.</p><div class="config-checks" id="live-checks"></div></div><button class="button button-danger" id="enable-live-button" disabled>Enable LIVE</button></div></section>
+            <section class="panel settings-panel" id="auth-settings-panel">
+              <div class="panel-head">
+                <div>
+                  <div class="panel-title">Dashboard Access Token</div>
+                  <div class="panel-caption">Enable or disable token authentication for opening this web console</div>
+                </div>
+                <span class="badge" id="auth-status-badge">CHECKING</span>
+              </div>
+              <div class="auth-settings-body" style="display:flex; flex-direction:column; gap:12px; margin-top:8px;">
+                <p id="auth-status-description" style="color:var(--text-muted); font-size:14px; margin:0;">
+                  Loading authentication status...
+                </p>
+                <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+                  <button type="button" class="button button-secondary" id="toggle-auth-btn">Toggle Auth</button>
+                  <button type="button" class="button button-secondary" id="clear-saved-token-btn">Clear Saved Browser Token</button>
+                </div>
+              </div>
+            </section>
             <section class="panel settings-panel"><div class="panel-head"><div><div class="panel-title">Signal filters</div><div class="panel-caption">Empty allowlist permits all metadata-verified USDT perpetuals; denylist always wins.</div></div></div><form id="symbol-form" class="symbol-form"><label>Allowlist <small>Comma-separated Shark symbols</small><input name="allow_symbols" type="text" placeholder="e.g. BTCUSDT, ETHUSDT"></label><label>Denylist <small>Comma-separated Shark symbols</small><input name="deny_symbols" type="text" placeholder="e.g. DOGEUSDT"></label><div class="form-actions"><button class="button button-secondary" type="submit">Save symbol filters</button><span id="symbol-save-status" class="form-status"></span></div></form></section>
           </div>
           <aside class="settings-side">
@@ -231,6 +249,6 @@
   <div class="toast-stack" id="toast-stack" aria-live="polite"></div>
   <div class="drawer-backdrop hidden" id="drawer-backdrop"><aside class="detail-drawer" id="detail-drawer"><div class="drawer-head"><div><div class="eyebrow">TRADE DETAIL</div><h2 id="drawer-title">Trade</h2></div><button class="icon-button" id="drawer-close" aria-label="Close details">×</button></div><div class="drawer-body" id="drawer-body"></div></aside></div>
   <div class="modal-backdrop hidden" id="modal-backdrop"><div class="confirm-modal" role="dialog" aria-modal="true"><button class="icon-button modal-close" id="modal-close" aria-label="Close dialog">×</button><div class="modal-symbol" id="modal-symbol">!</div><div class="eyebrow" id="modal-eyebrow">CONFIRM ACTION</div><h2 id="modal-title">Confirm</h2><p id="modal-copy"></p><label id="modal-phrase-label" class="phrase-label">Type <strong id="modal-phrase-display"></strong><input type="text" id="modal-phrase-input" autocomplete="off" spellcheck="false"></label><label class="ack-row hidden" id="modal-ack-row"><input type="checkbox" id="modal-ack"><span>I understand exchange execution and loss risk.</span></label><div class="modal-actions"><button class="button button-secondary" id="modal-cancel">Cancel</button><button class="button button-danger" id="modal-confirm" disabled>Confirm</button></div></div></div>
-  <div class="auth-overlay" id="auth-overlay"><div class="auth-card"><div class="brand-mark auth-mark"><span></span><span></span><span></span></div><div class="eyebrow">PRIVATE OPERATIONS CONSOLE</div><h1>Welcome back.</h1><p>Enter the dashboard access token configured on the Shasha Act server.</p><form id="auth-form"><label>Dashboard access token<input id="auth-token" type="password" autocomplete="current-password" required autofocus></label><button class="button button-primary full-width" type="submit">Open dashboard <span>→</span></button><div class="auth-error" id="auth-error"></div></form><div class="auth-note"><span class="lock-icon">⌑</span><span>The token is kept in memory only and is not saved to browser storage.</span></div></div></div>
+  <div class="auth-overlay hidden" id="auth-overlay"><div class="auth-card"><div class="brand-mark auth-mark"><span></span><span></span><span></span></div><div class="eyebrow">PRIVATE OPERATIONS CONSOLE</div><h1>Welcome back.</h1><p id="auth-modal-instruction">Enter the dashboard access token configured on the Shasha Act server.</p><form id="auth-form"><label>Dashboard access token<input id="auth-token" type="password" autocomplete="current-password" autofocus></label><div style="display:flex; align-items:center; justify-content:space-between; margin-top:8px; margin-bottom:12px;"><label class="checkbox-row" style="margin:0; font-size:13px; cursor:pointer;"><input type="checkbox" id="auth-remember" checked><span>Remember on this device</span></label></div><button class="button button-primary full-width" type="submit">Open dashboard <span>→</span></button><div class="auth-error" id="auth-error"></div></form><div class="auth-note"><span class="lock-icon">⌑</span><span id="auth-note-text">You can enable or disable this token requirement anytime in Settings or in <code>.env</code>.</span></div></div></div>
 </body>
 </html>

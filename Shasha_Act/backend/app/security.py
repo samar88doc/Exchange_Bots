@@ -111,6 +111,8 @@ class SlidingWindowRateLimiter:
 
 async def require_dashboard_auth(request: Request) -> None:
     settings = request.app.state.settings
+    if not getattr(settings, "dashboard_auth_enabled", True):
+        return
     configured = settings.dashboard_api_token
     candidate = request.headers.get("x-dashboard-token")
     if not configured:
@@ -120,3 +122,4 @@ async def require_dashboard_auth(request: Request) -> None:
         )
     if not constant_time_equals(candidate, configured):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Dashboard authentication required")
+

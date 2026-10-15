@@ -25,6 +25,23 @@ from app.shark import SharkApiError, SharkClient, SharkOutcomeUnknown
 from app.symbols import ContractSpec, ContractUnavailable
 
 
+def _normalize_shark_interval(timeframe: str | None) -> str:
+    tf = (timeframe or "15m").strip().lower()
+    if tf in {"15", "15m"}:
+        return "15m"
+    if tf in {"1h", "60", "60m"}:
+        return "1h"
+    if tf in {"4h", "240", "240m"}:
+        return "4h"
+    if tf in {"1d", "d"}:
+        return "1d"
+    if tf in {"5", "5m"}:
+        return "5m"
+    if tf in {"30", "30m"}:
+        return "30m"
+    return "15m"
+
+
 class TradeExecutor:
     def __init__(
         self,
@@ -39,6 +56,31 @@ class TradeExecutor:
         self.market = market
         self.shark = shark
         self.paper = paper
+
+    async def _resolve_entry_price(
+        self, symbol: str, timeframe: str | None, fallback_price: Decimal
+    ) -> tuple[Decimal, str]:
+        source_mode = getattr(self.settings, "entry_price_source", "SHARK_15M_CLOSE").upper()
+        if source_mode == "SIGNAL_PAYLOAD":
+            return fallback_price, "TradingView signal close"
+
+        interval = _normalize_shark_interval(timeframe)
+        try:
+            klines = await self.shark.klines(symbol, interval=interval, limit=2)
+            if isinstance(klines, list) and len(klines) >= 1:
+                completed = klines[0]
+                if isinstance(completed, dict) and completed.get("close"):
+                    close_dec = Decimal(str(completed["close"]))
+                    if close_dec > 0:
+                        return close_dec, f"Shark {interval} completed candle close"
+        except Exception:
+            pass
+
+        ticker = self.market.tickers.get(symbol)
+        if ticker and ticker.last_price > 0:
+            return ticker.last_price, "Shark live ticker last price"
+
+        return fallback_price, "TradingView signal close fallback"
 
     async def process_signal(self, event_id: str) -> None:
         async with self.session_factory() as session:
@@ -114,9 +156,16 @@ class TradeExecutor:
                 control = await session.get(RiskControl, 1)
                 if event is None or trade is None or control is None or trade.status != "QUEUED":
                     return
+
+                # Resolve entry price directly from Shark Exchange completed candle close
+                resolved_entry, entry_source = await self._resolve_entry_price(
+                    trade.symbol, event.timeframe, trade.planned_entry
+                )
+
                 # A long limit buy is rounded down so the submitted limit does not exceed
-                # the previous-candle close supplied by TradingView.
-                trade.planned_entry = round_down_to_step(trade.planned_entry, tick)
+                # the resolved candle close.
+                trade.planned_entry = round_down_to_step(resolved_entry, tick)
+                event.entry_price = trade.planned_entry
                 trade.margin = control.margin_per_trade
                 trade.leverage = control.leverage
                 trade.notional = control.margin_per_trade * Decimal(control.leverage)
@@ -173,13 +222,13 @@ class TradeExecutor:
                                 "entry": str(trade.planned_entry),
                                 "quantity": str(quantity),
                                 "signal_close": str(trade.signal_close),
-                                "entry_price_source": "TradingView previous candle close",
+                                "entry_price_source": entry_source,
                             },
                         )
                     )
                     await session.commit()
                 else:
-                    await self._prepare_live_submission(session, event, trade, control)
+                    await self._prepare_live_submission(session, event, trade, control, entry_source=entry_source)
                     await session.commit()
         except ValidationProblem as exc:
             await self._reject_by_id(event_id, str(exc))
@@ -194,6 +243,8 @@ class TradeExecutor:
         event: SignalEvent,
         trade: Trade,
         control: RiskControl,
+        *,
+        entry_source: str = "Shark limit entry",
     ) -> None:
         if not self.settings.live_server_gate_open or control.live_confirmed_at is None:
             await self._reject(session, event, trade, "LIVE_REQUIRES_ENV_GATE_AND_DASHBOARD_CONFIRMATION")
@@ -269,7 +320,12 @@ class TradeExecutor:
                 action="LIVE_ORDER_SUBMISSION_ARMED",
                 entity_type="trade",
                 entity_id=trade.id,
-                details={"symbol": trade.symbol, "quantity": str(trade.quantity), "price": str(trade.planned_entry)},
+                details={
+                    "symbol": trade.symbol,
+                    "quantity": str(trade.quantity),
+                    "price": str(trade.planned_entry),
+                    "entry_price_source": entry_source,
+                },
             )
         )
 
@@ -472,12 +528,12 @@ class TradeExecutor:
                         exchange_order_id=stop_id,
                         kind="STOP_LOSS",
                         side="SELL",
-                        order_type="STOP_MARKET",
+                        order_type="LIMIT",
                         status="PENDING_CONFIRMATION",
                         quantity=filled_qty,
                         price=levels.stop,
                         reduce_only=True,
-                        request_summary={"exchange": "shark", "protection": "STOP_LOSS"},
+                        request_summary={"exchange": "shark", "protection": "STOP_LOSS", "type": "LIMIT"},
                         submitted_at=datetime.now(UTC),
                     )
                 )
@@ -547,12 +603,12 @@ class TradeExecutor:
                             exchange_order_id=order_id,
                             kind=kind,
                             side="SELL",
-                            order_type="STOP_MARKET",
+                            order_type="LIMIT",
                             status="PENDING_CONFIRMATION",
                             quantity=quantity,
                             price=price,
                             reduce_only=True,
-                            request_summary={"exchange": "shark", "protection": kind},
+                            request_summary={"exchange": "shark", "protection": kind, "type": "LIMIT"},
                             submitted_at=datetime.now(UTC),
                         )
                     )
@@ -597,12 +653,12 @@ class TradeExecutor:
                             exchange_order_id=client_id,
                             kind=kind,
                             side="SELL",
-                            order_type="STOP_MARKET",
+                            order_type="LIMIT",
                             status="NEW",
                             quantity=quantity,
                             price=price,
                             reduce_only=True,
-                            request_summary={"exchange": "shark", "protection": kind},
+                            request_summary={"exchange": "shark", "protection": kind, "type": "LIMIT"},
                             submitted_at=datetime.now(UTC),
                         )
                     )

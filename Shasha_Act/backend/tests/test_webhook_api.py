@@ -50,6 +50,24 @@ def test_webhook_is_tokenized_durable_and_idempotent(
     assert history.json()["items"][0]["signal_close"] == "102.75"
 
 
+def test_webhook_accepts_user_demo_format(test_client: TestClient) -> None:
+    # User's exact demo payload format:
+    # {"symbol": "{{ticker}}", "action": "BUY", "price": "{{close}}", "secret": "demo-webhook-secret-12345"}
+    resp = test_client.post(
+        "/api/webhooks/tradingview",
+        json={
+            "symbol": "BTCUSDT.P",
+            "action": "BUY",
+            "price": "81250.50",
+            "secret": "demo-webhook-secret-12345",
+        },
+    )
+    assert resp.status_code == 202
+    data = resp.json()
+    assert data["accepted"] is True
+    assert data["status"] in ("QUEUED", "ENTRY_PENDING")
+
+
 def test_dashboard_api_requires_auth_but_health_is_safe_and_public(
     test_client: TestClient,
     dashboard_headers: dict[str, str],
@@ -187,3 +205,44 @@ def test_legacy_payload_is_persisted_as_rejected_if_required_fields_are_missing(
     assert len(events) == 1
     assert events[0]["symbol"] is None
     assert "MISSING_SYMBOL" in events[0]["status_reason"]
+
+
+def test_dashboard_auth_enable_disable_feature(
+    test_client: TestClient,
+    dashboard_headers: dict[str, str],
+) -> None:
+    # 1. When auth is enabled, missing token returns 401
+    unauth = test_client.get("/api/settings")
+    assert unauth.status_code == 401
+
+    # 2. Valid token returns 200 and reports dashboard_auth_enabled: True
+    authed = test_client.get("/api/settings", headers=dashboard_headers)
+    assert authed.status_code == 200
+    assert authed.json()["dashboard_auth_enabled"] is True
+
+    # 3. Disable dashboard auth via control API
+    toggle_off = test_client.post(
+        "/api/control/dashboard-auth",
+        headers=dashboard_headers,
+        json={"enabled": False},
+    )
+    assert toggle_off.status_code == 200
+    assert toggle_off.json()["dashboard_auth_enabled"] is False
+
+    # 4. Now requests without token succeed with 200
+    open_access = test_client.get("/api/settings")
+    assert open_access.status_code == 200
+    assert open_access.json()["dashboard_auth_enabled"] is False
+
+    # 5. Enable dashboard auth again
+    toggle_on = test_client.post(
+        "/api/control/dashboard-auth",
+        json={"enabled": True},
+    )
+    assert toggle_on.status_code == 200
+    assert toggle_on.json()["dashboard_auth_enabled"] is True
+
+    # 6. Once re-enabled, missing token returns 401 again
+    unauth_again = test_client.get("/api/settings")
+    assert unauth_again.status_code == 401
+
