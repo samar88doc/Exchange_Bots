@@ -1,0 +1,7 @@
+// Minimal alert block for an existing SHASHA indicator.
+// Keep the indicator's existing `shashaAlertConditionCurrent` calculation unchanged.
+// In TradingView, create the alert using: "Any alert() function call".
+
+if shashaAlertConditionCurrent
+    string shashaJson = '{"strategy":"SHASHA","event_id":"' + syminfo.ticker + '|' + timeframe.period + '|' + str.tostring(time) + '","symbol":"' + syminfo.ticker + '","direction":"LONG","timeframe":"' + timeframe.period + '","bar_time":' + str.tostring(time) + ',"signal_close":"' + str.tostring(close, format.mintick) + '","entry_price":"' + str.tostring(close[1], format.mintick) + '"}'
+    alert(shashaJson, alert.freq_once_per_bar_close)
