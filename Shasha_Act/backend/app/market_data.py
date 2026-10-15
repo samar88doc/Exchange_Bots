@@ -95,7 +95,7 @@ class MarketDataService:
     async def refresh_contracts(self, *, force: bool = False) -> dict[str, ContractSpec]:
         if not force and self.resolver_contracts and time.monotonic() - self._last_metadata_fetch < 300:
             return self.resolver_contracts
-        raw = await self.shark.exchange_info("USDT")
+        raw = await self.shark.exchange_info()
         contracts = parse_exchange_info(raw)
         if not contracts:
             self.last_error = "SHARK_EXCHANGE_INFO_EMPTY_OR_UNRECOGNIZED"
@@ -145,7 +145,7 @@ class MarketDataService:
                 return
         chosen = symbols or [
             name for name, spec in self.resolver_contracts.items()
-            if spec.quote_asset == "USDT" and spec.contract_type == "PERPETUAL"
+            if spec.contract_type in {"PERPETUAL", "TRADIFI_PERPETUAL"}
         ]
         for symbol in chosen[: self.settings.market_data_max_subscriptions]:
             await self.get_ticker(symbol, refresh=True)
@@ -234,7 +234,7 @@ class MarketDataService:
                     self.websocket_error = ""
                     symbols = [
                         name for name, spec in self.resolver_contracts.items()
-                        if spec.quote_asset == "USDT" and spec.contract_type == "PERPETUAL"
+                        if spec.contract_type in {"PERPETUAL", "TRADIFI_PERPETUAL"}
                     ][: self.settings.market_data_max_subscriptions]
                     topics = [f"{symbol.lower()}@ticker" for symbol in symbols]
                     if topics:
@@ -277,7 +277,7 @@ class MarketDataService:
                     await self.refresh_contracts(force=True)
                 symbols = [
                     name for name, spec in self.resolver_contracts.items()
-                    if spec.quote_asset == "USDT" and spec.contract_type == "PERPETUAL"
+                    if spec.contract_type in {"PERPETUAL", "TRADIFI_PERPETUAL"}
                 ][: self.settings.market_data_max_subscriptions]
                 for symbol in symbols:
                     await self.get_ticker(symbol, refresh=True)

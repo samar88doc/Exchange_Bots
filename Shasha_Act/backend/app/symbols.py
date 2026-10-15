@@ -155,7 +155,7 @@ class SymbolResolver:
 
     def resolve(self, symbol: str, margin_asset: str = "USDT") -> ContractSpec:
         spec = self.get(symbol)
-        if spec.contract_type != "PERPETUAL":
+        if spec.contract_type not in {"PERPETUAL", "TRADIFI_PERPETUAL"}:
             raise ContractUnavailable("CONTRACT_IS_NOT_PERPETUAL")
         if spec.quote_asset != "USDT":
             raise ContractUnavailable("CONTRACT_QUOTE_ASSET_IS_NOT_USDT")

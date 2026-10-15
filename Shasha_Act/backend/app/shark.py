@@ -152,8 +152,9 @@ class SharkClient:
         return result
 
     # ---------------------------- public market/contract data
-    async def exchange_info(self, market: str = "USDT") -> Any:
-        return await self._request("GET", "/v1/exchange/exchangeInfo", query=[("market", market)])
+    async def exchange_info(self, market: str | None = None) -> Any:
+        query = [("market", market)] if market else []
+        return await self._request("GET", "/v1/exchange/exchangeInfo", query=query)
 
     async def ticker_24h(self, symbol: str) -> Any:
         clean = symbol.upper()
