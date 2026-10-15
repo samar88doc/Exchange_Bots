@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.accounts import (
@@ -921,13 +921,44 @@ async def overview(
                 )
             ).all()
         )
-        wins = sum(1 for t in trades_for_pnl if (t.net_realized_pnl or Decimal("0")) > 0)
-        losses = sum(1 for t in trades_for_pnl if (t.net_realized_pnl or Decimal("0")) < 0)
+        winning_trades = [t for t in trades_for_pnl if (t.net_realized_pnl or Decimal("0")) > 0]
+        losing_trades = [t for t in trades_for_pnl if (t.net_realized_pnl or Decimal("0")) < 0]
+        wins = len(winning_trades)
+        losses = len(losing_trades)
         closed_today = len(trades_for_pnl)
+        win_sum = sum((t.net_realized_pnl for t in winning_trades if t.net_realized_pnl is not None), Decimal("0"))
+        loss_sum = sum((t.net_realized_pnl for t in losing_trades if t.net_realized_pnl is not None), Decimal("0"))
+        avg_profit_today = (win_sum / wins) if wins > 0 else Decimal("0")
+        avg_loss_today = (loss_sum / losses) if losses > 0 else Decimal("0")
+        avg_pnl_today = (daily_pnl / closed_today) if closed_today > 0 else Decimal("0")
     else:
         wins = 0
         losses = 0
         closed_today = 0
+        avg_profit_today = Decimal("0")
+        avg_loss_today = Decimal("0")
+        avg_pnl_today = Decimal("0")
+
+    # All-time stats for the active trading mode
+    all_mode_exited_trades = list(
+        (
+            await session.scalars(
+                select(Trade).where(
+                    Trade.mode == mode,
+                    Trade.net_realized_pnl.is_not(None),
+                    Trade.net_realized_pnl != Decimal("0"),
+                )
+            )
+        ).all()
+    )
+    all_wins = [t for t in all_mode_exited_trades if (t.net_realized_pnl or Decimal("0")) > 0]
+    all_losses = [t for t in all_mode_exited_trades if (t.net_realized_pnl or Decimal("0")) < 0]
+    all_win_sum = sum((t.net_realized_pnl for t in all_wins if t.net_realized_pnl is not None), Decimal("0"))
+    all_loss_sum = sum((t.net_realized_pnl for t in all_losses if t.net_realized_pnl is not None), Decimal("0"))
+    all_net_sum = sum((t.net_realized_pnl for t in all_mode_exited_trades if t.net_realized_pnl is not None), Decimal("0"))
+    all_avg_profit = (all_win_sum / len(all_wins)) if all_wins else Decimal("0")
+    all_avg_loss = (all_loss_sum / len(all_losses)) if all_losses else Decimal("0")
+    all_avg_pnl = (all_net_sum / len(all_mode_exited_trades)) if all_mode_exited_trades else Decimal("0")
     trades_today = int(
         await session.scalar(
             select(func.count()).select_from(Trade).where(
@@ -978,6 +1009,9 @@ async def overview(
             "gross": _str(pnl_breakdown["gross"]),
             "fees_today": _str(pnl_breakdown["fees_paid"]),
             "funding_today": _str(pnl_breakdown["funding_paid"]),
+            "average_profit": _str(avg_profit_today),
+            "average_loss": _str(avg_loss_today),
+            "average_pnl": _str(avg_pnl_today),
             "unrealized": _str(active_unrealized) if active_prices_available else None,
             "unrealized_status": "AVAILABLE" if active_prices_available else "STALE_OR_UNAVAILABLE_MARKET_DATA",
             "total": _str(daily_pnl + active_unrealized) if active_prices_available else None,
@@ -993,6 +1027,19 @@ async def overview(
         "closed_today": closed_today,
         "wins_today": wins,
         "losses_today": losses,
+        "avg_profit_today": _str(avg_profit_today),
+        "avg_loss_today": _str(avg_loss_today),
+        "avg_pnl_today": _str(avg_pnl_today),
+        "all_time_stats": {
+            "total_trades": len(all_mode_exited_trades),
+            "winning_trades": len(all_wins),
+            "losing_trades": len(all_losses),
+            "win_rate": round(len(all_wins) / len(all_mode_exited_trades) * 100, 2) if all_mode_exited_trades else 0,
+            "total_net_pnl": _str(all_net_sum),
+            "avg_profit": _str(all_avg_profit),
+            "avg_loss": _str(all_avg_loss),
+            "avg_pnl": _str(all_avg_pnl),
+        },
         "open_positions": sum(
             value for key, value in statuses.items()
             if key in {"OPEN", "PARTIALLY_CLOSED", "PROTECTION_ERROR", "CLOSING", "ENTRY_PARTIAL"}
@@ -1067,6 +1114,10 @@ async def positions(
                 pass
 
     total_net_profit = total_realized + total_unrealized
+    pos_count = len(output)
+    avg_realized = (total_realized / pos_count) if pos_count > 0 else Decimal("0")
+    avg_unrealized = (total_unrealized / pos_count) if pos_count > 0 else Decimal("0")
+    avg_net_profit = (total_net_profit / pos_count) if pos_count > 0 else Decimal("0")
 
     return {
         "items": output,
@@ -1076,6 +1127,10 @@ async def positions(
             "total_unrealized_pnl": _str(total_unrealized) if has_unrealized else "0.00",
             "total_net_profit_pnl": _str(total_net_profit),
             "total_margin": _str(total_margin),
+            "avg_realized_pnl": _str(avg_realized),
+            "avg_unrealized_pnl": _str(avg_unrealized) if has_unrealized else "0.00",
+            "avg_net_profit_pnl": _str(avg_net_profit),
+            "avg_profit_loss": _str(avg_net_profit),
         },
         "updated_at": datetime.now(UTC).isoformat(),
     }
@@ -1214,11 +1269,45 @@ async def history(
     trades = await session.scalars(
         select(Trade).where(*criteria).order_by(Trade.created_at.desc()).limit(limit).offset(offset)
     )
+    items = [_trade_payload(trade, None, 0) for trade in trades.all()]
+
+    matching_all = list(
+        (
+            await session.scalars(
+                select(Trade).where(*criteria)
+            )
+        ).all()
+    )
+    hist_wins = [t for t in matching_all if (t.net_realized_pnl or Decimal("0")) > 0]
+    hist_losses = [t for t in matching_all if (t.net_realized_pnl or Decimal("0")) < 0]
+    hist_total_net = sum((t.net_realized_pnl for t in matching_all if t.net_realized_pnl is not None), Decimal("0"))
+    hist_total_gross = sum((t.gross_realized_pnl for t in matching_all if t.gross_realized_pnl is not None), Decimal("0"))
+    hist_total_fees = sum((t.fees_paid for t in matching_all if t.fees_paid is not None), Decimal("0"))
+    hist_win_sum = sum((t.net_realized_pnl for t in hist_wins if t.net_realized_pnl is not None), Decimal("0"))
+    hist_loss_sum = sum((t.net_realized_pnl for t in hist_losses if t.net_realized_pnl is not None), Decimal("0"))
+    hist_closed = len(hist_wins) + len(hist_losses)
+    hist_avg_profit = (hist_win_sum / len(hist_wins)) if hist_wins else Decimal("0")
+    hist_avg_loss = (hist_loss_sum / len(hist_losses)) if hist_losses else Decimal("0")
+    hist_avg_pnl = (hist_total_net / hist_closed) if hist_closed > 0 else Decimal("0")
+
     return {
-        "items": [_trade_payload(trade, None, 0) for trade in trades.all()],
+        "items": items,
         "total": total,
         "limit": limit,
         "offset": offset,
+        "summary": {
+            "total_trades": total,
+            "closed_trades": hist_closed,
+            "winning_trades": len(hist_wins),
+            "losing_trades": len(hist_losses),
+            "win_rate": round(len(hist_wins) / hist_closed * 100, 2) if hist_closed > 0 else 0,
+            "total_net_pnl": _str(hist_total_net),
+            "total_gross_pnl": _str(hist_total_gross),
+            "total_fees": _str(hist_total_fees),
+            "avg_profit": _str(hist_avg_profit),
+            "avg_loss": _str(hist_avg_loss),
+            "avg_pnl": _str(hist_avg_pnl),
+        },
     }
 
 

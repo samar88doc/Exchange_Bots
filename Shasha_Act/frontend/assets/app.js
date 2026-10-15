@@ -389,6 +389,46 @@
         : `${esc(overview.market_day || "")} market day · unrealized Unavailable (stale market data)`;
     }
 
+    const avgPnlNode = $("#kpi-avg-pnl");
+    const avgWinNode = $("#kpi-avg-win");
+    const avgLossNode = $("#kpi-avg-loss");
+    const closedToday = overview.closed_today ?? ((overview.wins_today || 0) + (overview.losses_today || 0));
+    const avgPnl = toNumber(overview.avg_pnl_today ?? day.average_pnl);
+    const avgWin = toNumber(overview.avg_profit_today ?? day.average_profit);
+    const avgLoss = toNumber(overview.avg_loss_today ?? day.average_loss);
+
+    if (closedToday > 0 && avgPnl !== null) {
+      if (avgPnlNode) {
+        avgPnlNode.textContent = fmtMoney(avgPnl, "USDT", true);
+        avgPnlNode.className = `kpi-value ${pnlClass(avgPnl)}`;
+      }
+      if (avgWinNode) avgWinNode.textContent = avgWin !== null ? fmtMoney(avgWin, "USDT", true) : "—";
+      if (avgLossNode) avgLossNode.textContent = avgLoss !== null ? fmtMoney(avgLoss, "USDT", true) : "—";
+      if (noteNode && avgPnl !== null) {
+        noteNode.textContent += ` · Avg ${fmtMoney(avgPnl, "USDT", true)}/tr`;
+      }
+    } else {
+      const allStats = overview.all_time_stats;
+      if (allStats && allStats.total_trades > 0) {
+        const allAvgPnl = toNumber(allStats.avg_pnl);
+        const allAvgWin = toNumber(allStats.avg_profit);
+        const allAvgLoss = toNumber(allStats.avg_loss);
+        if (avgPnlNode) {
+          avgPnlNode.textContent = allAvgPnl !== null ? fmtMoney(allAvgPnl, "USDT", true) : "—";
+          avgPnlNode.className = `kpi-value ${pnlClass(allAvgPnl)}`;
+        }
+        if (avgWinNode) avgWinNode.textContent = allAvgWin !== null ? fmtMoney(allAvgWin, "USDT", true) : "—";
+        if (avgLossNode) avgLossNode.textContent = allAvgLoss !== null ? fmtMoney(allAvgLoss, "USDT", true) : "—";
+      } else {
+        if (avgPnlNode) {
+          avgPnlNode.textContent = "—";
+          avgPnlNode.className = "kpi-value";
+        }
+        if (avgWinNode) avgWinNode.textContent = "—";
+        if (avgLossNode) avgLossNode.textContent = "—";
+      }
+    }
+
     $("#kpi-open").textContent = String(overview.open_positions ?? 0);
     $("#kpi-open-note").textContent = overview.open_positions
       ? `${overview.pending_entries || 0} pending · ${overview.unknown_or_attention || 0} need attention`
@@ -693,6 +733,17 @@
       $("#pos-kpi-net").textContent = fmtMoney(totalNetProfit, "USDT", true);
       $("#pos-kpi-net").className = `kpi-value ${pnlClass(totalNetProfit)}`;
     }
+    const avgNetProfit = openCount > 0 ? (totalNetProfit / openCount) : 0;
+    if ($("#pos-kpi-avg")) {
+      $("#pos-kpi-avg").textContent = openCount > 0 ? fmtMoney(avgNetProfit, "USDT", true) : "—";
+      $("#pos-kpi-avg").className = `kpi-value ${openCount > 0 ? pnlClass(avgNetProfit) : ""}`;
+    }
+    if ($("#pos-kpi-avg-note")) {
+      $("#pos-kpi-avg-note").textContent = `${openCount} active position${openCount === 1 ? "" : "s"}`;
+    }
+    if ($("#pos-kpi-net-note")) {
+      $("#pos-kpi-net-note").textContent = openCount > 0 ? `Realized + Unrealized · Avg ${fmtMoney(avgNetProfit, "USDT", true)}/pos` : "Realized + Unrealized";
+    }
     if ($("#pos-kpi-margin")) {
       $("#pos-kpi-margin").textContent = fmtMoney(totalMargin, "USDT");
       const note = $("#pos-kpi-count-note");
@@ -770,7 +821,7 @@
       }).join("");
     }
     renderPendingEntries();
-    $("#positions-full-footer").textContent = `${state.positions.length} tracked position${state.positions.length === 1 ? "" : "s"} · ${state.pendingEntries.length} pending entr${state.pendingEntries.length === 1 ? "y" : "ies"}`;
+    $("#positions-full-footer").textContent = `${openCount} active position${openCount === 1 ? "" : "s"} · Net Profit: ${fmtMoney(totalNetProfit, "USDT", true)} · Avg P&L / Pos: ${fmtMoney(avgNetProfit, "USDT", true)}`;
   }
 
   function renderPendingEntries() {
@@ -956,10 +1007,54 @@
     const data = await api(`/api/history?${params}`, { silent: true });
     state.history = data.items || [];
     state.historyTotal = data.total ?? state.history.length;
+    state.historySummary = data.summary || null;
     renderHistory();
   }
 
   function renderHistory() {
+    const s = state.historySummary;
+    if (s) {
+      const net = toNumber(s.total_net_pnl) ?? 0;
+      const avgPnl = toNumber(s.avg_pnl) ?? 0;
+      const avgWin = toNumber(s.avg_profit) ?? 0;
+      const avgLoss = toNumber(s.avg_loss) ?? 0;
+
+      if ($("#hist-kpi-net")) {
+        $("#hist-kpi-net").textContent = fmtMoney(net, "USDT", true);
+        $("#hist-kpi-net").className = `kpi-value ${pnlClass(net)}`;
+      }
+      if ($("#hist-kpi-gross-note")) {
+        $("#hist-kpi-gross-note").textContent = `Gross ${fmtMoney(s.total_gross_pnl)} · Fees ${fmtMoney(s.total_fees)}`;
+      }
+      if ($("#hist-kpi-avg")) {
+        $("#hist-kpi-avg").textContent = s.closed_trades > 0 ? fmtMoney(avgPnl, "USDT", true) : "—";
+        $("#hist-kpi-avg").className = `kpi-value ${s.closed_trades > 0 ? pnlClass(avgPnl) : ""}`;
+      }
+      if ($("#hist-kpi-avg-note")) {
+        $("#hist-kpi-avg-note").textContent = `${s.closed_trades} closed trade${s.closed_trades === 1 ? "" : "s"}`;
+      }
+      if ($("#hist-kpi-win")) {
+        $("#hist-kpi-win").textContent = s.winning_trades > 0 ? fmtMoney(avgWin, "USDT", true) : "—";
+        $("#hist-kpi-win").className = `kpi-value ${s.winning_trades > 0 ? "positive" : ""}`;
+      }
+      if ($("#hist-kpi-win-count")) {
+        $("#hist-kpi-win-count").textContent = `${s.winning_trades} winning trade${s.winning_trades === 1 ? "" : "s"}`;
+      }
+      if ($("#hist-kpi-loss")) {
+        $("#hist-kpi-loss").textContent = s.losing_trades > 0 ? fmtMoney(avgLoss, "USDT", true) : "—";
+        $("#hist-kpi-loss").className = `kpi-value ${s.losing_trades > 0 ? "negative" : ""}`;
+      }
+      if ($("#hist-kpi-loss-count")) {
+        $("#hist-kpi-loss-count").textContent = `${s.losing_trades} losing trade${s.losing_trades === 1 ? "" : "s"}`;
+      }
+      if ($("#hist-kpi-win-rate")) {
+        $("#hist-kpi-win-rate").textContent = s.closed_trades > 0 ? `${s.win_rate}%` : "—";
+      }
+      if ($("#hist-kpi-trades-count")) {
+        $("#hist-kpi-trades-count").textContent = `${s.total_trades} total trades`;
+      }
+    }
+
     const body = $("#history-rows");
     if (!state.history.length) { body.innerHTML = `<tr><td colspan="11" class="empty-cell">No trades recorded for ${esc(state.historyMode)} mode.</td></tr>`; }
     else {
@@ -1959,6 +2054,14 @@
     setView(state.view);
     $("#market-direction-label").textContent = state.marketOrder.toUpperCase();
     await loadPublicConfig();
+    const urlToken = new URLSearchParams(window.location.search).get("token") || new URLSearchParams(window.location.hash.slice(1)).get("token");
+    if (urlToken) {
+      state.serverToken = urlToken.trim();
+      localStorage.setItem(TOKEN_STORAGE_KEY, state.serverToken);
+      localStorage.removeItem(SESSION_STORAGE_KEY);
+      state.sessionToken = "";
+      state.authMethod = "SERVER_TOKEN";
+    }
     if (!state.sessionToken && !state.serverToken) { showAuth(); return; }
     try {
       await loadIdentity();

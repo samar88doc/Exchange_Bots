@@ -6,8 +6,8 @@
   <meta name="color-scheme" content="dark">
   <meta name="theme-color" content="#050711">
   <title>Shasha Act — Neural Trading Operations</title>
-  <link rel="stylesheet" href="/assets/styles.css?v=20261015_09">
-  <script defer src="/assets/app.js?v=20261015_09"></script>
+  <link rel="stylesheet" href="/assets/styles.css?v=20261016_01">
+  <script defer src="/assets/app.js?v=20261016_01"></script>
 </head>
 <body>
   <canvas id="neural-field" aria-hidden="true"></canvas>
@@ -103,6 +103,17 @@
             <div class="kpi-label"><span>NET P&amp;L TODAY</span><span class="info-dot" title="Market-local realized net P&L from persisted fills; paper and live ledgers stay separate">i</span></div>
             <div class="kpi-value" id="kpi-day-pnl" data-count="0">—</div>
             <div class="kpi-foot"><span id="kpi-day-pnl-note">Awaiting persisted fill data</span><span class="kpi-spark" id="kpi-spark"><svg viewBox="0 0 120 28" preserveAspectRatio="none"><polyline id="kpi-spark-line" points=""></polyline></svg></span></div>
+            <div class="kpi-glow"></div>
+          </article>
+          <article class="kpi-card" data-accent="teal">
+            <div class="kpi-label"><span>AVG PROFIT / LOSS</span><span class="info-dot" title="Average net P&amp;L per trade today with average win and loss breakdown">i</span></div>
+            <div class="kpi-value" id="kpi-avg-pnl">—</div>
+            <div class="kpi-foot">
+              <span class="avg-subtext" id="kpi-avg-pnl-note">
+                <span class="avg-pill win">Win: <b id="kpi-avg-win">—</b></span>
+                <span class="avg-pill loss">Loss: <b id="kpi-avg-loss">—</b></span>
+              </span>
+            </div>
             <div class="kpi-glow"></div>
           </article>
           <article class="kpi-card" data-accent="violet">
@@ -285,6 +296,12 @@
             <div class="kpi-foot"><span id="pos-kpi-net-note">Realized + Unrealized</span></div>
             <div class="kpi-glow"></div>
           </article>
+          <article class="kpi-card" data-accent="teal">
+            <div class="kpi-label"><span>AVG PROFIT / LOSS</span><span class="info-dot" title="Average net profit per active position">i</span></div>
+            <div class="kpi-value" id="pos-kpi-avg">—</div>
+            <div class="kpi-foot"><span id="pos-kpi-avg-note">Per active position</span></div>
+            <div class="kpi-glow"></div>
+          </article>
           <article class="kpi-card" data-accent="violet">
             <div class="kpi-label"><span>TOTAL MARGIN</span><span class="kpi-icon icon-violet">⌖</span></div>
             <div class="kpi-value" id="pos-kpi-margin">—</div>
@@ -400,6 +417,38 @@
             <div class="segmented" id="history-mode"><button class="selected" data-mode="PAPER">PAPER</button><button data-mode="LIVE">LIVE</button></div>
             <a class="button button-secondary" id="csv-export" href="/api/history.csv" download>Export CSV <span>↓</span></a>
           </div>
+        </div>
+        <div class="kpi-grid history-kpis">
+          <article class="kpi-card" data-accent="cyan">
+            <div class="kpi-label"><span>TOTAL NET P&amp;L</span><span class="info-dot" title="Total net realized P&amp;L across all trades in ledger">i</span></div>
+            <div class="kpi-value" id="hist-kpi-net">—</div>
+            <div class="kpi-foot"><span id="hist-kpi-gross-note">Gross — · Fees —</span></div>
+            <div class="kpi-glow"></div>
+          </article>
+          <article class="kpi-card" data-accent="teal">
+            <div class="kpi-label"><span>AVG PROFIT / LOSS</span><span class="info-dot" title="Average net P&amp;L per closed trade">i</span></div>
+            <div class="kpi-value" id="hist-kpi-avg">—</div>
+            <div class="kpi-foot"><span id="hist-kpi-avg-note">Per closed trade</span></div>
+            <div class="kpi-glow"></div>
+          </article>
+          <article class="kpi-card" data-accent="green">
+            <div class="kpi-label"><span>AVERAGE WIN</span><span class="info-dot" title="Average net profit of winning trades">i</span></div>
+            <div class="kpi-value" id="hist-kpi-win">—</div>
+            <div class="kpi-foot"><span id="hist-kpi-win-count">— winning trades</span></div>
+            <div class="kpi-glow"></div>
+          </article>
+          <article class="kpi-card" data-accent="rose">
+            <div class="kpi-label"><span>AVERAGE LOSS</span><span class="info-dot" title="Average net loss of losing trades">i</span></div>
+            <div class="kpi-value" id="hist-kpi-loss">—</div>
+            <div class="kpi-foot"><span id="hist-kpi-loss-count">— losing trades</span></div>
+            <div class="kpi-glow"></div>
+          </article>
+          <article class="kpi-card" data-accent="amber">
+            <div class="kpi-label"><span>WIN RATE</span><span class="kpi-icon icon-amber">◌</span></div>
+            <div class="kpi-value" id="hist-kpi-win-rate">—</div>
+            <div class="kpi-foot"><span id="hist-kpi-trades-count">— total trades</span></div>
+            <div class="kpi-glow"></div>
+          </article>
         </div>
         <section class="panel table-panel">
           <div class="table-scroll tall">
