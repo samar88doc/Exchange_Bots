@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0a1020">
+  <title>Shasha Act — Trading Operations</title>
+  <link rel="stylesheet" href="/assets/styles.css">
+  <script defer src="/assets/app.js"></script>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar">
+      <a class="brand" href="#dashboard" aria-label="Shasha Act dashboard">
+        <span class="brand-mark"><span></span><span></span><span></span></span>
+        <span class="brand-copy"><strong>SHASHA<span>ACT</span></strong><small>TRADING OPERATIONS</small></span>
+      </a>
+      <div class="workspace-label">WORKSPACE</div>
+      <nav class="main-nav" aria-label="Main navigation">
+        <button class="nav-item active" data-view="dashboard"><span class="nav-icon">◫</span><span>Overview</span><span class="nav-trail"></span></button>
+        <button class="nav-item" data-view="positions"><span class="nav-icon">⌖</span><span>Positions</span><span class="nav-count" id="nav-open-count">—</span></button>
+        <button class="nav-item" data-view="markets"><span class="nav-icon">⌁</span><span>Markets</span></button>
+        <button class="nav-item" data-view="signals"><span class="nav-icon">⌘</span><span>Signals</span></button>
+        <button class="nav-item" data-view="history"><span class="nav-icon">▤</span><span>Trade history</span></button>
+      </nav>
+      <div class="sidebar-divider"></div>
+      <div class="workspace-label">SYSTEM</div>
+      <nav class="main-nav">
+        <button class="nav-item" data-view="settings"><span class="nav-icon">⚙</span><span>Settings</span></button>
+      </nav>
+      <div class="sidebar-spacer"></div>
+      <div class="sidebar-status">
+        <div class="sidebar-status-head"><span class="status-dot" id="sidebar-dot"></span><span id="sidebar-health">Connecting</span><button class="icon-button tiny" id="refresh-button" aria-label="Refresh" title="Refresh">↻</button></div>
+        <div class="sidebar-status-detail" id="sidebar-market">Market feed status unavailable</div>
+      </div>
+      <div class="user-block">
+        <div class="avatar">SA</div><div class="user-copy"><strong>Shasha Act</strong><small>Trading workspace</small></div>
+        <button class="icon-button tiny" id="signout-button" title="Forget dashboard token" aria-label="Forget dashboard token">↗</button>
+      </div>
+    </aside>
+
+    <main class="main-content">
+      <header class="topbar">
+        <button class="icon-button mobile-menu" id="mobile-menu" aria-label="Toggle navigation">☰</button>
+        <div class="breadcrumbs"><span>Shasha Act</span><b>/</b><strong id="page-crumb">Overview</strong></div>
+        <div class="topbar-right">
+          <div class="market-clock"><span class="status-dot" id="clock-dot"></span><span id="market-clock-label">MARKET DAY</span><strong id="market-clock">—</strong></div>
+          <span class="mode-pill paper" id="mode-pill"><i></i><span>PAPER MODE</span></span>
+          <button class="button button-danger button-compact" id="pause-button">Pause trading</button>
+        </div>
+      </header>
+
+      <section class="page active" id="view-dashboard">
+        <div class="page-heading">
+          <div><div class="eyebrow">SHASHA STRATEGY · OPERATIONS</div><h1>Good trading, <span class="heading-accent">stay in control.</span></h1><p class="subheading">Monitor signal flow, risk and confirmed positions in one place.</p></div>
+          <div class="heading-actions"><span class="updated-label">UPDATED <strong id="last-updated">—</strong></span><button class="button button-secondary" data-view="signals">View signal log <span>↗</span></button></div>
+        </div>
+
+        <div class="alert-banner hidden" id="system-alert"><span class="alert-icon">!</span><div><strong id="system-alert-title">System attention</strong><p id="system-alert-copy"></p></div><button class="icon-button" id="dismiss-alert" aria-label="Dismiss alert">×</button></div>
+
+        <div class="kpi-grid">
+          <article class="kpi-card kpi-main"><div class="kpi-label"><span>NET P&L TODAY</span><span class="info-dot" title="Market-local realized P&L from persisted fills; paper and live are separate">i</span></div><div class="kpi-value" id="kpi-day-pnl">—</div><div class="kpi-foot"><span id="kpi-day-pnl-note">Awaiting persisted fill data</span><span class="kpi-spark" id="kpi-spark"></span></div><div class="kpi-glow"></div></article>
+          <article class="kpi-card"><div class="kpi-label"><span>OPEN POSITIONS</span><span class="kpi-icon icon-violet">⌖</span></div><div class="kpi-value" id="kpi-open">—</div><div class="kpi-foot"><span id="kpi-open-note">Positions awaiting sync</span><span class="kpi-link" data-view="positions">Details <b>→</b></span></div></article>
+          <article class="kpi-card"><div class="kpi-label"><span>SIGNALS TODAY</span><span class="kpi-icon icon-blue">⌘</span></div><div class="kpi-value" id="kpi-signals">—</div><div class="kpi-foot"><span id="kpi-signal-note">TradingView ingress</span><span class="kpi-link" data-view="signals">View log <b>→</b></span></div></article>
+          <article class="kpi-card"><div class="kpi-label"><span>WIN RATE TODAY</span><span class="kpi-icon icon-amber">◌</span></div><div class="kpi-value" id="kpi-win-rate">—</div><div class="kpi-foot"><span id="kpi-win-note">Closed trades only</span><span class="muted">Market-local day</span></div></article>
+        </div>
+
+        <div class="dashboard-grid">
+          <section class="panel performance-panel">
+            <div class="panel-head"><div><div class="panel-title">Performance</div><div class="panel-caption">Realized net P&L · <span id="performance-mode">PAPER</span></div></div><div class="segmented" id="performance-range"><button class="selected" data-days="30">30D</button><button data-days="7">7D</button></div></div>
+            <div class="chart-summary"><strong id="performance-total">—</strong><span id="performance-period">Last 30 days · fees included</span></div>
+            <div class="chart-wrap"><div class="chart-y-labels"><span id="chart-max">—</span><span id="chart-mid">—</span><span id="chart-min">—</span></div><div class="chart-area"><div class="chart-gridline grid-top"></div><div class="chart-gridline grid-middle"></div><div class="chart-gridline grid-bottom"></div><div class="zero-line" id="chart-zero"></div><div class="bar-chart" id="performance-chart" aria-label="Daily realized P and L chart"></div></div></div>
+            <div class="chart-x-labels"><span id="chart-start">—</span><span id="chart-end">—</span></div>
+            <div class="chart-footnote"><span class="legend-dot"></span>Daily realized net <span class="chart-note">Funding data not included unless available</span></div>
+          </section>
+
+          <section class="panel system-panel">
+            <div class="panel-head"><div><div class="panel-title">System status</div><div class="panel-caption">Core services & connectivity</div></div><span class="live-indicator"><i></i>LIVE SYNC</span></div>
+            <div class="system-overall" id="system-overall"><span class="system-orbit"><i></i></span><div><strong>Checking services</strong><small>Health is based on observed service state</small></div></div>
+            <div class="service-list" id="service-list"><div class="service-row loading-line"></div><div class="service-row loading-line"></div><div class="service-row loading-line"></div></div>
+            <div class="system-foot"><span>Last health check</span><strong id="health-checked-at">—</strong></div>
+          </section>
+        </div>
+
+        <section class="panel table-panel positions-panel">
+          <div class="panel-head table-panel-head"><div><div class="panel-title">Open positions</div><div class="panel-caption">Exchange-confirmed status · stale prices are marked unavailable</div></div><div class="panel-actions"><span class="count-chip" id="positions-count">—</span><button class="button button-secondary button-small" data-view="positions">All positions <span>→</span></button></div></div>
+          <div class="table-scroll"><table><thead><tr><th>CONTRACT</th><th>ENTRY / LAST</th><th>SIZE</th><th>LEVERAGE</th><th>UNREALIZED P&L</th><th>PROTECTION</th><th>STATUS</th><th></th></tr></thead><tbody id="dashboard-position-rows"><tr><td colspan="8" class="empty-cell"><span class="spinner"></span>Loading positions</td></tr></tbody></table></div>
+          <div class="table-footer"><span id="positions-footer">No position snapshot</span><span>Public last price · not mark price</span></div>
+        </section>
+
+        <section class="panel table-panel recent-signals-panel">
+          <div class="panel-head table-panel-head"><div><div class="panel-title">Recent signals</div><div class="panel-caption">Durable TradingView event and outbox state</div></div><div class="panel-actions"><button class="button button-ghost button-small" data-view="signals">Open signal log <span>→</span></button></div></div>
+          <div class="table-scroll"><table><thead><tr><th>RECEIVED</th><th>TRADINGVIEW</th><th>SHARK CONTRACT</th><th>ENTRY PLAN</th><th>MODE</th><th>STATUS</th><th>NOTIFICATIONS</th></tr></thead><tbody id="dashboard-event-rows"><tr><td colspan="7" class="empty-cell"><span class="spinner"></span>Loading signals</td></tr></tbody></table></div>
+        </section>
+
+        <footer class="page-foot"><span>Shasha_Act <b>·</b> PAPER-first execution console</span><span>Prices, fills and P&amp;L are estimates unless exchange-confirmed.</span></footer>
+      </section>
+
+      <section class="page" id="view-positions">
+        <div class="page-heading compact-heading"><div><div class="eyebrow">RISK & EXPOSURE</div><h1>Positions</h1><p class="subheading">Only confirmed or unresolved exposure is shown. No price is fabricated.</p></div><div class="heading-actions"><button class="button button-secondary" id="cancel-pending-button">Cancel pending entries</button></div></div>
+        <div class="positions-summary" id="position-summary"></div>
+        <section class="panel table-panel"><div class="panel-head table-panel-head"><div><div class="panel-title">Pending limit entries</div><div class="panel-caption">Queued/submitted entries are not open positions; cancel only after checking the state.</div></div><span class="count-chip" id="pending-entry-count">—</span></div><div class="table-scroll"><table><thead><tr><th>CONTRACT</th><th>LIMIT PLAN</th><th>QTY</th><th>EXPIRES</th><th>MODE</th><th>STATUS</th><th>ACTION</th></tr></thead><tbody id="pending-entry-rows"><tr><td colspan="7" class="empty-cell">Loading pending entries.</td></tr></tbody></table></div></section>
+        <section class="panel table-panel"><div class="panel-head table-panel-head"><div><div class="panel-title">Position ledger</div><div class="panel-caption">Open, partially closed and attention-required trades</div></div></div><div class="table-scroll"><table class="wide-table"><thead><tr><th>CONTRACT</th><th>ENTRY PLAN / FILL</th><th>LAST PRICE</th><th>QTY LEFT</th><th>MARGIN / NOTIONAL</th><th>U-P&L / ROI</th><th>LIQ. PRICE</th><th>STOP / TARGETS</th><th>PROTECTION</th><th>STATUS</th><th>ACTIONS</th></tr></thead><tbody id="position-rows"><tr><td colspan="11" class="empty-cell"><span class="spinner"></span>Loading positions</td></tr></tbody></table></div></section>
+        <section class="panel attention-panel"><div class="panel-head"><div><div class="panel-title">Safety notes</div><div class="panel-caption">Execution behavior</div></div><span class="badge badge-amber">READ BEFORE ACTION</span></div><ul class="safety-list"><li>Pending LIMIT orders are not open positions; fill state is confirmed separately.</li><li>Cancel and close actions remain pending until Shark confirms the final order state.</li><li>LIVE position-level risk edits stay disabled until contract filters and split protection semantics are verified.</li><li>Unrealized P&amp;L uses the last public price where fresh; it is not a mark-price or liquidation estimate.</li></ul></section>
+      </section>
+
+      <section class="page" id="view-markets">
+        <div class="page-heading compact-heading"><div><div class="eyebrow">PUBLIC MARKET DATA</div><h1>Markets</h1><p class="subheading">Shark 24-hour ticker stream and REST fallback. Change is not a 24-hour chart.</p></div><div class="heading-actions"><span class="feed-pill" id="market-feed-pill"><i></i><span>Feed status unavailable</span></span></div></div>
+        <section class="panel market-panel"><div class="panel-head"><div><div class="panel-title">USDT perpetual watch</div><div class="panel-caption" id="market-note">No market data has been received yet.</div></div><div class="panel-actions"><label class="search-field"><span>⌕</span><input id="market-search" type="search" placeholder="Search contract" maxlength="64"></label><select class="select-control" id="market-sort"><option value="symbol">Symbol</option><option value="change_24h_percent">24h change</option><option value="volume_24h">24h volume</option><option value="last_price">Last price</option></select></div></div><div class="table-scroll"><table><thead><tr><th>CONTRACT</th><th>LAST PRICE</th><th>24H CHANGE</th><th>24H HIGH / LOW</th><th>24H VOLUME</th><th>SOURCE</th><th>UPDATED</th></tr></thead><tbody id="market-rows"><tr><td colspan="7" class="empty-cell">Market feed has not provided a current snapshot.</td></tr></tbody></table></div></section>
+        <div class="inline-note"><span class="note-icon">i</span><span>Prices and volume are reported exactly as observed from the Shark public ticker. A missing or stale value is shown as unavailable.</span></div>
+      </section>
+
+      <section class="page" id="view-signals">
+        <div class="page-heading compact-heading"><div><div class="eyebrow">INGRESS & DELIVERY</div><h1>Signal log</h1><p class="subheading">Every authenticated webhook is persisted, deduplicated and traceable through the outbox.</p></div><div class="heading-actions"><button class="button button-secondary" id="signals-refresh">Refresh log <span>↻</span></button></div></div>
+        <section class="panel table-panel"><div class="panel-head table-panel-head"><div><div class="panel-title">TradingView events</div><div class="panel-caption">Events with parser, risk, execution and notification outcomes</div></div><div class="panel-actions"><select class="select-control" id="event-status-filter"><option value="">All statuses</option><option>QUEUED</option><option>ENTRY_PENDING</option><option>OPEN</option><option>REJECTED</option><option>UNKNOWN</option><option>PROTECTION_ERROR</option><option>CLOSED</option></select><label class="search-field"><span>⌕</span><input id="event-symbol-filter" type="search" placeholder="Filter symbol" maxlength="64"></label></div></div><div class="table-scroll"><table><thead><tr><th>RECEIVED</th><th>EVENT / STRATEGY</th><th>TRADINGVIEW → SHARK</th><th>SIGNAL CLOSE / ENTRY</th><th>MODE</th><th>STATUS / REASON</th><th>OUTBOX</th><th></th></tr></thead><tbody id="signal-rows"><tr><td colspan="8" class="empty-cell">No events loaded.</td></tr></tbody></table></div><div class="table-footer"><span id="signal-total">—</span><span>Payload values are not displayed.</span></div></section>
+        <section class="panel webhook-panel"><div class="panel-head"><div><div class="panel-title">Webhook receiver</div><div class="panel-caption">Tokenized HTTPS endpoint · JSON and constrained legacy text</div></div><span class="badge badge-blue" id="webhook-config-badge">Configuration status unavailable</span></div><div class="webhook-info"><div><span>Endpoint path</span><code>/api/webhooks/tradingview/{token}</code></div><div><span>Authentication</span><strong>Secret path token · never included in the dashboard</strong></div><div><span>Delivery</span><strong>Durable idempotent outbox with retries</strong></div></div></section>
+      </section>
+
+      <section class="page" id="view-history">
+        <div class="page-heading compact-heading"><div><div class="eyebrow">AUDITABLE TRADE RECORD</div><h1>Trade history</h1><p class="subheading">Closed, rejected, pending and active trades with explicit fee-data availability.</p></div><div class="heading-actions"><a class="button button-secondary" id="csv-export" href="/api/history.csv">Export CSV <span>↓</span></a></div></div>
+        <section class="panel table-panel"><div class="panel-head table-panel-head"><div><div class="panel-title">All trades</div><div class="panel-caption" id="history-caption">Most recent 50 records</div></div><div class="panel-actions"><select class="select-control" id="history-mode"><option value="">All modes</option><option>PAPER</option><option>LIVE</option></select><label class="search-field"><span>⌕</span><input id="history-symbol" type="search" placeholder="Filter symbol" maxlength="64"></label></div></div><div class="table-scroll"><table><thead><tr><th>CREATED</th><th>CONTRACT</th><th>MODE</th><th>ENTRY / EXIT</th><th>QUANTITY</th><th>REALIZED NET</th><th>FEES</th><th>FILL DATA</th><th>STATUS</th><th></th></tr></thead><tbody id="history-rows"><tr><td colspan="10" class="empty-cell">No trades loaded.</td></tr></tbody></table></div><div class="table-footer"><span id="history-total">—</span><span id="history-page-label">Page 1</span><div class="pagination"><button class="icon-button tiny" id="history-prev" aria-label="Previous page">←</button><button class="icon-button tiny" id="history-next" aria-label="Next page">→</button></div></div></section>
+      </section>
+
+      <section class="page" id="view-settings">
+        <div class="page-heading compact-heading"><div><div class="eyebrow">CONFIGURATION & SAFETY</div><h1>Settings</h1><p class="subheading">Risk limits are enforced server-side. Credentials are configured only in the server environment.</p></div></div>
+        <div class="settings-layout">
+          <div class="settings-main">
+            <section class="panel settings-panel"><div class="panel-head"><div><div class="panel-title">Risk parameters</div><div class="panel-caption">Applied to future reservations only</div></div><span class="badge badge-green">SERVER ENFORCED</span></div><form id="risk-form" class="settings-form"><div class="form-grid"><label>Margin per trade <span>USDT</span><input name="margin_per_trade" type="number" min="0.01" step="0.01" required></label><label>Leverage <span>×</span><input name="leverage" type="number" min="1" max="200" step="1" required></label><label>Max open slots <span>trades</span><input name="max_open_positions" type="number" min="1" max="20" step="1" required></label><label>Max notional per trade <span>USDT</span><input name="max_notional_per_trade" type="number" min="0.01" step="0.01" required></label><label>Target 1 <span>% underlying</span><input name="target1_percent" type="number" min="0.01" step="0.01" required></label><label>Target 2 <span>% underlying</span><input name="target2_percent" type="number" min="0.01" step="0.01" required></label><label>Target 3 <span>% underlying</span><input name="target3_percent" type="number" min="0.01" step="0.01" required></label><label>Stop loss <span>% underlying</span><input name="stop_loss_percent" type="number" min="0.01" step="0.01" required></label><label>Max daily loss <span>USDT</span><input name="max_daily_loss" type="number" min="0.01" step="0.01" required></label><label>Limit entry expiry <span>seconds</span><input name="limit_entry_expiry_seconds" type="number" min="60" max="86400" step="1" required></label></div><label class="checkbox-row"><input type="checkbox" name="cancel_stale_entry_orders"><span>Cancel a stale LIMIT entry after its configured expiry (only report confirmed exchange cancellation)</span></label><div class="form-actions"><button type="submit" class="button button-primary">Save risk parameters <span>→</span></button><span id="risk-save-status" class="form-status"></span></div></form></section>
+            <section class="panel settings-panel"><div class="panel-head"><div><div class="panel-title">Trading mode</div><div class="panel-caption">PAPER is the default. LIVE activation is guarded by server and dashboard confirmation.</div></div><span class="mode-pill paper" id="settings-mode-pill"><i></i><span>PAPER MODE</span></span></div><div class="mode-card"><div class="mode-card-copy"><strong>Paper simulation</strong><p>Uses Shark public last prices for simulated fills. It cannot call private order placement.</p></div><button class="button button-secondary" id="switch-paper-button">Stay / switch to PAPER</button></div><div class="live-blocker" id="live-blocker"><div class="blocker-icon">!</div><div><strong>LIVE is fail-closed</strong><p id="live-blocker-copy">Official Shark contract filters and protection semantics must be verified before LIVE can be enabled.</p><div class="config-checks" id="live-checks"></div></div><button class="button button-danger" id="enable-live-button" disabled>Enable LIVE</button></div></section>
+            <section class="panel settings-panel"><div class="panel-head"><div><div class="panel-title">Signal filters</div><div class="panel-caption">Empty allowlist permits all metadata-verified USDT perpetuals; denylist always wins.</div></div></div><form id="symbol-form" class="symbol-form"><label>Allowlist <small>Comma-separated Shark symbols</small><input name="allow_symbols" type="text" placeholder="e.g. BTCUSDT, ETHUSDT"></label><label>Denylist <small>Comma-separated Shark symbols</small><input name="deny_symbols" type="text" placeholder="e.g. DOGEUSDT"></label><div class="form-actions"><button class="button button-secondary" type="submit">Save symbol filters</button><span id="symbol-save-status" class="form-status"></span></div></form></section>
+          </div>
+          <aside class="settings-side">
+            <section class="panel control-panel"><div class="panel-title">Emergency control</div><div class="panel-caption">A pause blocks new signals; it does not close open exposure.</div><div class="kill-switch-state" id="kill-switch-state"><span class="status-dot"></span><strong>Checking</strong></div><button class="button button-danger full-width" id="settings-pause-button">Pause new trades</button><p class="micro-copy">Clearing a pause requires a typed confirmation. Environment-level emergency disable cannot be cleared here.</p></section>
+            <section class="panel control-panel"><div class="panel-title">Connected services</div><div class="panel-caption">Configuration is reported without revealing any secret values.</div><div class="config-service-list" id="config-service-list"><div class="loading-line"></div><div class="loading-line"></div><div class="loading-line"></div></div></section>
+            <section class="panel control-panel"><div class="panel-title">PAPER assumptions</div><div class="paper-assumption" id="paper-assumption">Loading configured simulation assumptions.</div><div class="micro-copy">Simulated fills and net P&amp;L do not guarantee real execution, returns or protection. Funding can be unavailable.</div></section>
+            <section class="panel control-panel"><div class="panel-title">Timezone</div><div class="panel-caption">P&amp;L day boundary</div><div class="timezone-value" id="timezone-value">Asia/Kolkata</div><div class="micro-copy">Day P&amp;L uses this configured market-local calendar day, not a rolling 24-hour ticker change.</div></section>
+          </aside>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div class="toast-stack" id="toast-stack" aria-live="polite"></div>
+  <div class="drawer-backdrop hidden" id="drawer-backdrop"><aside class="detail-drawer" id="detail-drawer"><div class="drawer-head"><div><div class="eyebrow">TRADE DETAIL</div><h2 id="drawer-title">Trade</h2></div><button class="icon-button" id="drawer-close" aria-label="Close details">×</button></div><div class="drawer-body" id="drawer-body"></div></aside></div>
+  <div class="modal-backdrop hidden" id="modal-backdrop"><div class="confirm-modal" role="dialog" aria-modal="true"><button class="icon-button modal-close" id="modal-close" aria-label="Close dialog">×</button><div class="modal-symbol" id="modal-symbol">!</div><div class="eyebrow" id="modal-eyebrow">CONFIRM ACTION</div><h2 id="modal-title">Confirm</h2><p id="modal-copy"></p><label id="modal-phrase-label" class="phrase-label">Type <strong id="modal-phrase-display"></strong><input type="text" id="modal-phrase-input" autocomplete="off" spellcheck="false"></label><label class="ack-row hidden" id="modal-ack-row"><input type="checkbox" id="modal-ack"><span>I understand exchange execution and loss risk.</span></label><div class="modal-actions"><button class="button button-secondary" id="modal-cancel">Cancel</button><button class="button button-danger" id="modal-confirm" disabled>Confirm</button></div></div></div>
+  <div class="auth-overlay" id="auth-overlay"><div class="auth-card"><div class="brand-mark auth-mark"><span></span><span></span><span></span></div><div class="eyebrow">PRIVATE OPERATIONS CONSOLE</div><h1>Welcome back.</h1><p>Enter the dashboard access token configured on the Shasha Act server.</p><form id="auth-form"><label>Dashboard access token<input id="auth-token" type="password" autocomplete="current-password" required autofocus></label><button class="button button-primary full-width" type="submit">Open dashboard <span>→</span></button><div class="auth-error" id="auth-error"></div></form><div class="auth-note"><span class="lock-icon">⌑</span><span>The token is kept in memory only and is not saved to browser storage.</span></div></div></div>
+</body>
+</html>

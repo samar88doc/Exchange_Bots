@@ -72,3 +72,8 @@ Thumbs.db
 .git_backup*
 nohup.out
 *.out
+
+# Host credentials & temp files
+host.txt
+.~lock.*
+

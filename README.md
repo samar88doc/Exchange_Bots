@@ -18,6 +18,11 @@ Full-stack trading automation platform featuring:
 - **Backend:** FastAPI, automated order execution, paper/live trading pipelines, risk management, and Telegram listener.
 - **Frontend:** Next.js dashboard for positions, sentiment monitoring, and system settings.
 
+### 4. [Shasha_Act](./Shasha_Act)
+PAPER-first TradingView SHASHA signal receiver and execution console for Shark Exchange:
+- **Backend:** FastAPI, PostgreSQL outbox, risk gates, simulated paper fills with live market data feeds.
+- **Frontend:** Single-page real-time dashboard for positions, orders, and risk controls.
+
 ---
 
 ## Setup & Configuration
