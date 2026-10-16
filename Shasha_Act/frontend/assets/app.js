@@ -16,6 +16,7 @@
   const PREF_STORAGE_KEY = "shasha_console_prefs";
   const FAST_POLL_MS = 1000;
   const POLL_MS = 15000;
+  const SESSION_WARNING_MS = 15 * 60 * 1000;
 
   const $ = (selector) => document.querySelector(selector);
   const $$ = (selector) => Array.from(document.querySelectorAll(selector));
@@ -178,6 +179,11 @@
     marketSort: "change_24h_percent",
     marketOrder: "desc",
     liveFeed: false,
+    sessionExpiresAt: null,
+    sessionExpiryWarned: false,
+    positionsSignature: "",
+    pendingSignature: "",
+    pointerDown: false,
     polling: null,
     fastPolling: null,
     isFastPolling: false,
@@ -205,11 +211,31 @@
     return error.message || String(error);
   };
 
+  /** Point the operator at the place where a refused action can be unlocked. */
+  const actionHint = (detail) => {
+    const text = typeof detail === "string" ? detail : "";
+    if (text.includes("DISCLAIMER_NOT_ACCEPTED")) {
+      return " Acknowledge the risk disclaimer in Account to enable order-changing actions.";
+    }
+    if (text.includes("SUBSCRIPTION_EXPIRED")) {
+      return " Renew the plan in Account to enable order-changing actions.";
+    }
+    if (text.includes("Admin role required") || text.includes("OWNER")) {
+      return " Ask an administrator for the required role.";
+    }
+    return "";
+  };
+
   /* --------------------------------------------------------------------- api ------- */
+  /* Sign-in endpoints answer 401 for wrong credentials. They are the only paths where a
+     401 must never be read as "the browser session expired". */
+  const CREDENTIAL_PATHS = ["/api/auth/login", "/api/auth/signup"];
+
   async function api(path, options = {}) {
     const { method = "GET", body, silent = false, raw = false } = options;
     const headers = { Accept: raw ? "*/*" : "application/json" };
-    if (state.sessionToken) headers["X-Session-Token"] = state.sessionToken;
+    const presentedToken = Boolean(state.sessionToken);
+    if (presentedToken) headers["X-Session-Token"] = state.sessionToken;
     if (body !== undefined) headers["Content-Type"] = "application/json";
     let response;
     try {
@@ -227,10 +253,19 @@
       throw error;
     }
     state.online = true;
-    if (response.status === 401 && !path.startsWith("/api/auth/login") && !path.startsWith("/api/auth/signup")) {
-      clearCredentials();
-      showAuth("Your session expired. Sign in again.");
-      throw new Error("Your session expired. Sign in again.");
+    if (response.status === 401 && !CREDENTIAL_PATHS.some((prefix) => path.startsWith(prefix))) {
+      /* Only a request that actually carried a session token can expire that session.
+         An unauthenticated request must not delete a stored credential, otherwise one
+         rejected call silently signs the operator out and every later call repeats it. */
+      const message = presentedToken
+        ? "Your session expired. Sign in again."
+        : "Sign in to load this data.";
+      if (presentedToken) clearCredentials();
+      showAuth(message);
+      const error = new Error(message);
+      error.status = 401;
+      if (!silent) toast(message, "error");
+      throw error;
     }
     let payload = null;
     const text = await response.text();
@@ -240,7 +275,7 @@
       const error = new Error(typeof detail === "string" ? detail : `Request failed (${response.status})`);
       error.detail = detail;
       error.status = response.status;
-      if (!silent) toast(describeError(error), "error");
+      if (!silent) toast(`${describeError(error)}${actionHint(detail)}`, "error");
       throw error;
     }
     return payload;
@@ -288,7 +323,9 @@
     $("#app-shell").hidden = true;
     const error = $("#auth-error");
     if (error) error.textContent = message;
-    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    /* Polling always stops while the sign-in screen is open. The previous version
+       skipped this for reduced-motion users, which kept background requests running
+       against a console nobody can see. */
     stopPolling();
   }
 
@@ -319,12 +356,14 @@
     errorBox.textContent = "";
     button.disabled = true;
     button.innerHTML = `<span class="spinner"></span>${mode === "signup" ? "Creating account" : "Verifying"}`;
+    let sessionEstablished = false;
     try {
       const path = mode === "signup" ? "/api/auth/signup" : "/api/auth/login";
       if (!["login", "signup"].includes(mode)) throw new Error("Username and password sign-in is required");
       const result = await api(path, { method: "POST", body: payload, silent: true });
       if (!result.session_token) throw new Error("The server did not create a dashboard session");
       saveSession(result.session_token, payload.remember !== false);
+      sessionEstablished = true;
       state.user = result.user || null;
       state.subscription = result.subscription || null;
       state.authMethod = "SESSION";
@@ -338,12 +377,14 @@
           errorBox.textContent = `Signed in, but the disclaimer must be acknowledged: ${describeError(error)}`;
         }
       }
-      hideAuth();
-      await bootstrapDashboard();
-      startPolling();
+      await enterConsole();
       toast("Console connected.", "success");
     } catch (error) {
-      clearCredentials();
+      /* Only a failed sign-in clears the credentials. Once the server issued a session,
+         a later failure (a widget that cannot render, a slow first load) must not
+         delete it: that produced a console that looked signed in while every later
+         request went out unauthenticated and bounced the operator to the sign-in page. */
+      if (!sessionEstablished) clearCredentials();
       errorBox.textContent = describeError(error);
     } finally {
       button.disabled = false;
@@ -358,6 +399,19 @@
     state.subscription = identity.subscription || state.subscription;
     state.disclaimer = identity.disclaimer || state.disclaimer;
     state.permissions = identity.permissions || state.permissions;
+    state.sessionExpiresAt = identity.session_expires_at || null;
+    warnAboutSessionExpiry();
+  }
+
+  /** Tell the operator before the server rejects the next request on an expired session. */
+  function warnAboutSessionExpiry() {
+    const expires = state.sessionExpiresAt;
+    if (!expires) return;
+    const remaining = new Date(expires).getTime() - Date.now();
+    if (!Number.isFinite(remaining) || remaining > SESSION_WARNING_MS) return;
+    if (state.sessionExpiryWarned) return;
+    state.sessionExpiryWarned = true;
+    toast("This console session expires soon. Sign in again to stay connected.", "error");
   }
 
   async function signOut() {
@@ -375,7 +429,17 @@
     history: "Trade history", strategy: "Playbook", account: "Account", settings: "Settings", users: "Access control",
   };
 
-  function setView(view) {
+  /** The view named in the URL fragment, when it is one the console knows. */
+  const viewFromHash = () => {
+    const raw = String(window.location.hash || "").replace(/^#\/?/, "").trim().toLowerCase();
+    return raw && Object.prototype.hasOwnProperty.call(VIEW_TITLES, raw) ? raw : null;
+  };
+
+  /**
+   * Switch the visible page. The view is mirrored into the URL fragment so a refresh,
+   * a bookmark or a shared link reopens the same page instead of the default one.
+   */
+  function setView(view, options = {}) {
     if (!VIEW_TITLES[view]) view = "dashboard";
     state.view = view;
     prefs.save({ view });
@@ -384,6 +448,10 @@
     const crumb = $("#page-crumb");
     if (crumb) crumb.textContent = VIEW_TITLES[view];
     if (window.innerWidth <= 860) $("#sidebar").classList.remove("open");
+    if (options.updateHash !== false && window.location.hash.replace(/^#\/?/, "") !== view) {
+      try { window.history.replaceState(null, "", `#${view}`); }
+      catch { window.location.hash = view; }
+    }
     if (view === "users") renderUsers();
     if (view === "markets" && !state.market) refreshMarkets();
   }
@@ -560,7 +628,7 @@
         <td class="${pnlClass(item.unrealized_pnl)}">${item.unrealized_pnl === null ? "Unavailable" : fmtMoney(item.unrealized_pnl, "USDT", true)}</td>
         <td>${trailingCell(item)}</td>
         <td>${pill(item.status, statusTone(item.status))}</td>
-        <td><button class="icon-button tiny" data-action="details" data-id="${esc(item.id)}" title="Trade details">···</button></td>
+        <td><div class="inline-actions"><button class="button button-secondary button-small" data-action="details" data-id="${esc(item.id)}">Details</button></div></td>
       </tr>`).join("");
     state.positions.forEach((item) => state.knownPositionIds.add(item.id));
   }
@@ -728,6 +796,26 @@
   /* ------------------------------------------------------------------- positions --- */
   const ACTIVE_STATUSES = new Set(["OPEN", "PARTIALLY_CLOSED", "ENTRY_PARTIAL", "PROTECTION_ERROR", "UNKNOWN", "CLOSING", "ENTRY_PENDING", "SUBMITTING", "QUEUED"]);
 
+  /**
+   * A cheap fingerprint of the values the positions table draws. When it does not
+   * change the table is left alone, so the once-per-second refresh does not rebuild
+   * the DOM (and does not swallow a click on a row button) for nothing.
+   */
+  const positionsSignature = (items) => JSON.stringify(
+    (items || []).map((item) => [
+      item.id, item.last_price, item.unrealized_pnl, item.net_profit_pnl, item.net_realized_pnl,
+      item.status, item.status_reason, item.price_stale, item.stop_price, item.target1_price,
+      item.protection_state, item.trail_high_water_price, item.remaining_quantity,
+    ])
+  );
+
+  /** The same fingerprint for the pending-entries table. */
+  const pendingSignature = (items) => JSON.stringify(
+    (items || []).map((item) => [
+      item.id, item.status, item.planned_entry, item.entry_expires_at, item.quantity, item.symbol,
+    ])
+  );
+
   function getPositionSortVal(item, key) {
     switch (key) {
       case "symbol":
@@ -887,12 +975,14 @@
       }).join("");
     }
     renderPendingEntries();
+    state.positionsSignature = positionsSignature(state.positions);
     $("#positions-full-footer").textContent = `${openCount} active position${openCount === 1 ? "" : "s"} · Net Profit: ${fmtMoney(totalNetProfit, "USDT", true)} · Avg P&L / Pos: ${fmtMoney(avgNetProfit, "USDT", true)}`;
   }
 
   function renderPendingEntries() {
     const body = $("#pending-rows");
     const items = state.pendingEntries;
+    state.pendingSignature = pendingSignature(items);
     if (!items.length) { body.innerHTML = `<tr><td colspan="6" class="empty-cell">No pending entries. Limit orders that have not filled appear here.</td></tr>`; return; }
     body.innerHTML = items.map((item) => `
       <tr>
@@ -1276,9 +1366,15 @@
       if (form.elements[field]) form.elements[field].value = risk[field] ?? "";
     });
     if (form.elements.limit_entry_expiry_seconds) form.elements.limit_entry_expiry_seconds.value = risk.limit_entry_expiry_seconds ?? 900;
-    form.elements.cancel_stale_entry_orders.checked = Boolean(risk.cancel_stale_entry_orders);
-    form.elements.allow_symbols.value = (risk.allow_symbols || []).join(", ");
-    form.elements.deny_symbols.value = (risk.deny_symbols || []).join(", ");
+    if (form.elements.cancel_stale_entry_orders) form.elements.cancel_stale_entry_orders.checked = Boolean(risk.cancel_stale_entry_orders);
+    /* The symbol filters live in their own form. Writing them into the risk form
+       addressed a non-existent field and threw, which aborted the whole refresh and
+       pushed the operator back to the sign-in screen. */
+    const symbolForm = $("#symbol-form");
+    if (symbolForm) {
+      if (symbolForm.elements.allow_symbols) symbolForm.elements.allow_symbols.value = (risk.allow_symbols || []).join(", ");
+      if (symbolForm.elements.deny_symbols) symbolForm.elements.deny_symbols.value = (risk.deny_symbols || []).join(", ");
+    }
 
     const mode = settings.effective_mode || settings.mode || "PAPER";
     const pillNode = $("#mode-pill");
@@ -1513,6 +1609,33 @@
   }
 
   /* ------------------------------------------------------------------ operations --- */
+  /**
+   * Put a button into a visible "working" state and return a restore function.
+   * Every operator control answers its click, so a request that takes a moment is
+   * never mistaken for a button that does nothing.
+   */
+  function setBusy(button, busyLabel) {
+    if (!button) return () => {};
+    const original = button.innerHTML;
+    const wasDisabled = button.disabled;
+    button.disabled = true;
+    button.innerHTML = `<span class="spinner"></span>${busyLabel}`;
+    return () => {
+      button.disabled = wasDisabled;
+      button.innerHTML = original;
+    };
+  }
+
+  /** Run an operator action with the confirmation button showing progress. */
+  async function submitAction(busyLabel, run) {
+    const restore = setBusy($("#modal-confirm"), busyLabel);
+    try {
+      return await run();
+    } finally {
+      restore();
+    }
+  }
+
   async function togglePause() {
     const paused = Boolean(state.settings?.trading_paused);
     const phrase = paused ? "RESUME SHASHA ACT" : "PAUSE SHASHA ACT";
@@ -1527,11 +1650,20 @@
       confirmLabel: paused ? "Resume trading" : "Pause trading",
     });
     if (!ok) return;
+    const restoreTop = setBusy($("#pause-button"), paused ? "Resuming" : "Pausing");
+    const restoreSettings = setBusy($("#settings-pause-button"), paused ? "Resuming" : "Pausing");
     try {
-      await api("/api/control/pause", { method: "POST", body: { paused: !paused, confirmation_phrase: phrase } });
+      await submitAction(paused ? "Resuming" : "Pausing", () => api("/api/control/pause", {
+        method: "POST",
+        body: { paused: !paused, confirmation_phrase: phrase },
+      }));
       toast(paused ? "Signal processing resumed." : "Signal processing paused.", "success");
       await refreshAll();
     } catch { /* toast already shown */ }
+    finally {
+      restoreTop();
+      restoreSettings();
+    }
   }
 
   async function cancelPending() {
@@ -1544,14 +1676,19 @@
       confirmLabel: "Cancel entries",
     });
     if (!ok) return;
+    const restore = setBusy($("#cancel-pending-button"), "Cancelling");
     try {
-      const result = await api("/api/control/cancel-pending", { method: "POST", body: { confirmation_phrase: "CANCEL PENDING ENTRIES" } });
+      const result = await submitAction("Cancelling", () => api("/api/control/cancel-pending", {
+        method: "POST",
+        body: { confirmation_phrase: "CANCEL PENDING ENTRIES" },
+      }));
       toast(`${result.confirmed_cancellations} cancellation(s) confirmed.`, "success");
       await refreshAll();
     } catch { /* handled */ }
+    finally { restore(); }
   }
 
-  async function cancelEntry(tradeId, symbol) {
+  async function cancelEntry(tradeId, symbol, button) {
     const ok = await confirmModal({
       title: `Cancel pending entry for ${symbol}?`,
       copy: "The limit entry is cancelled only when the exchange confirms it. A partially filled entry keeps the filled part.",
@@ -1561,14 +1698,19 @@
       confirmLabel: "Cancel entry",
     });
     if (!ok) return;
+    const restore = setBusy(button, "Cancelling");
     try {
-      await api(`/api/trades/${encodeURIComponent(tradeId)}/cancel-entry`, { method: "POST", body: { confirmation_phrase: "CANCEL PENDING ENTRIES" } });
+      await submitAction("Cancelling", () => api(`/api/trades/${encodeURIComponent(tradeId)}/cancel-entry`, {
+        method: "POST",
+        body: { confirmation_phrase: "CANCEL PENDING ENTRIES" },
+      }));
       toast("Cancellation request recorded.", "success");
       await refreshAll();
     } catch { /* handled */ }
+    finally { restore(); }
   }
 
-  async function closeTrade(tradeId, symbol) {
+  async function closeTrade(tradeId, symbol, button) {
     const ok = await confirmModal({
       title: `Close ${symbol} at market?`,
       copy: "A reduce-only market close is requested. The position is finalized only after the exchange confirms the fill.",
@@ -1578,12 +1720,17 @@
       confirmLabel: "Close position",
     });
     if (!ok) return;
+    const restore = setBusy(button, "Closing");
     try {
-      const result = await api(`/api/trades/${encodeURIComponent(tradeId)}/close`, { method: "POST", body: { confirmation_phrase: "CLOSE POSITION" } });
+      const result = await submitAction("Closing", () => api(`/api/trades/${encodeURIComponent(tradeId)}/close`, {
+        method: "POST",
+        body: { confirmation_phrase: "CLOSE POSITION" },
+      }));
       toast(result.message || "Close request recorded.", "success");
       $("#drawer-backdrop").classList.add("hidden");
       await refreshAll();
     } catch { /* handled */ }
+    finally { restore(); }
   }
 
   async function switchPaper() {
@@ -1597,7 +1744,10 @@
     });
     if (!ok) return;
     try {
-      await api("/api/control/mode/paper", { method: "POST", body: { confirmation_phrase: "SWITCH TO PAPER" } });
+      await submitAction("Switching", () => api("/api/control/mode/paper", {
+        method: "POST",
+        body: { confirmation_phrase: "SWITCH TO PAPER" },
+      }));
       toast("PAPER mode active.", "success");
       await refreshAll();
     } catch { /* handled */ }
@@ -1615,10 +1765,10 @@
     });
     if (!ok) return;
     try {
-      await api("/api/control/mode/live", {
+      await submitAction("Enabling", () => api("/api/control/mode/live", {
         method: "POST",
         body: { confirmation_phrase: "ENABLE LIVE TRADING", acknowledge_exchange_risk: true },
-      });
+      }));
       toast("LIVE mode confirmed.", "success");
       await refreshAll();
     } catch { /* handled */ }
@@ -1707,6 +1857,19 @@
   }
 
   /* -------------------------------------------------------------------- refresh ---- */
+  /**
+   * Run one renderer without letting it break the whole refresh cycle. A single
+   * widget that cannot draw must never abort the remaining panels, stop the poll
+   * loop or send the operator back to the sign-in screen.
+   */
+  function safeRender(name, render) {
+    try {
+      render();
+    } catch (error) {
+      console.error(`Dashboard render failed: ${name}`, error);
+    }
+  }
+
   async function refreshAll() {
     const tasks = [
       api("/api/settings", { silent: true }).then((data) => { state.settings = data; }),
@@ -1724,15 +1887,17 @@
     const failed = results.filter((result) => result.status === "rejected");
     state.online = failed.length < results.length;
     state.lastUpdate = new Date().toISOString();
-    renderDashboard();
-    renderPositions();
-    renderStrategy();
-    renderAccount();
-    renderSettings();
-    renderPerformance();
-    renderConnectivity();
-    if (state.view === "users") await renderUsers();
-    if (state.firstPaint) { state.firstPaint = false; }
+    safeRender("dashboard", renderDashboard);
+    safeRender("positions", renderPositions);
+    safeRender("strategy", renderStrategy);
+    safeRender("account", renderAccount);
+    safeRender("settings", renderSettings);
+    safeRender("performance", renderPerformance);
+    safeRender("connectivity", renderConnectivity);
+    if (state.view === "users") {
+      try { await renderUsers(); } catch (error) { console.error("Dashboard render failed: users", error); }
+    }
+    state.firstPaint = false;
     if (failed.length === results.length && results.length) toast("Every data request failed. Check the server connection.", "error");
   }
 
@@ -1871,8 +2036,16 @@
   }
 
   /* -------------------------------------------------------------------- polling ---- */
+  /**
+   * One-second refresh of the live values: last price, unrealized P&L, the open
+   * position KPIs and the pending entries. It runs next to the slower full refresh
+   * so the numbers on screen move continuously instead of only after a manual reload.
+   */
   async function refreshPositionsFast() {
-    if (document.hidden || !state.sessionToken || !state.online || state.isFastPolling) return;
+    if (document.hidden || !state.sessionToken || state.isFastPolling) return;
+    /* Redrawing the table between mousedown and mouseup would move the button out
+       from under the pointer and the click would never reach the action. */
+    if (state.pointerDown) return;
     state.isFastPolling = true;
     try {
       const [posData, overviewData, pendingData] = await Promise.all([
@@ -1891,9 +2064,15 @@
       }
       state.lastUpdate = new Date().toISOString();
       if ($("#last-updated")) $("#last-updated").textContent = fmtDateTime(state.lastUpdate);
+      if ($("#positions-last-updated")) $("#positions-last-updated").textContent = fmtDateTime(state.lastUpdate);
 
-      renderPositions();
-      renderDashboardPositions();
+      if (positionsSignature(state.positions) !== state.positionsSignature) {
+        safeRender("positions", renderPositions);
+        safeRender("dashboard-positions", renderDashboardPositions);
+      }
+      if (pendingSignature(state.pendingEntries) !== state.pendingSignature) {
+        safeRender("pending-entries", renderPendingEntries);
+      }
       if (state.overview) {
         const overview = state.overview;
         const day = overview.day_pnl || {};
@@ -1911,7 +2090,7 @@
             ? `Unrealized ${fmtMoney(day.unrealized, day.currency, true)} · ${day.fees_included ? "fees included" : "fees excluded"}`
             : `${esc(overview.market_day || "")} market day · unrealized Unavailable (stale market data)`;
         }
-        renderDailyPnlLedger(overview);
+        safeRender("daily-pnl-ledger", () => renderDailyPnlLedger(overview));
       }
     } catch {
       /* fast-poll errors remain silent to avoid spam */
@@ -1933,6 +2112,7 @@
         await refreshAll();
         if (state.liveFeed) await refreshLiveFeed();
         await recordSentiment();
+        warnAboutSessionExpiry();
       } catch { /* individual requests already reported */ }
     }, POLL_MS);
   }
@@ -1951,8 +2131,8 @@
       if (actionTarget) {
         const { action, id, symbol, role, active, username } = actionTarget.dataset;
         if (action === "details") openDrawer(id);
-        if (action === "close") closeTrade(id, symbol);
-        if (action === "cancel-entry") cancelEntry(id, symbol);
+        if (action === "close") closeTrade(id, symbol, actionTarget);
+        if (action === "cancel-entry") cancelEntry(id, symbol, actionTarget);
         if (action === "retry-notice") api(`/api/events/${encodeURIComponent(id)}/retry-notification`, { method: "POST" })
           .then(() => { toast("Notification retry queued.", "success"); refreshSignals(); })
           .catch(() => {});
@@ -2009,11 +2189,27 @@
 
     $("#signout-button").addEventListener("click", signOut);
     $("#account-signout").addEventListener("click", signOut);
-    $("#refresh-button").addEventListener("click", () => refreshAll().then(() => toast("Data refreshed.", "success")));
+    $("#refresh-button").addEventListener("click", async () => {
+      const restore = setBusy($("#refresh-button"), "Refreshing");
+      try {
+        await refreshAll();
+        toast("Data refreshed.", "success");
+      } catch (error) {
+        toast(describeError(error), "error");
+      } finally { restore(); }
+    });
     $("#pause-button").addEventListener("click", togglePause);
     $("#settings-pause-button").addEventListener("click", togglePause);
     $("#cancel-pending-button").addEventListener("click", cancelPending);
-    $("#positions-refresh").addEventListener("click", () => refreshAll().then(() => toast("Positions refreshed.", "success")));
+    $("#positions-refresh").addEventListener("click", async () => {
+      const restore = setBusy($("#positions-refresh"), "Refreshing");
+      try {
+        await refreshAll();
+        toast("Positions refreshed.", "success");
+      } catch (error) {
+        toast(describeError(error), "error");
+      } finally { restore(); }
+    });
     $("#switch-paper-button").addEventListener("click", switchPaper);
     $("#enable-live-button").addEventListener("click", enableLive);
     $("#clear-saved-token-btn").addEventListener("click", () => {
@@ -2117,9 +2313,17 @@
       }
     });
 
+    document.addEventListener("mousedown", () => { state.pointerDown = true; }, true);
+    document.addEventListener("mouseup", () => { state.pointerDown = false; }, true);
     document.addEventListener("visibilitychange", () => { if (!document.hidden && state.user !== null) refreshAll(); });
     window.addEventListener("online", () => { state.online = true; refreshAll(); });
     window.addEventListener("offline", () => { state.online = false; renderConnectivity(); });
+    /* The URL fragment mirrors the open page, so a reload, a bookmark or a shared
+       link reopens the same view instead of dropping the operator on the Overview. */
+    window.addEventListener("hashchange", () => {
+      const target = viewFromHash();
+      if (target && target !== state.view) setView(target, { updateHash: false });
+    });
   }
 
   const debounce = (fn, wait) => {
@@ -2130,7 +2334,22 @@
   /* ------------------------------------------------------------------------ init --- */
   async function bootstrapDashboard() {
     await refreshAll();
-    renderFundamentals();
+    safeRender("fundamentals", renderFundamentals);
+  }
+
+  /**
+   * Show the console and start the live refresh loop. A data or rendering problem is
+   * reported in place: it must never sign the operator out, because the session is
+   * still valid on the server.
+   */
+  async function enterConsole() {
+    hideAuth();
+    try {
+      await bootstrapDashboard();
+    } catch (error) {
+      toast(`Some dashboard data could not be loaded: ${describeError(error)}`, "error");
+    }
+    startPolling();
   }
 
   function renderFundamentals() {
@@ -2148,19 +2367,22 @@
     startNeuralField();
     startClock();
     bindEvents();
+    const hashView = viewFromHash();
+    if (hashView) state.view = hashView;
     setView(state.view);
     $("#market-direction-label").textContent = state.marketOrder.toUpperCase();
     await loadPublicConfig();
     if (!state.sessionToken) { showAuth(); return; }
     try {
+      /* The stored credential was rejected by the server. Only in this case is the
+         saved session dropped and the sign-in screen shown. */
       await loadIdentity();
-      hideAuth();
-      await bootstrapDashboard();
-      startPolling();
     } catch (error) {
       clearCredentials();
       showAuth(describeError(error));
+      return;
     }
+    await enterConsole();
   }
 
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);

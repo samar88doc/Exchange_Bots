@@ -6,8 +6,8 @@
   <meta name="color-scheme" content="dark">
   <meta name="theme-color" content="#050711">
   <title>Shasha Act — Neural Trading Operations</title>
-  <link rel="stylesheet" href="/assets/styles.css?v=20261016_03">
-  <script defer src="/assets/app.js?v=20261016_03"></script>
+  <link rel="stylesheet" href="/assets/styles.css?v=20261016_04">
+  <script defer src="/assets/app.js?v=20261016_04"></script>
 </head>
 <body>
   <canvas id="neural-field" aria-hidden="true"></canvas>
@@ -294,7 +294,10 @@
       <section class="page" id="view-positions">
         <div class="page-heading compact-heading">
           <div><div class="eyebrow">EXPOSURE</div><h1>Positions</h1><p class="subheading">Every open trade with its live protection rail: stop, entry, target 1 and trailing high-water mark.</p></div>
-          <div class="heading-actions"><button class="button button-secondary" id="positions-refresh">Refresh <span>↻</span></button></div>
+          <div class="heading-actions">
+            <span class="updated-label">LIVE PRICES <strong>1s</strong> · UPDATED <strong id="positions-last-updated">—</strong></span>
+            <button class="button button-secondary" id="positions-refresh">Refresh <span>↻</span></button>
+          </div>
         </div>
         <div class="kpi-grid position-kpis">
           <article class="kpi-card" data-accent="green">

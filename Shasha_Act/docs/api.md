@@ -54,7 +54,7 @@ Response example:
 | `POST` | `/api/auth/signup` | Creates exactly one initial `OWNER` and returns a session only when `INITIAL_OWNER_SIGNUP_ENABLED=true` and no account exists. Otherwise refuses the request. |
 | `POST` | `/api/auth/login` | Username + password → session token, finite expiry, user, subscription and disclaimer state. `remember: true` selects the longer configured server-side lifetime. |
 | `POST` | `/api/auth/logout` | Revokes the presented session. |
-| `GET` | `/api/auth/me` | Current identity, auth method, subscription state, disclaimer state and role permissions. |
+| `GET` | `/api/auth/me` | Current identity, auth method, subscription state, disclaimer state, role permissions and `session_expires_at`, so the console can warn before the session runs out. |
 | `POST` | `/api/auth/disclaimer` | Records the operator's acknowledgement of the risk disclaimer (session required). |
 | `GET` | `/api/subscription` | Service subscription, the signed-in operator's own plan/expiry, whether enforcement is on, the plan catalogue and billing cycles. |
 | `PATCH` | `/api/subscription` | Admin-only update of plan, fee, currency, cycle, status, contact or expiry. Audited. |

@@ -63,6 +63,22 @@ PAPER protection is simulated and is not an exchange-side stop. LIVE remains blo
 - Use the Daily P&L Ledger in the configured timezone (`Asia/Kolkata` by default), not the ticker's 24-hour change. It separates gross realized P&L, transaction fees, persisted funding, net realized P&L, fully closed wins/losses, open unrealized P&L and net including open exposure. Partial exits affect realized cash but do not inflate completed-trade win/loss counts. Funding is explicitly marked unavailable when no persisted record exists.
 - Retain audit events and outbox rows for a period consistent with operating and regulatory needs. Do not store request headers or webhook tokens in logs.
 
+## If the console returns to the sign-in screen
+
+- A browser refresh, a bookmark or a shared link reopens the same page: the open view is kept in
+  the URL fragment (`#positions`, `#markets`, ...). The sign-in screen only appears when the server
+  rejects the presented session, when no session was ever established, or after an explicit sign-out.
+- The console keeps the stored credential when a request fails for any other reason (a rendering
+  problem, a network error, a `5xx`). It reports the failure in place and keeps refreshing, so a
+  single failed call can no longer turn into a logout.
+- `GET /api/auth/me` returns `session_expires_at`. The console warns shortly before that moment so an
+  expiry is expected rather than surprising; sign in again to extend it.
+- If a sign-in is required unexpectedly, check the server log for `401` answers from the dashboard
+  routes and confirm that the session row still exists in `shasha_act_sessions` and is not revoked.
+- The Overview **Details** control opens the trade drawer, and the Positions page refreshes last
+  price, unrealized P/L, the position KPIs and pending entries about once per second without any
+  manual action.
+
 ## If a webhook is not processed
 
 1. Check that the URL is HTTPS, the path token matches, and the reverse proxy did not rewrite/drop the request body.

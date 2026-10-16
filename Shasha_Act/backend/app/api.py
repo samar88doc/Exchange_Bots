@@ -481,6 +481,10 @@ async def auth_me(
     user = await current_user(request)
     subscription = await ensure_subscription(session, settings)
     disclaimer_required = bool(settings.require_disclaimer_ack)
+    # The console needs to know when the presented session runs out, so it can warn
+    # the operator before the server rejects the next request.
+    session_record = getattr(request.state, "session", None)
+    session_expires_at = _iso(getattr(session_record, "expires_at", None))
     if user is None:
         return {
             "auth_method": getattr(request.state, "auth_method", "UNKNOWN"),
@@ -488,6 +492,7 @@ async def auth_me(
             "subscription": subscription_state(subscription),
             "disclaimer": {"required": False, "accepted_at": None, "text": DEFAULT_DISCLAIMER},
             "permissions": {"can_manage_users": True, "can_change_settings": True, "can_trade": True},
+            "session_expires_at": session_expires_at,
         }
     return {
         "auth_method": getattr(request.state, "auth_method", "SESSION"),
@@ -503,6 +508,7 @@ async def auth_me(
             "can_change_settings": role_at_least(user.role, "OPERATOR"),
             "can_trade": role_at_least(user.role, "OPERATOR"),
         },
+        "session_expires_at": session_expires_at,
     }
 
 
