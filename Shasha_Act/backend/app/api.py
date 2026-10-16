@@ -5,21 +5,21 @@ import csv
 import io
 import re
 from datetime import UTC, date, datetime, time, timedelta
-from decimal import Decimal
-from pathlib import Path
+from decimal import Decimal, InvalidOperation
 from typing import Any
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import case, func, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.accounts import (
     DEFAULT_DISCLAIMER,
     SUBSCRIPTION_PLANS,
     authenticate_user,
+    create_initial_owner,
     current_user,
     ensure_subscription,
     get_user_by_username,
@@ -27,6 +27,7 @@ from app.accounts import (
     require_dashboard_auth,
     require_mutation_allowed,
     revoke_session,
+    revoke_user_sessions,
     role_at_least,
     subscription_state,
     user_payload,
@@ -51,6 +52,7 @@ from app.schemas import (
     CancelPendingRequest,
     CloseTradeRequest,
     DashboardAuthToggleRequest,
+    InitialOwnerSignupRequest,
     LiveActivationRequest,
     LoginRequest,
     SettingsUpdate,
@@ -64,7 +66,6 @@ from app.security import hash_password, redact_text
 from app.services.pnl import long_unrealized_pnl, realized_pnl_breakdown_for_day
 from app.services.risk import ACTIVE_TRADE_STATES, ensure_risk_control
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
 public_router = APIRouter(prefix="/api", tags=["Status"])
 auth_router = APIRouter(prefix="/api/auth", tags=["Authentication"])
 
@@ -131,10 +132,9 @@ def _audit(
 def _require_role(request: Request, minimum: str) -> None:
     """Enforce an operator role on a mutating dashboard route.
 
-    A resolved session must satisfy the minimum role. The server automation token — and a
-    deployment that has deliberately set ``DASHBOARD_AUTH_ENABLED=false`` — carries no operator
-    identity and keeps owner-level access, which is the same convention the account endpoints
-    already use.
+    A resolved session must satisfy the minimum role. The optional server automation token carries
+    no individual operator identity and therefore uses the owner-level integration convention. It
+    is not part of the browser dashboard flow.
     """
     user = getattr(request.state, "user", None)
     if not isinstance(user, DashboardUser):
@@ -359,15 +359,19 @@ async def _wallet_snapshot(request: Request, session: AsyncSession, mode: str) -
 
 
 @public_router.get("/public/config")
-async def public_config(request: Request) -> dict[str, Any]:
+async def public_config(
+    request: Request,
+    session: AsyncSession = Depends(session_dependency),
+) -> dict[str, Any]:
     """Unauthenticated login-screen metadata: no secrets, no internal state beyond this."""
     settings: Settings = request.app.state.settings
+    account_count = int(await session.scalar(select(func.count()).select_from(DashboardUser)) or 0)
     return {
         "app_name": settings.app_name,
         "environment": settings.environment,
-        "auth_enabled": getattr(settings, "dashboard_auth_enabled", True),
+        "auth_enabled": True,
         "username_signin_available": True,
-        "server_token_signin_available": bool(settings.dashboard_api_token),
+        "initial_owner_signup_enabled": settings.initial_owner_signup_enabled and account_count == 0,
         "disclaimer_required": settings.require_disclaimer_ack,
         "disclaimer": DEFAULT_DISCLAIMER,
         "subscription": {
@@ -393,6 +397,7 @@ async def login(
         settings,
         user,
         user_agent=request.headers.get("user-agent", ""),
+        remember=body.remember,
     )
     subscription = await ensure_subscription(session, settings)
     await session.commit()
@@ -412,6 +417,49 @@ async def login(
             "can_manage_users": role_at_least(user.role, "ADMIN"),
             "can_change_settings": role_at_least(user.role, "OPERATOR"),
             "can_trade": role_at_least(user.role, "OPERATOR"),
+        },
+    }
+
+
+@auth_router.post("/signup", status_code=status.HTTP_201_CREATED)
+async def signup_initial_owner(
+    body: InitialOwnerSignupRequest,
+    request: Request,
+    session: AsyncSession = Depends(session_dependency),
+) -> dict[str, Any]:
+    """Perform explicitly enabled one-time owner setup without a dashboard token."""
+    settings: Settings = request.app.state.settings
+    user = await create_initial_owner(
+        session,
+        settings,
+        username=body.username,
+        password=body.password,
+        display_name=body.display_name,
+    )
+    token, record = await issue_session(
+        session,
+        settings,
+        user,
+        user_agent=request.headers.get("user-agent", ""),
+        remember=body.remember,
+    )
+    subscription = await ensure_subscription(session, settings)
+    await session.commit()
+    return {
+        "authenticated": True,
+        "session_token": token,
+        "session_expires_at": _iso(record.expires_at),
+        "user": user_payload(user),
+        "subscription": subscription_state(subscription),
+        "disclaimer": {
+            "required": settings.require_disclaimer_ack,
+            "accepted_at": None,
+            "text": DEFAULT_DISCLAIMER,
+        },
+        "permissions": {
+            "can_manage_users": True,
+            "can_change_settings": True,
+            "can_trade": True,
         },
     }
 
@@ -550,6 +598,8 @@ async def create_user(
     actor = await writable_user(session, request)
     if actor is not None and not role_at_least(actor.role, "ADMIN"):
         raise HTTPException(status_code=403, detail="Admin role required")
+    if actor is not None and body.role == "OWNER" and not role_at_least(actor.role, "OWNER"):
+        raise HTTPException(status_code=403, detail="Only an OWNER can create another OWNER account")
     username = body.username.strip().lower()
     if not re.fullmatch(r"[a-z0-9._-]{3,64}", username):
         raise HTTPException(status_code=422, detail="Username must be 3-64 characters [a-z0-9._-]")
@@ -599,18 +649,47 @@ async def update_user(
         raise HTTPException(status_code=404, detail="User not found")
     settings: Settings = request.app.state.settings
     values = body.model_dump(exclude_unset=True, exclude_none=True)
-    if "password" in values:
+    actor_is_owner = actor is None or role_at_least(actor.role, "OWNER")
+    if not actor_is_owner and (target.role == "OWNER" or values.get("role") == "OWNER"):
+        raise HTTPException(status_code=403, detail="Only an OWNER can modify or assign the OWNER role")
+    if "role" in values and values["role"] not in {"VIEWER", "OPERATOR", "ADMIN", "OWNER"}:
+        raise HTTPException(status_code=422, detail="Unsupported role")
+    if actor is not None and target.id == actor.id:
+        if values.get("is_active") is False:
+            raise HTTPException(status_code=422, detail="You cannot disable your own account")
+        if actor.role == "OWNER" and values.get("role") not in {None, "OWNER"}:
+            raise HTTPException(status_code=422, detail="You cannot demote your own OWNER account")
+
+    removing_owner = target.role == "OWNER" and (
+        values.get("is_active") is False or (values.get("role") is not None and values["role"] != "OWNER")
+    )
+    if removing_owner:
+        active_owners = int(
+            await session.scalar(
+                select(func.count()).select_from(DashboardUser).where(
+                    DashboardUser.role == "OWNER", DashboardUser.is_active.is_(True)
+                )
+            )
+            or 0
+        )
+        if active_owners <= 1:
+            raise HTTPException(status_code=422, detail="At least one active OWNER account must remain")
+
+    password_changed = "password" in values
+    if password_changed:
         target.password_hash = hash_password(str(values.pop("password")), settings.password_hash_iterations)
         target.failed_login_count = 0
         target.locked_until = None
-    if "is_active" in values and target.username == (actor.username if actor else ""):
-        if values["is_active"] is False:
-            raise HTTPException(status_code=422, detail="You cannot disable your own account")
-    if "role" in values and not role_at_least(values["role"], "VIEWER"):
-        raise HTTPException(status_code=422, detail="Unsupported role")
     previous = {key: str(getattr(target, key)) for key in values}
     for key, value in values.items():
         setattr(target, key, value)
+    if password_changed or values.get("is_active") is False:
+        await revoke_user_sessions(
+            session,
+            target.id,
+            actor=_actor(request),
+            reason="password_changed" if password_changed else "account_disabled",
+        )
     session.add(
         _audit(
             action="USER_UPDATED",
@@ -707,8 +786,8 @@ async def read_settings(
         "shark_credentials_configured": settings.shark_credentials_configured,
         "telegram_configured": settings.telegram_configured,
         "webhook_configured": bool(settings.tradingview_webhook_token),
-        "dashboard_auth_enabled": getattr(settings, "dashboard_auth_enabled", True),
-        "dashboard_auth_configured": bool(settings.dashboard_api_token),
+        "dashboard_auth_enabled": True,
+        "dashboard_auth_configured": True,
         "trading_paused": control.kill_switch or settings.emergency_trading_disabled,
         "environment_pause": settings.emergency_trading_disabled,
         "risk": {
@@ -846,17 +925,25 @@ async def performance(
     first_day = today - timedelta(days=days - 1)
     _, start_utc, _ = _local_day_bounds(settings.timezone, first_day)
     rows = await session.execute(
-        select(Fill.fill_time, Fill.gross_realized_pnl, Fill.fee).where(
+        select(Fill.fill_time, Fill.gross_realized_pnl, Fill.fee, Fill.funding).where(
             Fill.mode == selected_mode,
             Fill.fill_time >= start_utc,
         ).order_by(Fill.fill_time)
     )
     zone = ZoneInfo(settings.timezone)
     grouped: dict[date, Decimal] = {}
-    for fill_time, gross, fee in rows.all():
+    funding_record_count = 0
+    for fill_time, gross, fee, funding in rows.all():
         moment = fill_time.replace(tzinfo=UTC) if fill_time.tzinfo is None else fill_time
         local_day = moment.astimezone(zone).date()
-        grouped[local_day] = grouped.get(local_day, Decimal("0")) + (gross or Decimal("0")) - (fee or Decimal("0"))
+        if funding is not None:
+            funding_record_count += 1
+        grouped[local_day] = (
+            grouped.get(local_day, Decimal("0"))
+            + (gross or Decimal("0"))
+            - (fee or Decimal("0"))
+            - (funding or Decimal("0"))
+        )
     series = [
         {"date": (first_day + timedelta(days=index)).isoformat(), "net_realized_pnl": _str(grouped.get(first_day + timedelta(days=index), Decimal("0")))}
         for index in range(days)
@@ -868,7 +955,8 @@ async def performance(
         "series": series,
         "source": "PERSISTED_FILLS",
         "fees_included": True,
-        "funding_included": False,
+        "funding_included": funding_record_count > 0,
+        "funding_record_count": funding_record_count,
     }
 
 
@@ -884,26 +972,13 @@ async def overview(
     pnl_breakdown = await realized_pnl_breakdown_for_day(session, settings.timezone, today, mode=mode)
     daily_pnl = pnl_breakdown["net"]
 
-    # Include both fully closed trades and trades with exit fills today (e.g. target 1 partial closes)
-    exit_fill_trade_ids = list(
+    # Win/loss counts are complete trades closed in the market-local day. A Target 1
+    # partial fill contributes to daily cash P&L above, but is not mislabelled as a fully
+    # won/lost trade while its protected runner is still open.
+    trades_for_pnl = list(
         (
             await session.scalars(
-                select(Fill.trade_id)
-                .where(
-                    Fill.mode == mode,
-                    Fill.entry_exit == "EXIT",
-                    Fill.fill_time >= start_utc,
-                    Fill.fill_time < end_utc,
-                )
-                .distinct()
-            )
-        ).all()
-    )
-    closed_trade_ids = list(
-        (
-            await session.scalars(
-                select(Trade.id)
-                .where(
+                select(Trade).where(
                     Trade.mode == mode,
                     Trade.status == "CLOSED",
                     Trade.closed_at >= start_utc,
@@ -912,42 +987,28 @@ async def overview(
             )
         ).all()
     )
-    all_exited_ids = set(exit_fill_trade_ids) | set(closed_trade_ids)
-    if all_exited_ids:
-        trades_for_pnl = list(
-            (
-                await session.scalars(
-                    select(Trade).where(Trade.id.in_(all_exited_ids))
-                )
-            ).all()
-        )
-        winning_trades = [t for t in trades_for_pnl if (t.net_realized_pnl or Decimal("0")) > 0]
-        losing_trades = [t for t in trades_for_pnl if (t.net_realized_pnl or Decimal("0")) < 0]
-        wins = len(winning_trades)
-        losses = len(losing_trades)
-        closed_today = len(trades_for_pnl)
-        win_sum = sum((t.net_realized_pnl for t in winning_trades if t.net_realized_pnl is not None), Decimal("0"))
-        loss_sum = sum((t.net_realized_pnl for t in losing_trades if t.net_realized_pnl is not None), Decimal("0"))
-        avg_profit_today = (win_sum / wins) if wins > 0 else Decimal("0")
-        avg_loss_today = (loss_sum / losses) if losses > 0 else Decimal("0")
-        avg_pnl_today = (daily_pnl / closed_today) if closed_today > 0 else Decimal("0")
-    else:
-        wins = 0
-        losses = 0
-        closed_today = 0
-        avg_profit_today = Decimal("0")
-        avg_loss_today = Decimal("0")
-        avg_pnl_today = Decimal("0")
+    winning_trades = [t for t in trades_for_pnl if (t.net_realized_pnl or Decimal("0")) > 0]
+    losing_trades = [t for t in trades_for_pnl if (t.net_realized_pnl or Decimal("0")) < 0]
+    wins = len(winning_trades)
+    losses = len(losing_trades)
+    closed_today = len(trades_for_pnl)
+    win_sum = sum((t.net_realized_pnl for t in winning_trades if t.net_realized_pnl is not None), Decimal("0"))
+    loss_sum = sum((t.net_realized_pnl for t in losing_trades if t.net_realized_pnl is not None), Decimal("0"))
+    completed_net_sum = sum(
+        (t.net_realized_pnl for t in trades_for_pnl if t.net_realized_pnl is not None), Decimal("0")
+    )
+    avg_profit_today = (win_sum / wins) if wins > 0 else Decimal("0")
+    avg_loss_today = (loss_sum / losses) if losses > 0 else Decimal("0")
+    # This is a completed-position statistic, distinct from the daily fill cash ledger
+    # (which also includes partial exits and costs incurred today).
+    avg_pnl_today = (completed_net_sum / closed_today) if closed_today > 0 else Decimal("0")
 
-    # All-time stats for the active trading mode
+    # All-time win/loss statistics use only completed positions. Partially realized
+    # runners remain visible in positions but cannot inflate a completed-trade win rate.
     all_mode_exited_trades = list(
         (
             await session.scalars(
-                select(Trade).where(
-                    Trade.mode == mode,
-                    Trade.net_realized_pnl.is_not(None),
-                    Trade.net_realized_pnl != Decimal("0"),
-                )
+                select(Trade).where(Trade.mode == mode, Trade.status == "CLOSED")
             )
         ).all()
     )
@@ -999,7 +1060,12 @@ async def overview(
     )
     statuses = {str(key): int(value) for key, value in status_counts.all()}
     wallet = await _wallet_snapshot(request, session, mode)
-    funding_available = bool(active) and all(trade.funding_data_available for trade in active)
+    if mode == "PAPER":
+        funding_status = "NOT_APPLICABLE_PAPER"
+    elif pnl_breakdown["funding_record_count"] > 0:
+        funding_status = "RECORDED_FROM_PERSISTED_FILLS"
+    else:
+        funding_status = "NOT_AVAILABLE"
     return {
         "mode": mode,
         "market_day": today.isoformat(),
@@ -1007,8 +1073,11 @@ async def overview(
         "day_pnl": {
             "realized_net": _str(daily_pnl),
             "gross": _str(pnl_breakdown["gross"]),
+            "transaction_fees_today": _str(pnl_breakdown["fees_paid"]),
             "fees_today": _str(pnl_breakdown["fees_paid"]),
             "funding_today": _str(pnl_breakdown["funding_paid"]),
+            "fill_count": pnl_breakdown["fill_count"],
+            "funding_record_count": pnl_breakdown["funding_record_count"],
             "average_profit": _str(avg_profit_today),
             "average_loss": _str(avg_loss_today),
             "average_pnl": _str(avg_pnl_today),
@@ -1018,9 +1087,9 @@ async def overview(
             "currency": settings.shark_margin_asset,
             "source": "PERSISTED_FILLS_AND_LAST_PRICE",
             "fees_included": True,
-            "funding_included": funding_available,
-            "funding_status": "AVAILABLE" if funding_available else "NOT_AVAILABLE",
-            "note": "Exchange fees are included where fills are available; funding is not assumed.",
+            "funding_included": pnl_breakdown["funding_record_count"] > 0,
+            "funding_status": funding_status,
+            "note": "Net realized P&L = gross realized P&L − transaction fees − recorded funding. Missing LIVE funding is never assumed to be zero.",
         },
         "trades_today": trades_today,
         "signals_today": signals_today,
@@ -1283,6 +1352,7 @@ async def history(
     hist_total_net = sum((t.net_realized_pnl for t in matching_all if t.net_realized_pnl is not None), Decimal("0"))
     hist_total_gross = sum((t.gross_realized_pnl for t in matching_all if t.gross_realized_pnl is not None), Decimal("0"))
     hist_total_fees = sum((t.fees_paid for t in matching_all if t.fees_paid is not None), Decimal("0"))
+    hist_total_funding = sum((t.funding_paid for t in matching_all if t.funding_paid is not None), Decimal("0"))
     hist_win_sum = sum((t.net_realized_pnl for t in hist_wins if t.net_realized_pnl is not None), Decimal("0"))
     hist_loss_sum = sum((t.net_realized_pnl for t in hist_losses if t.net_realized_pnl is not None), Decimal("0"))
     hist_closed = len(hist_wins) + len(hist_losses)
@@ -1304,6 +1374,7 @@ async def history(
             "total_net_pnl": _str(hist_total_net),
             "total_gross_pnl": _str(hist_total_gross),
             "total_fees": _str(hist_total_fees),
+            "total_funding": _str(hist_total_funding),
             "avg_profit": _str(hist_avg_profit),
             "avg_loss": _str(hist_avg_loss),
             "avg_pnl": _str(hist_avg_pnl),
@@ -1523,10 +1594,13 @@ async def update_trade_risk(
         raise HTTPException(status_code=409, detail="A fresh Shark last price is required; no risk edit was applied")
     if new_stop is None or new_stop >= ticker.last_price:
         raise HTTPException(status_code=422, detail="For a long position, the stop must be below the current last price")
-    if t1 is None or t2 is None or t3 is None or any(value <= entry for value in (t1, t2, t3)):
-        raise HTTPException(status_code=422, detail="Target prices must be above entry and satisfy T1 < T2 < T3")
-    if not t1 < t2 < t3:
-        raise HTTPException(status_code=422, detail="Target prices must be above entry and satisfy T1 < T2 < T3")
+    if t1 is None or t1 <= entry:
+        raise HTTPException(status_code=422, detail="Target 1 must be above the entry price")
+    if trade.secondary_targets_enabled:
+        if t2 is None or t3 is None or t2 <= entry or t3 <= entry or not t1 < t2 < t3:
+            raise HTTPException(status_code=422, detail="Secondary targets must be above entry and satisfy T1 < T2 < T3")
+    elif any(value is not None for value in (t2, t3)):
+        raise HTTPException(status_code=422, detail="Target 2 and Target 3 are disabled for this position")
     old = {
         "stop_price": _str(trade.stop_price),
         "target1_price": _str(trade.target1_price),
@@ -1779,41 +1853,13 @@ async def retry_notification(
 async def toggle_dashboard_auth(
     body: DashboardAuthToggleRequest,
     request: Request,
-    session: AsyncSession = Depends(session_dependency),
 ) -> dict[str, Any]:
-    _require_role(request, "ADMIN")
-    settings: Settings = request.app.state.settings
-    settings.dashboard_auth_enabled = body.enabled
-
-    if settings.environment != "test":
-        env_path = PROJECT_ROOT / "backend" / ".env"
-        if env_path.exists():
-            try:
-                content = env_path.read_text(encoding="utf-8")
-                if re.search(r"^DASHBOARD_AUTH_ENABLED=", content, flags=re.MULTILINE):
-                    content = re.sub(
-                        r"^DASHBOARD_AUTH_ENABLED=.*$",
-                        f"DASHBOARD_AUTH_ENABLED={'true' if body.enabled else 'false'}",
-                        content,
-                        flags=re.MULTILINE,
-                    )
-                else:
-                    content += f"\nDASHBOARD_AUTH_ENABLED={'true' if body.enabled else 'false'}\n"
-                env_path.write_text(content, encoding="utf-8")
-            except Exception:
-                pass
-
-    session.add(
-        _audit(
-            action="DASHBOARD_AUTH_TOGGLED",
-            entity_type="dashboard_auth",
-            entity_id="dashboard_auth",
-            details={"enabled": body.enabled},
+    """Compatibility guard for older consoles; authentication may not be disabled."""
+    _require_role(request, "OWNER")
+    if not body.enabled:
+        raise HTTPException(
+            status_code=422,
+            detail="Dashboard authentication is mandatory and cannot be disabled from the console",
         )
-    )
-    await session.flush()
-    return {
-        "dashboard_auth_enabled": settings.dashboard_auth_enabled,
-        "dashboard_auth_configured": bool(settings.dashboard_api_token),
-    }
+    return {"dashboard_auth_enabled": True, "dashboard_auth_configured": True}
 

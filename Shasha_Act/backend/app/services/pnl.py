@@ -17,6 +17,8 @@ class DayPnlBreakdown(TypedDict):
     gross: Decimal
     fees_paid: Decimal
     funding_paid: Decimal
+    fill_count: int
+    funding_record_count: int
 
 
 async def realized_pnl_for_day(
@@ -57,15 +59,22 @@ async def realized_pnl_breakdown_for_day(
     gross_total = Decimal("0")
     fees_total = Decimal("0")
     funding_total = Decimal("0")
+    fill_count = 0
+    funding_record_count = 0
     for gross, fee, funding in rows.all():
+        fill_count += 1
         gross_total += gross or Decimal("0")
         fees_total += fee or Decimal("0")
-        funding_total += funding or Decimal("0")
+        if funding is not None:
+            funding_record_count += 1
+            funding_total += funding
     return DayPnlBreakdown(
         net=gross_total - fees_total - funding_total,
         gross=gross_total,
         fees_paid=fees_total,
         funding_paid=funding_total,
+        fill_count=fill_count,
+        funding_record_count=funding_record_count,
     )
 
 

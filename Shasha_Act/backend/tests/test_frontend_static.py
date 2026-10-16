@@ -5,16 +5,20 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2] / "frontend"
 
 
-def test_dashboard_assets_are_local_and_support_auth_toggle() -> None:
+def test_dashboard_assets_are_local_and_use_password_signin() -> None:
     html = (ROOT / "index.html").read_text()
     script = (ROOT / "assets" / "app.js").read_text()
     assert "/assets/styles.css" in html
     assert "/assets/app.js" in html
     assert "localhost" not in script.lower()
     assert "127.0.0.1" not in script
-    assert "X-Dashboard-Token" in script
+    assert "X-Session-Token" in script
+    assert "X-Dashboard-Token" not in script
     assert "type=\"password\"" in html
-    assert "dashboard-auth" in script
+    assert "Create the initial owner" in html
+    assert "/api/auth/signup" in script
+    assert "dashboard authentication cannot be switched off" in script
+    assert "Daily P&amp;L ledger" in html
 
 
 

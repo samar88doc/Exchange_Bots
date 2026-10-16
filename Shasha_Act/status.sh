@@ -92,9 +92,10 @@ if os.path.isfile(env_file):
                 env_vars[k.strip()] = v.strip().strip("'\"")
 
 port = int(env_vars.get("PORT", "8000"))
-dashboard_token = env_vars.get("DASHBOARD_API_TOKEN", "")
-webhook_token = env_vars.get("TRADINGVIEW_WEBHOOK_TOKEN", "")
-auth_enabled = env_vars.get("DASHBOARD_AUTH_ENABLED", "true").lower() != "false"
+# An optional server-to-server automation token lets this local status command query
+# protected metrics. It is never displayed or used by the browser dashboard.
+automation_token = env_vars.get("DASHBOARD_API_TOKEN", "")
+webhook_configured = bool(env_vars.get("TRADINGVIEW_WEBHOOK_TOKEN", ""))
 
 # Check Process Status
 pid = None
@@ -150,7 +151,7 @@ def fetch_json(url, headers=None, timeout=2):
         return None
 
 base_url = f"http://127.0.0.1:{port}"
-api_headers = {"X-Dashboard-Token": dashboard_token} if dashboard_token else {}
+api_headers = {"X-Dashboard-Token": automation_token} if automation_token else {}
 
 health_data = fetch_json(f"{base_url}/api/health")
 ready_data = fetch_json(f"{base_url}/api/ready")
@@ -334,23 +335,19 @@ if items:
 # 4. NETWORK & WEBHOOKS
 print(f"{C_BOLD}► ENDPOINTS & INGRESS{C_RESET}")
 print(f"  Dashboard UI     :  {C_CYAN}http://localhost:{port}/{C_RESET}")
-if auth_enabled:
-    if dashboard_token:
-        print(f"  Dashboard Auth   :  {C_GREEN}Enabled{C_RESET} (Token configured in .env)")
-    else:
-        print(f"  Dashboard Auth   :  {C_YELLOW}Enabled (Token missing in .env){C_RESET}")
-else:
-    print(f"  Dashboard Auth   :  {C_YELLOW}Disabled (Direct access){C_RESET}")
+print(f"  Dashboard Auth   :  {C_GREEN}Enabled{C_RESET} (operator username/password required)")
+if not automation_token:
+    print(f"  Private Metrics  :  {C_DIM}Not queried; sign in to the dashboard or configure a server automation token.{C_RESET}")
 
 if ngrok_url:
     print(f"  Public Ngrok URL :  {C_GREEN}{ngrok_url}{C_RESET}")
-    if webhook_token:
-        print(f"  Public Webhook   :  {C_GREEN}{ngrok_url}/api/webhooks/tradingview/{webhook_token}{C_RESET}")
+    if webhook_configured:
+        print(f"  Public Webhook   :  {C_DIM}Configured (token intentionally not displayed){C_RESET}")
 else:
     print(f"  Public Ngrok URL :  {C_DIM}Inactive (Run ngrok for public TradingView webhook){C_RESET}")
 
-if webhook_token:
-    print(f"  Local Webhook    :  {C_DIM}http://localhost:{port}/api/webhooks/tradingview/{webhook_token}{C_RESET}")
+if webhook_configured:
+    print(f"  Local Webhook    :  {C_DIM}Configured (token intentionally not displayed){C_RESET}")
 
 print("")
 

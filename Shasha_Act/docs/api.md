@@ -4,17 +4,18 @@ The OpenAPI document is served by the running application at `/api/openapi.json`
 
 ## Authentication
 
-Two explicit, cookie-free credential paths are accepted on every dashboard route:
+Browser dashboard requests require an opaque, cookie-free operator session:
 
 | Credential | Header | Issued by |
 |---|---|---|
 | Operator session | `X-Session-Token` | `POST /api/auth/login` (username + password), stored server-side as a hash, revocable |
-| Server automation token | `X-Dashboard-Token` | `DASHBOARD_API_TOKEN` in the server environment |
 
-Because no ambient cookie credential exists, no CSRF token is needed and the console keeps
-working when it is embedded in a trusted preview frame. A resolved session is the only identity
-that can hold a disclaimer or subscription obligation; the server token is treated as an
-owner-level automation credential.
+Because no ambient cookie credential exists, no CSRF token is needed. The dashboard does not use,
+display or accept an automation token in its browser flow. A resolved session is the only identity
+that can hold a disclaimer or subscription obligation. `DASHBOARD_API_TOKEN` / `X-Dashboard-Token`,
+when deliberately configured, remains a server-to-server automation integration credential; do not
+put it in a browser, URL, client-side code or documentation intended for operators. Framing is denied
+by default and must be explicitly allowlisted if a trusted integration requires it.
 
 - Mutating calls from a **session** are gated by `require_mutation_allowed`: an unacknowledged
   risk disclaimer returns `403 DISCLAIMER_NOT_ACCEPTED`, and an expired/suspended/cancelled
@@ -49,8 +50,9 @@ Response example:
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/api/public/config` | Unauthenticated sign-in metadata: app name, whether username sign-in and server-token sign-in are available, disclaimer text, plan name/fee/currency/cycle and whether the subscription is enforced. Never returns a secret. |
-| `POST` | `/api/auth/login` | Username + password → session token, expiry, user, subscription and disclaimer state. |
+| `GET` | `/api/public/config` | Unauthenticated sign-in metadata: app name, whether initial-owner sign-up is currently available, disclaimer text, plan name/fee/currency/cycle and whether the subscription is enforced. Never returns a secret. |
+| `POST` | `/api/auth/signup` | Creates exactly one initial `OWNER` and returns a session only when `INITIAL_OWNER_SIGNUP_ENABLED=true` and no account exists. Otherwise refuses the request. |
+| `POST` | `/api/auth/login` | Username + password → session token, finite expiry, user, subscription and disclaimer state. `remember: true` selects the longer configured server-side lifetime. |
 | `POST` | `/api/auth/logout` | Revokes the presented session. |
 | `GET` | `/api/auth/me` | Current identity, auth method, subscription state, disclaimer state and role permissions. |
 | `POST` | `/api/auth/disclaimer` | Records the operator's acknowledgement of the risk disclaimer (session required). |
@@ -67,11 +69,15 @@ mutating route:
 |---|---|
 | `VIEWER` | read-only dashboard routes, `/api/auth/me`, `/api/subscription` (read) |
 | `OPERATOR` | `PATCH /api/settings` (risk + strategy), `POST /api/control/pause`, `POST /api/control/cancel-pending`, `POST /api/control/mode/paper`, `POST /api/trades/{id}/risk\|close\|cancel-entry`, `POST /api/events/{id}/retry-notification` |
-| `ADMIN` | `POST /api/control/mode/live`, `POST /api/control/dashboard-auth`, `PATCH /api/subscription`, every `/api/users` route |
+| `ADMIN` | `POST /api/control/mode/live`, `PATCH /api/subscription`, operator management excluding OWNER accounts |
+| `OWNER` | Create, promote, edit, demote or disable OWNER accounts; owner-only account hierarchy decisions |
 
-A refused call returns `403` with the required role in the detail and changes nothing. The server
-automation token (and a host that deliberately set `DASHBOARD_AUTH_ENABLED=false`) has no operator
-identity and keeps owner-level access — that is the documented automation path, not a role bypass.
+Authentication cannot be disabled. `POST /api/control/dashboard-auth` is retained solely as a
+compatibility no-op for `{"enabled": true}` and rejects an attempt to turn access off. A refused call
+returns `403` with the required role in the detail and changes nothing. An ADMIN cannot create, promote,
+edit, demote, reset the password of, or disable an OWNER. The final active OWNER cannot be demoted or
+disabled; password changes or disablement revoke that user's outstanding sessions. The optional server
+automation token is an owner-level integration identity, not a browser login or a role-bypass pattern.
 
 ## Dashboard read routes
 
@@ -79,7 +85,7 @@ identity and keeps owner-level access — that is the documented automation path
 |---|---|---|
 | `GET` | `/api/settings` | Effective mode, non-secret configuration flags, risk limits, the strategy block (entry candle interval, stop %, Target 1 %, Target 1 close %, trailing %, entry-source provenance) and market-day timezone |
 | `GET` | `/api/overview` | Market-local day P&L, wallet status, wins/losses and position/queue counts |
-| `GET` | `/api/performance?days=30` | Daily realized net-fill series (7–90 days; fees included, funding not assumed) |
+| `GET` | `/api/performance?days=30` | Daily realized net-fill series (7–90 days; transaction fees and persisted funding included, with funding-record availability stated explicitly) |
 | `GET` | `/api/positions` | Active and unresolved trade state; last price/liquidation data can be unavailable |
 | `GET` | `/api/pending-entries` | Queued/submitted limit entries, expiry and current status; pending limits are not counted as open positions |
 | `GET` | `/api/market?q=&sort=&order=` | Fresh public ticker snapshots, never synthetic values |

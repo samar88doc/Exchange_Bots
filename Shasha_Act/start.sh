@@ -74,9 +74,6 @@ for i in {1..20}; do
 done
 
 if [ "$READY" = "true" ]; then
-  DASHBOARD_TOKEN=$(grep -E '^DASHBOARD_API_TOKEN=' "$ENV_FILE" | cut -d '=' -f2- | tr -d ' "' || echo "")
-  DASHBOARD_AUTH=$(grep -E '^DASHBOARD_AUTH_ENABLED=' "$ENV_FILE" | cut -d '=' -f2- | tr -d ' "' | tr '[:upper:]' '[:lower:]' || echo "true")
-  WEBHOOK_TOKEN=$(grep -E '^TRADINGVIEW_WEBHOOK_TOKEN=' "$ENV_FILE" | cut -d '=' -f2- | tr -d ' "' || echo "")
 
   # Check for public ngrok HTTPS tunnel
   PUBLIC_URL=$(curl -s http://127.0.0.1:4040/api/tunnels 2>/dev/null | grep -o 'https://[^"]*\.ngrok[^"]*' | head -n 1 || echo "")
@@ -96,14 +93,10 @@ if [ "$READY" = "true" ]; then
   echo "══════════════════════════════════════════════════════════"
   echo "  • Dashboard UI:     http://localhost:${PORT}/"
   echo "  • Markets Feed:     http://localhost:${PORT}/#markets"
-  if [ "$DASHBOARD_AUTH" = "false" ]; then
-    echo "  • Dashboard Token:  DISABLED (direct access without token)"
-  else
-    echo "  • Dashboard Token:  $DASHBOARD_TOKEN"
-  fi
-  echo "  • Local Webhook:    http://localhost:${PORT}/api/webhooks/tradingview/${WEBHOOK_TOKEN}"
+  echo "  • Dashboard access: Sign in at the dashboard with an operator username and password"
+  echo "  • Local Webhook:    http://localhost:${PORT}/api/webhooks/tradingview/<configured-token>"
   if [ -n "$PUBLIC_URL" ]; then
-    echo "  • Public Webhook:   ${PUBLIC_URL}/api/webhooks/tradingview/${WEBHOOK_TOKEN}"
+    echo "  • Public Webhook:   ${PUBLIC_URL}/api/webhooks/tradingview/<configured-token>"
   else
     echo "  • Public Webhook:   (Run 'ngrok http ${PORT}' for TradingView cloud ingress)"
   fi

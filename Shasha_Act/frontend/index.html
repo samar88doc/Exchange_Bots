@@ -6,8 +6,8 @@
   <meta name="color-scheme" content="dark">
   <meta name="theme-color" content="#050711">
   <title>Shasha Act — Neural Trading Operations</title>
-  <link rel="stylesheet" href="/assets/styles.css?v=20261016_01">
-  <script defer src="/assets/app.js?v=20261016_01"></script>
+  <link rel="stylesheet" href="/assets/styles.css?v=20261016_02">
+  <script defer src="/assets/app.js?v=20261016_02"></script>
 </head>
 <body>
   <canvas id="neural-field" aria-hidden="true"></canvas>
@@ -106,7 +106,7 @@
             <div class="kpi-glow"></div>
           </article>
           <article class="kpi-card" data-accent="teal">
-            <div class="kpi-label"><span>AVG PROFIT / LOSS</span><span class="info-dot" title="Average net P&amp;L per trade today with average win and loss breakdown">i</span></div>
+            <div class="kpi-label"><span>AVG PROFIT / LOSS</span><span class="info-dot" title="Average net P&amp;L per completed trade today, with average win and loss breakdown">i</span></div>
             <div class="kpi-value" id="kpi-avg-pnl">—</div>
             <div class="kpi-foot">
               <span class="avg-subtext" id="kpi-avg-pnl-note">
@@ -137,6 +137,25 @@
             <div class="kpi-glow"></div>
           </article>
         </div>
+
+        <section class="panel pnl-ledger-panel" aria-labelledby="daily-pnl-heading">
+          <div class="panel-head">
+            <div>
+              <div class="panel-title" id="daily-pnl-heading">Daily P&amp;L ledger</div>
+              <div class="panel-caption">Persisted fills for the configured market-local day · PAPER and LIVE remain separate</div>
+            </div>
+            <span class="badge" id="daily-pnl-mode">—</span>
+          </div>
+          <div class="pnl-ledger-grid">
+            <div class="pnl-ledger-item"><span>GROSS REALIZED</span><strong id="day-gross-pnl">—</strong><small>Before costs</small></div>
+            <div class="pnl-ledger-item primary"><span>NET REALIZED P&amp;L</span><strong id="day-net-pnl">—</strong><small id="day-net-pnl-note">Persisted fills only</small></div>
+            <div class="pnl-ledger-item"><span>WIN / LOSS TRADES</span><strong id="day-win-loss">—</strong><small id="day-win-loss-note">Completed positions today</small></div>
+            <div class="pnl-ledger-item"><span>TRANSACTION FEES</span><strong id="day-transaction-fees">—</strong><small>Entry and exit fill fees</small></div>
+            <div class="pnl-ledger-item"><span>FUNDING FEES</span><strong id="day-funding-fees">—</strong><small id="day-funding-note">Status unavailable</small></div>
+            <div class="pnl-ledger-item"><span>OPEN UNREALIZED</span><strong id="day-unrealized-pnl">—</strong><small id="day-unrealized-note">Fresh last prices required</small></div>
+            <div class="pnl-ledger-item primary"><span>NET P&amp;L INCLUDING OPEN</span><strong id="day-total-pnl">—</strong><small>Realized net + unrealized</small></div>
+          </div>
+        </section>
 
         <section class="panel neural-panel">
           <div class="panel-head">
@@ -584,13 +603,12 @@
             </section>
             <section class="panel settings-panel" id="dashboard-auth-panel">
               <div class="panel-head">
-                <div><div class="panel-title">Dashboard access</div><div class="panel-caption">Username/password sessions or a server-side automation token</div></div>
-                <span class="badge" id="auth-status-badge">CHECKING</span>
+                <div><div class="panel-title">Dashboard access</div><div class="panel-caption">Username/password operator sessions are required</div></div>
+                <span class="badge badge-green" id="auth-status-badge">ENABLED</span>
               </div>
               <div class="auth-settings-body">
-                <p id="auth-status-description">Loading authentication status…</p>
+                <p id="auth-status-description">Authentication is always enabled. Create or manage operator accounts from Access control; browser sign-in never requires an automation token.</p>
                 <div class="inline-actions">
-                  <button type="button" class="button button-secondary" id="toggle-auth-btn">Toggle dashboard-auth</button>
                   <button type="button" class="button button-secondary" id="clear-saved-token-btn">Clear saved browser session</button>
                 </div>
               </div>
@@ -697,26 +715,23 @@
         </ul>
       </div>
       <div class="auth-form-side">
-        <div class="eyebrow">SIGN IN</div>
-        <h2>Welcome back</h2>
-        <div class="auth-tabs">
-          <button class="auth-tab active" data-auth-mode="password">Username &amp; password</button>
-          <button class="auth-tab" data-auth-mode="token">Server token</button>
-        </div>
+        <div class="eyebrow" id="auth-mode-label">OPERATOR SIGN IN</div>
+        <h2 id="auth-mode-title">Welcome back</h2>
         <form id="auth-form">
           <div id="auth-password-fields">
             <label>Username<input id="auth-username" type="text" autocomplete="username" spellcheck="false" required></label>
-            <label>Password<input id="auth-password" type="password" autocomplete="current-password" required></label>
-          </div>
-          <div id="auth-token-fields" class="hidden">
-            <label>Dashboard access token<input id="auth-token" type="password" autocomplete="off"></label>
+            <label class="hidden" id="auth-display-name-row">Display name <span class="muted">(optional)</span><input id="auth-display-name" type="text" autocomplete="name" maxlength="96"></label>
+            <label>Password<input id="auth-password" type="password" autocomplete="current-password" minlength="8" required></label>
+            <label class="hidden" id="auth-confirm-password-row">Confirm password<input id="auth-confirm-password" type="password" autocomplete="new-password" minlength="12"></label>
           </div>
           <label class="checkbox-row"><input type="checkbox" id="auth-remember" checked><span>Keep me signed in on this device</span></label>
           <label class="checkbox-row disclaimer-check"><input type="checkbox" id="auth-disclaimer-accept"><span>I have read and accept the <b>risk disclaimer</b>: leveraged derivatives can lose my entire margin and paper results are simulated.</span></label>
           <button class="button button-primary full-width" type="submit" id="auth-submit">Open console <span>→</span></button>
           <div class="auth-error" id="auth-error"></div>
         </form>
-        <div class="auth-note"><span class="lock-icon">⌑</span><span>Session tokens are stored server-side as hashes and can be revoked at any time.</span></div>
+        <button class="auth-mode-switch hidden" type="button" id="auth-signup-toggle">First deployment? Create the initial owner</button>
+        <button class="auth-mode-switch hidden" type="button" id="auth-login-toggle">Already have an operator account? Sign in</button>
+        <div class="auth-note"><span class="lock-icon">⌑</span><span id="auth-note-copy">Sign in once with your username and password. Your revocable session can stay signed in on this device.</span></div>
         <div class="auth-disclaimer" id="auth-disclaimer-box"><strong>Risk disclaimer</strong><p id="auth-disclaimer-copy"></p></div>
       </div>
     </div>

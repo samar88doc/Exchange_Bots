@@ -3,9 +3,8 @@
    -------------------------------------------------------------------------------------
    Contract notes (must stay true):
    * Every request is same-origin and relative. No absolute host is ever hard-coded.
-   * Session auth sends `X-Session-Token`; the server automation token sends
-     `X-Dashboard-Token`. Both are explicit headers, never cookies, so no CSRF token
-     is required and an embedded frame stays usable.
+   * Operator sign-in creates an opaque `X-Session-Token`. The console stores and sends
+     it transparently, so an operator never has to paste an access token.
    * Any value the server did not confirm is rendered as `Unavailable` instead of 0.
    * This file is loaded as an external asset because the server ships a strict
      `script-src 'self'` content policy: no inline script, no remote bundle.
@@ -14,7 +13,6 @@
 
 (() => {
   const SESSION_STORAGE_KEY = "shasha_session_token";
-  const TOKEN_STORAGE_KEY = "shasha_dashboard_token";
   const PREF_STORAGE_KEY = "shasha_console_prefs";
   const POLL_MS = 15000;
 
@@ -146,8 +144,10 @@
   /* --------------------------------------------------------------------- state ----- */
   const state = {
     authMethod: null,
-    sessionToken: localStorage.getItem(SESSION_STORAGE_KEY) || "",
-    serverToken: localStorage.getItem(TOKEN_STORAGE_KEY) || "",
+    authMode: "login",
+    publicConfig: null,
+    sessionToken: localStorage.getItem(SESSION_STORAGE_KEY) || sessionStorage.getItem(SESSION_STORAGE_KEY) || "",
+    sessionPersistent: Boolean(localStorage.getItem(SESSION_STORAGE_KEY)),
     user: null,
     subscription: null,
     disclaimer: null,
@@ -206,7 +206,6 @@
     const { method = "GET", body, silent = false, raw = false } = options;
     const headers = { Accept: raw ? "*/*" : "application/json" };
     if (state.sessionToken) headers["X-Session-Token"] = state.sessionToken;
-    if (state.serverToken) headers["X-Dashboard-Token"] = state.serverToken;
     if (body !== undefined) headers["Content-Type"] = "application/json";
     let response;
     try {
@@ -243,15 +242,43 @@
     return payload;
   }
 
+  const saveSession = (token, remember) => {
+    state.sessionToken = token;
+    state.sessionPersistent = Boolean(remember);
+    localStorage.removeItem(SESSION_STORAGE_KEY);
+    sessionStorage.removeItem(SESSION_STORAGE_KEY);
+    (remember ? localStorage : sessionStorage).setItem(SESSION_STORAGE_KEY, token);
+  };
+
   const clearCredentials = () => {
     state.sessionToken = "";
-    state.serverToken = "";
+    state.sessionPersistent = false;
     state.user = null;
     localStorage.removeItem(SESSION_STORAGE_KEY);
-    localStorage.removeItem(TOKEN_STORAGE_KEY);
+    sessionStorage.removeItem(SESSION_STORAGE_KEY);
   };
 
   /* --------------------------------------------------------------------- auth ------ */
+  function setAuthMode(mode) {
+    const signupAvailable = Boolean(state.publicConfig?.initial_owner_signup_enabled);
+    state.authMode = mode === "signup" && signupAvailable ? "signup" : "login";
+    const signingUp = state.authMode === "signup";
+    $("#auth-mode-label").textContent = signingUp ? "INITIAL OWNER SETUP" : "OPERATOR SIGN IN";
+    $("#auth-mode-title").textContent = signingUp ? "Create the first owner" : "Welcome back";
+    $("#auth-display-name-row").classList.toggle("hidden", !signingUp);
+    $("#auth-confirm-password-row").classList.toggle("hidden", !signingUp);
+    $("#auth-confirm-password").required = signingUp;
+    $("#auth-password").minLength = signingUp ? 12 : 8;
+    $("#auth-password").autocomplete = signingUp ? "new-password" : "current-password";
+    $("#auth-submit").innerHTML = signingUp ? "Create initial owner <span>→</span>" : "Open console <span>→</span>";
+    $("#auth-signup-toggle").classList.toggle("hidden", !signupAvailable || signingUp);
+    $("#auth-login-toggle").classList.toggle("hidden", !signingUp);
+    $("#auth-note-copy").textContent = signingUp
+      ? "This one-time setup creates the first OWNER. Future accounts are created from Access control."
+      : "Sign in once with your username and password. Your revocable session can stay signed in on this device.";
+    $("#auth-error").textContent = "";
+  }
+
   function showAuth(message = "") {
     $("#auth-overlay").classList.remove("hidden");
     $("#app-shell").hidden = true;
@@ -273,11 +300,9 @@
       $("#auth-fee").textContent = config.subscription
         ? `${config.subscription.fee ?? "—"} ${config.subscription.currency ?? ""} · ${config.subscription.billing_cycle ?? ""}`
         : "Unavailable";
-      if (!config.server_token_signin_available) {
-        $("#auth-token-fields")?.classList.add("hidden");
-        $('.auth-tab[data-auth-mode="token"]')?.classList.add("hidden");
-      }
       if (!config.disclaimer_required) $("#auth-disclaimer-accept").checked = true;
+      state.publicConfig = config;
+      setAuthMode(state.authMode);
       return config;
     } catch {
       return null;
@@ -289,34 +314,25 @@
     const errorBox = $("#auth-error");
     errorBox.textContent = "";
     button.disabled = true;
-    button.innerHTML = `<span class="spinner"></span>Verifying`;
+    button.innerHTML = `<span class="spinner"></span>${mode === "signup" ? "Creating account" : "Verifying"}`;
     try {
-      if (mode === "password") {
-        const result = await api("/api/auth/login", { method: "POST", body: payload, silent: true });
-        state.sessionToken = result.session_token || "";
-        state.user = result.user || null;
-        state.subscription = result.subscription || null;
-        state.authMethod = "SESSION";
-        localStorage.setItem(SESSION_STORAGE_KEY, state.sessionToken);
-        localStorage.removeItem(TOKEN_STORAGE_KEY);
-        if (result.disclaimer) state.disclaimer = result.disclaimer;
-        await loadIdentity();
-        if (state.disclaimer && state.disclaimer.required && !state.disclaimer.accepted_at) {
-          try {
-            await api("/api/auth/disclaimer", { method: "POST", silent: true });
-            await loadIdentity();
-          } catch (error) {
-            errorBox.textContent = `Signed in, but the disclaimer must be acknowledged: ${describeError(error)}`;
-          }
+      const path = mode === "signup" ? "/api/auth/signup" : "/api/auth/login";
+      if (!["login", "signup"].includes(mode)) throw new Error("Username and password sign-in is required");
+      const result = await api(path, { method: "POST", body: payload, silent: true });
+      if (!result.session_token) throw new Error("The server did not create a dashboard session");
+      saveSession(result.session_token, payload.remember !== false);
+      state.user = result.user || null;
+      state.subscription = result.subscription || null;
+      state.authMethod = "SESSION";
+      if (result.disclaimer) state.disclaimer = result.disclaimer;
+      await loadIdentity();
+      if (state.disclaimer && state.disclaimer.required && !state.disclaimer.accepted_at) {
+        try {
+          await api("/api/auth/disclaimer", { method: "POST", silent: true });
+          await loadIdentity();
+        } catch (error) {
+          errorBox.textContent = `Signed in, but the disclaimer must be acknowledged: ${describeError(error)}`;
         }
-      } else {
-        state.serverToken = String(payload || "").trim();
-        if (!state.serverToken) throw new Error("Enter the dashboard access token");
-        localStorage.setItem(TOKEN_STORAGE_KEY, state.serverToken);
-        localStorage.removeItem(SESSION_STORAGE_KEY);
-        state.sessionToken = "";
-        state.authMethod = "SERVER_TOKEN";
-        await loadIdentity();
       }
       hideAuth();
       await bootstrapDashboard();
@@ -327,7 +343,7 @@
       errorBox.textContent = describeError(error);
     } finally {
       button.disabled = false;
-      button.textContent = "Open console →";
+      button.textContent = mode === "signup" ? "Create initial owner →" : "Open console →";
     }
   }
 
@@ -369,6 +385,49 @@
   }
 
   /* ------------------------------------------------------------------ dashboard ---- */
+  function renderDailyPnlLedger(overview) {
+    const day = overview.day_pnl || {};
+    const currency = day.currency || "USDT";
+    const renderValue = (id, value) => {
+      const node = $(id);
+      if (!node) return;
+      node.textContent = fmtMoney(value, currency, true);
+      node.className = pnlClass(value);
+    };
+    renderValue("#day-gross-pnl", day.gross);
+    renderValue("#day-net-pnl", day.realized_net);
+    renderValue("#day-transaction-fees", day.transaction_fees_today ?? day.fees_today);
+    renderValue("#day-funding-fees", day.funding_today);
+    renderValue("#day-unrealized-pnl", day.unrealized);
+    renderValue("#day-total-pnl", day.total);
+
+    const wins = overview.wins_today ?? 0;
+    const losses = overview.losses_today ?? 0;
+    const winLoss = $("#day-win-loss");
+    if (winLoss) {
+      winLoss.textContent = `${wins} W / ${losses} L`;
+      winLoss.className = wins > losses ? "positive" : losses > wins ? "negative" : "";
+    }
+    const winLossNote = $("#day-win-loss-note");
+    if (winLossNote) winLossNote.textContent = `${overview.closed_today ?? 0} completed position${overview.closed_today === 1 ? "" : "s"} closed today`;
+    const fundingStatus = String(day.funding_status || "NOT_AVAILABLE").replaceAll("_", " ");
+    const fundingNote = $("#day-funding-note");
+    if (fundingNote) fundingNote.textContent = fundingStatus === "RECORDED FROM PERSISTED FILLS"
+      ? `${day.funding_record_count ?? 0} persisted funding record${day.funding_record_count === 1 ? "" : "s"}`
+      : fundingStatus === "NOT APPLICABLE PAPER" ? "Not simulated in PAPER mode" : "LIVE funding data unavailable";
+    const unrealizedNote = $("#day-unrealized-note");
+    if (unrealizedNote) unrealizedNote.textContent = day.unrealized_status === "AVAILABLE"
+      ? "Fresh Shark last prices"
+      : "Stale or unavailable market data";
+    const netNote = $("#day-net-pnl-note");
+    if (netNote) netNote.textContent = `${day.fill_count ?? 0} persisted fill${day.fill_count === 1 ? "" : "s"} · gross − costs`;
+    const mode = $("#daily-pnl-mode");
+    if (mode) {
+      mode.textContent = `${overview.mode || "PAPER"} LEDGER`;
+      mode.className = `badge ${overview.mode === "LIVE" ? "badge-amber" : "badge-green"}`;
+    }
+  }
+
   function renderDashboard() {
     const overview = state.overview;
     const settings = state.settings;
@@ -452,6 +511,7 @@
       ? `${overview.pending_entries} pending entr${overview.pending_entries === 1 ? "y" : "ies"} are not confirmed positions`
       : "Every value comes from stored trade state";
 
+    renderDailyPnlLedger(overview);
     renderDashboardPositions();
     renderDashboardSignals();
     renderStrategySnapshot(settings);
@@ -1242,19 +1302,15 @@
     $("#enable-live-button").disabled = !settings.live_available;
 
     const authBadge = $("#auth-status-badge");
-    authBadge.textContent = settings.dashboard_auth_enabled ? "ENABLED" : "DISABLED";
-    authBadge.className = `badge ${settings.dashboard_auth_enabled ? "badge-green" : "badge-amber"}`;
-    $("#auth-status-description").innerHTML = settings.dashboard_auth_enabled
-      ? 'Authentication is <strong>ENABLED</strong>. The console accepts an operator session (<code>X-Session-Token</code>) or the server token (<code>X-Dashboard-Token</code>).'
-      : 'Authentication is <strong>DISABLED</strong>. Every same-origin caller can reach the API — enable it before exposing this host.';
-    $("#toggle-auth-btn").textContent = settings.dashboard_auth_enabled ? "Disable dashboard-auth" : "Enable dashboard-auth";
-    $("#toggle-auth-btn").disabled = !state.permissions.can_change_settings;
+    authBadge.textContent = "ENABLED";
+    authBadge.className = "badge badge-green";
+    $("#auth-status-description").innerHTML = 'Authentication is <strong>ENABLED</strong>. Operators sign in with username and password; dashboard authentication cannot be switched off.';
 
     $("#config-service-list").innerHTML = [
       ["Webhook ingress", settings.webhook_configured],
       ["Telegram alerts", settings.telegram_configured],
       ["Shark private API", settings.shark_credentials_configured],
-      ["Dashboard authentication", settings.dashboard_auth_enabled],
+      ["Dashboard authentication", true],
       ["LIVE server gate", settings.live_server_gate_configured],
     ].map(([label, ready]) => `<div class="service-row"><span class="status-dot ${ready ? "ok" : "warn"}"></span><span>${esc(label)}</span><b>${ready ? "CONFIGURED" : "NOT CONFIGURED"}</b></div>`).join("");
     $("#paper-assumption").innerHTML = `Simulated starting balance <strong>${fmtMoney(settings.paper_initial_balance)}</strong> · maker <strong>${esc(settings.paper_maker_fee_bps)} bps</strong> · taker <strong>${esc(settings.paper_taker_fee_bps)} bps</strong>`;
@@ -1644,26 +1700,6 @@
     } catch { /* handled */ }
   }
 
-  async function toggleDashboardAuth() {
-    const enabled = Boolean(state.settings?.dashboard_auth_enabled);
-    const ok = await confirmModal({
-      title: enabled ? "Disable dashboard authentication?" : "Enable dashboard authentication?",
-      copy: enabled
-        ? "Every same-origin caller will be able to reach the console and API. Only do this on a trusted, non-exposed host."
-        : "Every dashboard request will then require a session token or the server access token.",
-      acknowledge: enabled,
-      eyebrow: "ACCESS CONTROL",
-      symbol: "⛭",
-      confirmLabel: enabled ? "Disable auth" : "Enable auth",
-    });
-    if (!ok) return;
-    try {
-      await api("/api/control/dashboard-auth", { method: "POST", body: { enabled: !enabled } });
-      toast(`Dashboard authentication ${enabled ? "disabled" : "enabled"}.`, "success");
-      await refreshAll();
-    } catch { /* handled */ }
-  }
-
   /* -------------------------------------------------------------------- refresh ---- */
   async function refreshAll() {
     const tasks = [
@@ -1882,14 +1918,6 @@
         if (row === "signal-filters") { state.signalStatus = chip.dataset.status || ""; state.signalsOffset = 0; refreshSignals(); }
         return;
       }
-      const authTab = event.target.closest(".auth-tab");
-      if (authTab) {
-        $$(".auth-tab").forEach((tab) => tab.classList.toggle("active", tab === authTab));
-        const mode = authTab.dataset.authMode;
-        $("#auth-password-fields").classList.toggle("hidden", mode !== "password");
-        $("#auth-token-fields").classList.toggle("hidden", mode !== "token");
-        return;
-      }
       const paletteItem = event.target.closest(".palette-item");
       if (paletteItem && paletteItem.dataset.index) { runPaletteItem(Number(paletteItem.dataset.index)); return; }
       if (event.target.id === "palette-backdrop") closePalette();
@@ -1899,15 +1927,24 @@
 
     $("#auth-form").addEventListener("submit", (event) => {
       event.preventDefault();
-      const mode = $(".auth-tab.active")?.dataset.authMode || "password";
       const accept = $("#auth-disclaimer-accept");
       if (!accept.checked) { $("#auth-error").textContent = "Accept the risk disclaimer to continue."; return; }
-      if (mode === "password") {
-        signIn("password", { username: $("#auth-username").value.trim(), password: $("#auth-password").value });
-      } else {
-        signIn("token", $("#auth-token").value);
+      const mode = state.authMode;
+      const password = $("#auth-password").value;
+      if (mode === "signup" && password !== $("#auth-confirm-password").value) {
+        $("#auth-error").textContent = "Password confirmation does not match.";
+        return;
       }
+      const payload = {
+        username: $("#auth-username").value.trim(),
+        password,
+        remember: $("#auth-remember").checked,
+      };
+      if (mode === "signup") payload.display_name = $("#auth-display-name").value.trim() || null;
+      signIn(mode, payload);
     });
+    $("#auth-signup-toggle").addEventListener("click", () => setAuthMode("signup"));
+    $("#auth-login-toggle").addEventListener("click", () => setAuthMode("login"));
 
     $("#signout-button").addEventListener("click", signOut);
     $("#account-signout").addEventListener("click", signOut);
@@ -1918,11 +1955,10 @@
     $("#positions-refresh").addEventListener("click", () => refreshAll().then(() => toast("Positions refreshed.", "success")));
     $("#switch-paper-button").addEventListener("click", switchPaper);
     $("#enable-live-button").addEventListener("click", enableLive);
-    $("#toggle-auth-btn").addEventListener("click", toggleDashboardAuth);
     $("#clear-saved-token-btn").addEventListener("click", () => {
-      localStorage.removeItem(SESSION_STORAGE_KEY);
-      localStorage.removeItem(TOKEN_STORAGE_KEY);
-      toast("Saved browser credentials cleared.", "success");
+      clearCredentials();
+      toast("Saved browser session cleared. Sign in again to continue.", "success");
+      showAuth();
     });
     $("#accept-disclaimer").addEventListener("click", acceptDisclaimer);
     $("#renew-button").addEventListener("click", renewSubscription);
@@ -2054,15 +2090,7 @@
     setView(state.view);
     $("#market-direction-label").textContent = state.marketOrder.toUpperCase();
     await loadPublicConfig();
-    const urlToken = new URLSearchParams(window.location.search).get("token") || new URLSearchParams(window.location.hash.slice(1)).get("token");
-    if (urlToken) {
-      state.serverToken = urlToken.trim();
-      localStorage.setItem(TOKEN_STORAGE_KEY, state.serverToken);
-      localStorage.removeItem(SESSION_STORAGE_KEY);
-      state.sessionToken = "";
-      state.authMethod = "SERVER_TOKEN";
-    }
-    if (!state.sessionToken && !state.serverToken) { showAuth(); return; }
+    if (!state.sessionToken) { showAuth(); return; }
     try {
       await loadIdentity();
       hideAuth();

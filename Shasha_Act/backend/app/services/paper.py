@@ -291,14 +291,18 @@ class PaperExecutionAdapter:
         if entry is None or remaining <= 0:
             return
 
-        # A last-price gap below the active stop is treated as a simulated market stop.
+        # A last-price touch or gap through the active stop closes the full remaining size.
+        # This is modelled as a taker/market exit: when the observed last is below the stop,
+        # it records the worse observed price rather than an optimistic fill at the stop.
         # Target fills advance only by creating persisted PAPER fill records below.
         if trade.stop_price is not None and ticker.last_price <= trade.stop_price:
+            trigger_price = trade.stop_price
+            fill_price = min(ticker.last_price, trigger_price)
             await self._close_paper_quantity(
                 session,
                 trade,
                 remaining,
-                trade.stop_price,
+                fill_price,
                 "STOP_LOSS",
                 now,
                 taker=True,
@@ -307,7 +311,21 @@ class PaperExecutionAdapter:
                 "TRAILING": "SIMULATED_TRAILING_STOP",
                 "BREAK_EVEN": "SIMULATED_BREAK_EVEN_STOP",
             }.get(trade.stop_stage, "SIMULATED_STOP")
-            await self._mark_closed(session, trade, event, now, trade.stop_price, stop_reason)
+            session.add(
+                AuditEvent(
+                    action="PAPER_STOP_TRIGGERED",
+                    entity_type="trade",
+                    entity_id=trade.id,
+                    details={
+                        "trigger_price": str(trigger_price),
+                        "observed_last_price": str(ticker.last_price),
+                        "fill_price": str(fill_price),
+                        "remaining_quantity": str(remaining),
+                        "stage": trade.stop_stage,
+                    },
+                )
+            )
+            await self._mark_closed(session, trade, event, now, fill_price, stop_reason)
             return
 
         await self._process_target1(session, trade, ticker, now)

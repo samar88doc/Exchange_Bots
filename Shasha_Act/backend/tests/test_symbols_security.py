@@ -148,14 +148,18 @@ def test_parse_kline_and_day_change_calculation() -> None:
 
     from app.market_data import MarketDataService, TickerSnapshot, parse_kline
 
-    # 1. Parse REST format
+    # 1. Parse REST format for the current crypto market day. Keeping timestamps current
+    # avoids accidentally treating yesterday's daily candle as today's opening price.
+    day_start = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+    start_ms = int(day_start.timestamp() * 1000)
+    end_ms = start_ms + 86_399_999
     rest_kline = {
-        "startTime": "1792022400000",
+        "startTime": str(start_ms),
         "open": "81641.8",
         "high": "81894.0",
         "low": "80187.8",
         "close": "81080.3",
-        "endTime": "1792108799999",
+        "endTime": str(end_ms),
         "volume": "94765.636",
     }
     parsed = parse_kline(rest_kline, symbol="BTCUSDT")
@@ -172,8 +176,8 @@ def test_parse_kline_and_day_change_calculation() -> None:
         "ps": "ETHUSDT",
         "ct": "PERPETUAL",
         "k": {
-            "t": 1792022400000,
-            "T": 1792108799999,
+            "t": start_ms,
+            "T": end_ms,
             "i": "1d",
             "o": "2420.9",
             "c": "2450.0",

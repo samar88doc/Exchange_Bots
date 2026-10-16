@@ -74,7 +74,7 @@ pip install -e '.[dev]'
 cp .env.example .env
 ```
 
-Edit only your local `backend/.env` file. Never commit it. Use a PostgreSQL database dedicated to this application and a least-privilege database role. Generate two unrelated random tokens locally, for example with `python -c 'import secrets; print(secrets.token_urlsafe(32))'`, and set them as `DASHBOARD_API_TOKEN` and `TRADINGVIEW_WEBHOOK_TOKEN`. Also set `DASHBOARD_USERNAME` and a strong `DASHBOARD_PASSWORD`: the console signs in with those credentials, and the first account is bootstrapped with the `OWNER` role. The server token stays available for automation. A browser session token is only written to `localStorage` when the operator keeps the "keep me signed in" box checked, and it can be cleared from **Settings → Dashboard access** or revoked server-side.
+Edit only your local `backend/.env` file. Never commit it. Use a PostgreSQL database dedicated to this application and a least-privilege database role. Generate a high-entropy `TRADINGVIEW_WEBHOOK_TOKEN` locally, for example with `python -c 'import secrets; print(secrets.token_urlsafe(32))'`. Set `DASHBOARD_USERNAME` and a strong `DASHBOARD_PASSWORD`: the first account is bootstrapped with the `OWNER` role. Operators always use username/password; the browser is never asked to paste a server token. For a secret-manager-free first deployment only, set `INITIAL_OWNER_SIGNUP_ENABLED=true`, create the sole first owner through the sign-up screen, then set it back to `false` and restart. An optional `DASHBOARD_API_TOKEN` is strictly a server-to-server automation credential, not a dashboard login method. A browser session is stored only for the browser session unless **Keep me signed in** is selected; that option uses local storage and still has a finite server-side expiry. Owners can revoke sessions by resetting a password or disabling an account.
 
 Set up the PostgreSQL database/role using your normal secrets manager, then set `DATABASE_URL` to a SQLAlchemy async URL, for example:
 
@@ -94,9 +94,9 @@ Run the application locally (PAPER remains the default):
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --no-access-log
 ```
 
-Open `http://localhost:8000/` and sign in with `DASHBOARD_USERNAME` / `DASHBOARD_PASSWORD` (or the server token). The first sign-in asks for the risk disclaimer, then use **Playbook** and **Settings → Risk parameters** to review the server-enforced rules. `/api/health` and `/api/ready` are safe health endpoints; all dashboard data/actions require `X-Dashboard-Token`.
+Open `http://localhost:8000/` and sign in with `DASHBOARD_USERNAME` / `DASHBOARD_PASSWORD`. The first sign-in asks for the risk disclaimer, then use **Playbook** and **Settings → Risk parameters** to review the server-enforced rules. `/api/health` and `/api/ready` are safe health endpoints; dashboard data/actions require an authenticated operator session. `/api/auth/signup` is available only for the one-time initial-owner setup described above.
 
-For production, set `ENVIRONMENT=production`, use PostgreSQL, configure the dashboard and webhook tokens, terminate HTTPS at a trusted proxy, and ensure the proxy/ASGI server correctly sets the external HTTPS scheme. Do not trust arbitrary forwarded headers from the public internet. Keep access logging disabled or configure the reverse proxy to redact the tokenized webhook path; the webhook token is part of the URL. Do not enable a broad CORS policy.
+For production, set `ENVIRONMENT=production`, use PostgreSQL, configure a dashboard username/password and the webhook token, terminate HTTPS at a trusted proxy, and ensure the proxy/ASGI server correctly sets the external HTTPS scheme. Do not trust arbitrary forwarded headers from the public internet. Keep access logging disabled or configure the reverse proxy to redact the tokenized webhook path; the webhook token is part of the URL. Do not enable a broad CORS policy. Framing is denied by default; set an explicit trusted frame policy only if embedding the console is required.
 
 ## TradingView alert setup
 

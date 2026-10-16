@@ -209,6 +209,13 @@ h1, h2, h3, strong { letter-spacing: -0.01em; }
 
 /* ------------------------------------------------------------------ kpi cards ------ */
 .kpi-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 14px; margin-bottom: 20px; }
+.pnl-ledger-panel { margin-bottom: 20px; }
+.pnl-ledger-grid { display: grid; grid-template-columns: repeat(7, minmax(118px, 1fr)); gap: 10px; overflow-x: auto; padding-bottom: 2px; }
+.pnl-ledger-item { min-width: 126px; padding: 13px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: rgba(7, 13, 27, 0.68); }
+.pnl-ledger-item.primary { border-color: rgba(34, 211, 238, 0.36); background: linear-gradient(135deg, rgba(34, 211, 238, 0.1), rgba(139, 92, 246, 0.1)); }
+.pnl-ledger-item span { display: block; color: var(--text-dim); font-size: 9.5px; letter-spacing: 0.1em; }
+.pnl-ledger-item strong { display: block; min-height: 23px; margin: 7px 0 5px; font-family: var(--mono); font-size: 14px; white-space: nowrap; }
+.pnl-ledger-item small { display: block; min-height: 27px; color: var(--text-muted); font-size: 10.5px; line-height: 1.35; }
 .kpi-card { position: relative; overflow: hidden; padding: 16px 14px 14px; border-radius: var(--radius); border: 1px solid var(--border); background: linear-gradient(160deg, rgba(13, 20, 39, 0.92), rgba(7, 11, 24, 0.86)); animation: fade-up 0.5s ease both; }
 .kpi-card[data-accent="cyan"] { border-color: rgba(34, 211, 238, 0.28); }
 .kpi-card[data-accent="teal"] { border-color: rgba(20, 184, 166, 0.32); }
@@ -570,6 +577,8 @@ tbody tr.new-row { animation: flash-row 1.6s ease; }
 #auth-form input:focus { outline: none; border-color: rgba(34, 211, 238, 0.6); box-shadow: 0 0 0 3px rgba(34, 211, 238, 0.12); }
 .disclaimer-check { font-size: 11.5px; line-height: 1.5; }
 .auth-error { min-height: 18px; margin-top: 12px; font-size: 12.5px; color: var(--red); }
+.auth-mode-switch { display: inline-flex; margin: 2px 0 0; padding: 0; border: 0; background: transparent; color: var(--cyan); font-size: 11.5px; cursor: pointer; text-decoration: underline; text-underline-offset: 3px; }
+.auth-mode-switch:hover { color: #b7f5ff; }
 .auth-note { display: flex; gap: 10px; margin-top: 14px; font-size: 11px; color: var(--text-dim); }
 .auth-disclaimer { margin-top: 16px; padding: 14px; border-radius: var(--radius-sm); border: 1px solid rgba(251, 191, 36, 0.25); background: rgba(251, 191, 36, 0.06); }
 .auth-disclaimer strong { display: block; font-size: 11px; letter-spacing: 0.14em; color: var(--amber); margin-bottom: 6px; }
