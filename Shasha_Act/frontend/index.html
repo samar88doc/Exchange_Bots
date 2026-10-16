@@ -6,8 +6,8 @@
   <meta name="color-scheme" content="dark">
   <meta name="theme-color" content="#050711">
   <title>Shasha Act — Neural Trading Operations</title>
-  <link rel="stylesheet" href="/assets/styles.css?v=20261016_04">
-  <script defer src="/assets/app.js?v=20261016_04"></script>
+  <link rel="stylesheet" href="/assets/styles.css?v=20261016_05">
+  <script defer src="/assets/app.js?v=20261016_05"></script>
 </head>
 <body>
   <canvas id="neural-field" aria-hidden="true"></canvas>
@@ -116,13 +116,13 @@
             </div>
             <div class="kpi-glow"></div>
           </article>
-          <article class="kpi-card" data-accent="violet">
+          <article class="kpi-card" data-accent="violet" data-view="positions">
             <div class="kpi-label"><span>OPEN POSITIONS</span><span class="kpi-icon icon-violet">⌖</span></div>
             <div class="kpi-value" id="kpi-open">—</div>
             <div class="kpi-foot"><span id="kpi-open-note">Positions awaiting sync</span><span class="kpi-link" data-view="positions">Details <b>→</b></span></div>
             <div class="kpi-glow"></div>
           </article>
-          <article class="kpi-card" data-accent="blue">
+          <article class="kpi-card" data-accent="blue" data-view="signals">
             <div class="kpi-label"><span>SIGNALS TODAY</span><span class="kpi-icon icon-blue">⌘</span></div>
             <div class="kpi-value" id="kpi-signals">—</div>
             <div class="kpi-foot"><span id="kpi-signal-note">TradingView ingress</span><span class="kpi-link" data-view="signals">View log <b>→</b></span></div>
@@ -142,7 +142,7 @@
           <div class="panel-head">
             <div>
               <div class="panel-title" id="daily-pnl-heading">Daily P&amp;L ledger</div>
-              <div class="panel-caption">Persisted fills for the configured market-local day · PAPER and LIVE remain separate</div>
+              <div class="panel-caption">Persisted fills for the configured market day (05:30 AM – 05:29 AM IST) · PAPER and LIVE remain separate</div>
             </div>
             <span class="badge" id="daily-pnl-mode">—</span>
           </div>
@@ -423,7 +423,18 @@
         <section class="panel table-panel">
           <div class="table-scroll tall">
             <table>
-              <thead><tr><th>TIME</th><th>SYMBOL</th><th>DIR</th><th>TF</th><th>TV CLOSE</th><th>PLANNED ENTRY</th><th>MODE</th><th>STATUS</th><th>REASON</th><th></th></tr></thead>
+              <thead><tr>
+                <th class="sortable" data-sort="time">TIME <span class="sort-icon">⇅</span></th>
+                <th class="sortable" data-sort="symbol">SYMBOL <span class="sort-icon">⇅</span></th>
+                <th class="sortable" data-sort="direction">DIR <span class="sort-icon">⇅</span></th>
+                <th class="sortable" data-sort="timeframe">TF <span class="sort-icon">⇅</span></th>
+                <th class="sortable" data-sort="close">TV CLOSE <span class="sort-icon">⇅</span></th>
+                <th class="sortable" data-sort="entry">PLANNED ENTRY <span class="sort-icon">⇅</span></th>
+                <th class="sortable" data-sort="mode">MODE <span class="sort-icon">⇅</span></th>
+                <th class="sortable" data-sort="status">STATUS <span class="sort-icon">⇅</span></th>
+                <th class="sortable" data-sort="reason">REASON <span class="sort-icon">⇅</span></th>
+                <th></th>
+              </tr></thead>
               <tbody id="signal-rows"><tr><td colspan="10" class="empty-cell"><span class="spinner"></span>Loading signals</td></tr></tbody>
             </table>
           </div>
@@ -475,7 +486,21 @@
         <section class="panel table-panel">
           <div class="table-scroll tall">
             <table>
-              <thead><tr><th>OPENED</th><th>CLOSED</th><th>CONTRACT</th><th>ENTRY</th><th>EXIT</th><th>QTY</th><th>GROSS</th><th>FEES</th><th>NET</th><th>EXIT REASON</th><th></th></tr></thead>
+              <thead>
+                <tr>
+                  <th class="sortable" data-sort="opened">OPENED <span class="sort-icon">⇅</span></th>
+                  <th class="sortable" data-sort="closed">CLOSED <span class="sort-icon">⇅</span></th>
+                  <th class="sortable" data-sort="symbol">CONTRACT <span class="sort-icon">⇅</span></th>
+                  <th class="sortable" data-sort="entry">ENTRY <span class="sort-icon">⇅</span></th>
+                  <th class="sortable" data-sort="exit">EXIT <span class="sort-icon">⇅</span></th>
+                  <th class="sortable" data-sort="quantity">QTY <span class="sort-icon">⇅</span></th>
+                  <th class="sortable" data-sort="gross">GROSS <span class="sort-icon">⇅</span></th>
+                  <th class="sortable" data-sort="fees">FEES <span class="sort-icon">⇅</span></th>
+                  <th class="sortable" data-sort="net">NET <span class="sort-icon">⇅</span></th>
+                  <th class="sortable" data-sort="reason">EXIT REASON <span class="sort-icon">⇅</span></th>
+                  <th>ACTIONS</th>
+                </tr>
+              </thead>
               <tbody id="history-rows"><tr><td colspan="11" class="empty-cell"><span class="spinner"></span>Loading history</td></tr></tbody>
             </table>
           </div>

@@ -63,7 +63,7 @@ from app.schemas import (
     UserUpdateRequest,
 )
 from app.security import hash_password, redact_text
-from app.services.pnl import long_unrealized_pnl, realized_pnl_breakdown_for_day
+from app.services.pnl import long_unrealized_pnl, market_day_bounds, realized_pnl_breakdown_for_day
 from app.services.risk import ACTIVE_TRADE_STATES, ensure_risk_control
 
 public_router = APIRouter(prefix="/api", tags=["Status"])
@@ -106,10 +106,7 @@ def _iso(value: datetime | None) -> str | None:
 
 
 def _local_day_bounds(timezone_name: str, requested: date | None = None) -> tuple[date, datetime, datetime]:
-    zone = ZoneInfo(timezone_name)
-    local_day = requested or datetime.now(zone).date()
-    start_local = datetime.combine(local_day, time.min, tzinfo=zone)
-    return local_day, start_local.astimezone(UTC), (start_local + timedelta(days=1)).astimezone(UTC)
+    return market_day_bounds(timezone_name, requested)
 
 
 def _audit(
@@ -273,6 +270,26 @@ def _trade_payload(trade: Trade, ticker: Any | None, stale_after: int) -> dict[s
         "opened_at": _iso(trade.opened_at),
         "closed_at": _iso(trade.closed_at),
         "exit_price": _str(trade.exit_price),
+        "exit_reason": (
+            "STOPLOSS HIT"
+            if trade.status == "CLOSED"
+            and (
+                (trade.net_realized_pnl or Decimal("0")) < 0
+                or (
+                    "STOP" in (trade.status_reason or "").upper()
+                    and "TRAILING" not in (trade.status_reason or "").upper()
+                )
+            )
+            else (
+                "TRAILING STOP"
+                if trade.status == "CLOSED" and "TRAILING_STOP" in (trade.status_reason or "")
+                else (
+                    "PROFIT EXIT"
+                    if trade.status == "CLOSED" and (trade.net_realized_pnl or Decimal("0")) > 0
+                    else ("CLOSED" if trade.status == "CLOSED" else trade.status)
+                )
+            )
+        ),
         "created_at": _iso(trade.created_at),
         "updated_at": _iso(trade.updated_at),
     }
@@ -837,7 +854,7 @@ async def read_settings(
             ),
         },
         "market_day_timezone": settings.timezone,
-        "market_day": datetime.now(ZoneInfo(settings.timezone)).date().isoformat(),
+        "market_day": _local_day_bounds(settings.timezone)[0].isoformat(),
         "paper_initial_balance": _str(settings.paper_initial_balance),
         "paper_maker_fee_bps": _str(settings.paper_maker_fee_bps),
         "paper_taker_fee_bps": _str(settings.paper_taker_fee_bps),
@@ -941,7 +958,11 @@ async def performance(
     funding_record_count = 0
     for fill_time, gross, fee, funding in rows.all():
         moment = fill_time.replace(tzinfo=UTC) if fill_time.tzinfo is None else fill_time
-        local_day = moment.astimezone(zone).date()
+        moment_local = moment.astimezone(zone)
+        if moment_local.time() < time(5, 30):
+            local_day = moment_local.date() - timedelta(days=1)
+        else:
+            local_day = moment_local.date()
         if funding is not None:
             funding_record_count += 1
         grouped[local_day] = (
@@ -1408,6 +1429,7 @@ async def history_csv(
         "created_at", "mode", "symbol", "status", "planned_entry", "signal_close", "actual_entry",
         "quantity", "remaining_quantity", "stop_price", "target1_price", "target2_price", "target3_price",
         "gross_realized_pnl", "fees_paid", "funding_paid", "net_realized_pnl", "fee_data_available", "funding_data_available",
+        "exit_reason",
     ]
     writer.writerow(columns)
     for trade in trades.all():

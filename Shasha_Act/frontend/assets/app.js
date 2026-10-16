@@ -169,9 +169,13 @@
     historyMode: prefs.load().historyMode || "PAPER",
     historyOffset: 0,
     historyLimit: 25,
+    historySort: "opened",
+    historyOrder: "desc",
     signalsOffset: 0,
     signalsLimit: 25,
     signalStatus: "",
+    signalSort: "time",
+    signalOrder: "desc",
     positionFilter: "all",
     positionSort: "created_at",
     positionOrder: "desc",
@@ -454,6 +458,10 @@
     }
     if (view === "users") renderUsers();
     if (view === "markets" && !state.market) refreshMarkets();
+    if (view === "positions") { renderPositions(); refreshPositionsFast(); }
+    if (view === "signals") { renderSignals(); refreshSignals(); }
+    if (view === "history") { renderHistory(); refreshHistory(); }
+    window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
   /* ------------------------------------------------------------------ dashboard ---- */
@@ -618,19 +626,40 @@
 
   function renderDashboardPositions() {
     const body = $("#dashboard-position-rows");
+    if (!body) return;
     const items = state.positions.slice(0, 5);
-    if (!items.length) { body.innerHTML = `<tr><td colspan="7" class="empty-cell">No open positions. New signals will appear in the signal log.</td></tr>`; return; }
-    body.innerHTML = items.map((item) => `
-      <tr class="${state.knownPositionIds.has(item.id) ? "" : "new-row"}">
-        <td><div class="contract-cell">${coinIcon(item.symbol)}<div><strong>${esc(item.symbol)}</strong><small>${esc(item.mode)} · ${esc(item.direction || "LONG")}</small></div></div></td>
-        <td>${protectionRail(item)}</td>
-        <td><div class="contract-cell"><div><strong>${fmtPrice(item.actual_entry || item.planned_entry)}</strong><small>last ${item.price_stale ? "stale / Unavailable" : fmtPrice(item.last_price)}</small></div></div></td>
-        <td class="${pnlClass(item.unrealized_pnl)}">${item.unrealized_pnl === null ? "Unavailable" : fmtMoney(item.unrealized_pnl, "USDT", true)}</td>
-        <td>${trailingCell(item)}</td>
-        <td>${pill(item.status, statusTone(item.status))}</td>
-        <td><div class="inline-actions"><button class="button button-secondary button-small" data-action="details" data-id="${esc(item.id)}">Details</button></div></td>
-      </tr>`).join("");
-    state.positions.forEach((item) => state.knownPositionIds.add(item.id));
+    const emptyHtml = `<tr><td colspan="7" class="empty-cell">No open positions. New signals will appear in the signal log.</td></tr>`;
+    if (!items.length) {
+      if (body.innerHTML !== emptyHtml) body.innerHTML = emptyHtml;
+      return;
+    }
+
+    const renderRowCells = (item) => `
+      <td><div class="contract-cell">${coinIcon(item.symbol)}<div><strong>${esc(item.symbol)}</strong><small>${esc(item.mode)} · ${esc(item.direction || "LONG")}</small></div></div></td>
+      <td>${protectionRail(item)}</td>
+      <td><div class="contract-cell"><div><strong>${fmtPrice(item.actual_entry || item.planned_entry)}</strong><small>last ${item.price_stale ? "stale / Unavailable" : fmtPrice(item.last_price)}</small></div></div></td>
+      <td class="${pnlClass(item.unrealized_pnl)}">${item.unrealized_pnl === null ? "Unavailable" : fmtMoney(item.unrealized_pnl, "USDT", true)}</td>
+      <td>${trailingCell(item)}</td>
+      <td>${pill(item.status, statusTone(item.status))}</td>
+      <td><div class="inline-actions"><button class="button button-secondary button-small" data-action="details" data-id="${esc(item.id)}">Details</button></div></td>
+    `;
+
+    const existingRows = Array.from(body.children).filter((el) => el.tagName === "TR" && el.dataset.id);
+    const sameIds = existingRows.length === items.length && items.every((item, idx) => existingRows[idx].dataset.id === String(item.id));
+
+    if (sameIds) {
+      items.forEach((item, idx) => {
+        const row = existingRows[idx];
+        const newHtml = renderRowCells(item);
+        if (row.innerHTML !== newHtml) row.innerHTML = newHtml;
+      });
+    } else {
+      body.innerHTML = items.map((item) => `
+        <tr data-id="${esc(item.id)}" class="${state.knownPositionIds.has(item.id) ? "" : "new-row"}">
+          ${renderRowCells(item)}
+        </tr>`).join("");
+      items.forEach((item) => state.knownPositionIds.add(item.id));
+    }
   }
 
   function renderDashboardSignals() {
@@ -645,7 +674,7 @@
         <td class="mono">${fmtPrice(event.signal_close)}</td>
         <td class="mono">${fmtPrice(event.entry_price)}</td>
         <td>${pill(event.status, statusTone(event.status))}</td>
-        <td class="muted">${esc((event.status_reason || "").slice(0, 60) || "—")}</td>
+        <td>${formatStatusReason(event.status_reason, 55)}</td>
       </tr>`).join("");
   }
 
@@ -932,10 +961,11 @@
       }
     });
 
+    const emptyPositionsHtml = `<tr><td colspan="12" class="empty-cell">No positions match this filter.</td></tr>`;
     if (!items.length) {
-      body.innerHTML = `<tr><td colspan="12" class="empty-cell">No positions match this filter.</td></tr>`;
+      if (body.innerHTML !== emptyPositionsHtml) body.innerHTML = emptyPositionsHtml;
     } else {
-      body.innerHTML = items.map((item) => {
+      const renderRowCells = (item) => {
         const percentage = (item.stop_price && item.actual_entry && toNumber(item.actual_entry))
           ? (((toNumber(item.stop_price) - toNumber(item.actual_entry)) / toNumber(item.actual_entry)) * 100).toFixed(2) : null;
         
@@ -945,7 +975,6 @@
         const netRoi = (item.margin && toNumber(item.margin) > 0) ? ((netProfitVal / toNumber(item.margin)) * 100).toFixed(2) : null;
 
         return `
-        <tr>
           <td><div class="contract-cell">${coinIcon(item.symbol)}<div><strong>${esc(item.symbol)}</strong><small>${esc(item.tradingview_symbol || "")} · ${esc(item.mode)}</small></div></div></td>
           <td>${protectionRail(item)}</td>
           <td><div class="contract-cell"><div><strong>${fmtPrice(item.actual_entry || item.planned_entry)}</strong><small>${item.price_stale ? "stale / Unavailable" : `last ${fmtPrice(item.last_price)}`}</small></div></div></td>
@@ -971,8 +1000,23 @@
             <button class="button button-secondary button-small" data-action="details" data-id="${esc(item.id)}">Details</button>
             ${["OPEN", "PARTIALLY_CLOSED", "PROTECTION_ERROR", "UNKNOWN"].includes(item.status) ? `<button class="button button-danger button-small" data-action="close" data-id="${esc(item.id)}" data-symbol="${esc(item.symbol)}">Close</button>` : ""}
           </div></td>
-        </tr>`;
-      }).join("");
+        `;
+      };
+
+      const existingRows = Array.from(body.children).filter((el) => el.tagName === "TR" && el.dataset.id);
+      const sameIds = existingRows.length === items.length && items.every((item, idx) => existingRows[idx].dataset.id === String(item.id));
+
+      if (sameIds) {
+        items.forEach((item, idx) => {
+          const row = existingRows[idx];
+          const newHtml = renderRowCells(item);
+          if (row.innerHTML !== newHtml) {
+            row.innerHTML = newHtml;
+          }
+        });
+      } else {
+        body.innerHTML = items.map((item) => `<tr data-id="${esc(item.id)}">${renderRowCells(item)}</tr>`).join("");
+      }
     }
     renderPendingEntries();
     state.positionsSignature = positionsSignature(state.positions);
@@ -981,18 +1025,36 @@
 
   function renderPendingEntries() {
     const body = $("#pending-rows");
+    if (!body) return;
     const items = state.pendingEntries;
     state.pendingSignature = pendingSignature(items);
-    if (!items.length) { body.innerHTML = `<tr><td colspan="6" class="empty-cell">No pending entries. Limit orders that have not filled appear here.</td></tr>`; return; }
-    body.innerHTML = items.map((item) => `
-      <tr>
-        <td><div class="contract-cell">${coinIcon(item.symbol)}<div><strong>${esc(item.symbol)}</strong><small>${esc(item.mode)} · ${esc(item.direction || "LONG")}</small></div></div></td>
-        <td class="mono">${fmtPrice(item.planned_entry)}<small class="muted"> signal ${fmtPrice(item.signal_close)}</small></td>
-        <td class="mono">${fmtNum(item.quantity)}</td>
-        <td class="mono">${isMissing(item.entry_expires_at) ? "Unavailable" : fmtDateTime(item.entry_expires_at)}</td>
-        <td>${pill(item.status, statusTone(item.status))}</td>
-        <td><button class="button button-danger button-small" data-action="cancel-entry" data-id="${esc(item.id)}" data-symbol="${esc(item.symbol)}">Cancel entry</button></td>
-      </tr>`).join("");
+    const emptyPendingHtml = `<tr><td colspan="6" class="empty-cell">No pending entries. Limit orders that have not filled appear here.</td></tr>`;
+    if (!items.length) {
+      if (body.innerHTML !== emptyPendingHtml) body.innerHTML = emptyPendingHtml;
+      return;
+    }
+
+    const renderPendingCells = (item) => `
+      <td><div class="contract-cell">${coinIcon(item.symbol)}<div><strong>${esc(item.symbol)}</strong><small>${esc(item.mode)} · ${esc(item.direction || "LONG")}</small></div></div></td>
+      <td class="mono">${fmtPrice(item.planned_entry)}<small class="muted"> signal ${fmtPrice(item.signal_close)}</small></td>
+      <td class="mono">${fmtNum(item.quantity)}</td>
+      <td class="mono">${isMissing(item.entry_expires_at) ? "Unavailable" : fmtDateTime(item.entry_expires_at)}</td>
+      <td>${pill(item.status, statusTone(item.status))}</td>
+      <td><button class="button button-danger button-small" data-action="cancel-entry" data-id="${esc(item.id)}" data-symbol="${esc(item.symbol)}">Cancel entry</button></td>
+    `;
+
+    const existingRows = Array.from(body.children).filter((el) => el.tagName === "TR" && el.dataset.id);
+    const sameIds = existingRows.length === items.length && items.every((item, idx) => existingRows[idx].dataset.id === String(item.id));
+
+    if (sameIds) {
+      items.forEach((item, idx) => {
+        const row = existingRows[idx];
+        const newHtml = renderPendingCells(item);
+        if (row.innerHTML !== newHtml) row.innerHTML = newHtml;
+      });
+    } else {
+      body.innerHTML = items.map((item) => `<tr data-id="${esc(item.id)}">${renderPendingCells(item)}</tr>`).join("");
+    }
   }
 
   /* --------------------------------------------------------------------- markets --- */
@@ -1118,6 +1180,79 @@
   }
 
   /* --------------------------------------------------------------------- signals --- */
+  function formatStatusReason(rawReason, maxLength = 80) {
+    if (!rawReason) return '<span class="muted">—</span>';
+    const text = String(rawReason);
+
+    // Initial Stop Loss Hit (when price drops to initial stop loss level)
+    if (text.includes("SIMULATED_STOP") && !text.includes("TRAILING") && !text.includes("BREAK_EVEN")) {
+      return `<span class="sl-hit-badge" title="Initial Stop Loss Hit: Position stopped out at initial risk level">
+        <span class="sl-hit-tag">🛑 INITIAL SL HIT</span>
+        <span class="sl-hit-text">${esc(text)}</span>
+      </span>`;
+    }
+
+    // Trailing Stop Hit (closed in profit after trailing)
+    if (text.includes("SIMULATED_TRAILING_STOP") || text.includes("TRAILING_STOP")) {
+      return `<span class="sl-trail-badge" title="Trailing Stop Hit: Closed after trailing peak">
+        <span class="sl-trail-tag">⚡ TRAILING SL</span>
+        <span class="sl-trail-text">${esc(text)}</span>
+      </span>`;
+    }
+
+    // Break-Even Stop Hit
+    if (text.includes("SIMULATED_BREAK_EVEN_STOP") || text.includes("BREAK_EVEN")) {
+      return `<span class="sl-be-badge" title="Break-Even Stop Hit">
+        <span class="sl-be-tag">🛡️ BREAK-EVEN SL</span>
+        <span class="sl-be-text">${esc(text)}</span>
+      </span>`;
+    }
+
+    // Target 1 / 2 / 3 Fills
+    if (text.includes("TARGET_")) {
+      return `<span class="tp-hit-badge">
+        <span class="tp-hit-tag">🎯 TARGET HIT</span>
+        <span class="tp-hit-text">${esc(text)}</span>
+      </span>`;
+    }
+
+    // Live stop loss if applicable
+    if (text.includes("STOP_LOSS") && !text.includes("TRAILING")) {
+      return `<span class="sl-hit-badge" title="Live Stop Loss Hit">
+        <span class="sl-hit-tag">🛑 STOP LOSS HIT</span>
+        <span class="sl-hit-text">${esc(text)}</span>
+      </span>`;
+    }
+
+    const truncated = text.length > maxLength ? text.slice(0, maxLength) + "…" : text;
+    return `<span class="muted" title="${esc(text)}">${esc(truncated)}</span>`;
+  }
+
+  function getSignalSortVal(event, key) {
+    switch (key) {
+      case "time":
+        return event.received_at ? new Date(event.received_at).getTime() : 0;
+      case "symbol":
+        return (event.tradingview_symbol || event.symbol || "").toLowerCase();
+      case "direction":
+        return (event.direction || "LONG").toLowerCase();
+      case "timeframe":
+        return (event.timeframe || "").toLowerCase();
+      case "close":
+        return toNumber(event.signal_close) || 0;
+      case "entry":
+        return toNumber(event.entry_price) || 0;
+      case "mode":
+        return (event.mode || "PAPER").toLowerCase();
+      case "status":
+        return (event.status || "").toLowerCase();
+      case "reason":
+        return (event.status_reason || "").toLowerCase();
+      default:
+        return event.received_at ? new Date(event.received_at).getTime() : 0;
+    }
+  }
+
   async function refreshSignals() {
     const params = new URLSearchParams({ limit: String(state.signalsLimit), offset: String(state.signalsOffset) });
     if (state.signalStatus) params.set("status", state.signalStatus);
@@ -1131,7 +1266,37 @@
   function renderSignals() {
     const body = $("#signal-rows");
     if (!state.events.length) { body.innerHTML = `<tr><td colspan="10" class="empty-cell">No signal events for this filter.</td></tr>`; return; }
-    body.innerHTML = state.events.map((event) => {
+
+    const items = [...state.events];
+    if (state.signalSort) {
+      items.sort((a, b) => {
+        let va = getSignalSortVal(a, state.signalSort);
+        let vb = getSignalSortVal(b, state.signalSort);
+
+        if (typeof va === "string" || typeof vb === "string") {
+          va = String(va).toLowerCase();
+          vb = String(vb).toLowerCase();
+          return state.signalOrder === "asc" ? va.localeCompare(vb) : vb.localeCompare(va);
+        }
+
+        if (va === null || va === undefined || isNaN(va)) va = -Infinity;
+        if (vb === null || vb === undefined || isNaN(vb)) vb = -Infinity;
+
+        return state.signalOrder === "asc" ? (va - vb) : (vb - va);
+      });
+    }
+
+    $$("#view-signals table thead th[data-sort]").forEach((th) => {
+      const isSorted = th.dataset.sort === state.signalSort;
+      th.classList.toggle("sorted-asc", isSorted && state.signalOrder === "asc");
+      th.classList.toggle("sorted-desc", isSorted && state.signalOrder === "desc");
+      const icon = th.querySelector(".sort-icon");
+      if (icon) {
+        icon.textContent = isSorted ? (state.signalOrder === "asc" ? "▲" : "▼") : "⇅";
+      }
+    });
+
+    body.innerHTML = items.map((event) => {
       const jobs = event.outbox || [];
       const failed = jobs.some((job) => job.status === "FAILED");
       const delivered = jobs.filter((job) => job.status === "DELIVERED").length;
@@ -1146,7 +1311,7 @@
         <td class="mono">${fmtPrice(event.entry_price)}</td>
         <td>${pill(event.mode || "PAPER", "muted")}</td>
         <td>${pill(event.status, statusTone(event.status))}</td>
-        <td class="muted">${esc((event.status_reason || "—").slice(0, 70))}</td>
+        <td>${formatStatusReason(event.status_reason, 80)}</td>
         <td><div class="inline-actions">${failed ? `<button class="button button-secondary button-small" data-action="retry-notice" data-id="${esc(event.id)}">Retry</button>` : `<span class="muted">${esc(notice)}</span>`}</div></td>
       </tr>`;
     }).join("");
@@ -1158,6 +1323,75 @@
   }
 
   /* --------------------------------------------------------------------- history --- */
+  function getTradeExitReasonText(trade) {
+    const isClosed = trade.status === "CLOSED" || (!isMissing(trade.closed_at) && trade.status !== "OPEN");
+    const netVal = toNumber(trade.net_realized_pnl);
+    const reasonUpper = (trade.status_reason || trade.exit_reason || "").toUpperCase();
+    const hasLoss = netVal !== null && netVal < 0;
+    const isStopLoss = isClosed && (hasLoss || (reasonUpper.includes("STOP") && !reasonUpper.includes("TRAILING")));
+
+    if (isStopLoss) return "STOPLOSS HIT";
+    if (isClosed) {
+      if (netVal !== null && netVal > 0 && reasonUpper.includes("TRAILING")) return "TRAILING STOP";
+      return trade.exit_reason || trade.status || "CLOSED";
+    }
+    if (trade.status === "OPEN" || isMissing(trade.closed_at)) return "OPEN";
+    return trade.exit_reason || trade.status || "UNKNOWN";
+  }
+
+  function renderHistoryExitReason(trade) {
+    const isClosed = trade.status === "CLOSED" || (!isMissing(trade.closed_at) && trade.status !== "OPEN");
+    const netVal = toNumber(trade.net_realized_pnl);
+    const reasonUpper = (trade.status_reason || trade.exit_reason || "").toUpperCase();
+    const hasLoss = netVal !== null && netVal < 0;
+    const isStopLoss = isClosed && (hasLoss || (reasonUpper.includes("STOP") && !reasonUpper.includes("TRAILING")));
+
+    if (isStopLoss) {
+      return `<span class="sl-hit-badge" title="${esc(trade.status_reason || 'Stop loss hit: Realized loss')}"><span class="sl-hit-tag">🛑 STOPLOSS HIT</span></span>`;
+    }
+
+    if (isClosed) {
+      if (netVal !== null && netVal > 0 && reasonUpper.includes("TRAILING")) {
+        return `<span class="sl-trail-badge" title="${esc(trade.status_reason || 'Closed via trailing stop in profit')}"><span class="sl-trail-tag">TRAILING STOP</span></span>`;
+      }
+      return pill(trade.exit_reason || trade.status || "CLOSED", statusTone(trade.status));
+    }
+
+    if (trade.status === "OPEN" || isMissing(trade.closed_at)) {
+      return pill("OPEN", "good");
+    }
+
+    return pill(trade.exit_reason || trade.status, statusTone(trade.status));
+  }
+
+  function getHistorySortVal(trade, key) {
+    switch (key) {
+      case "opened":
+        return trade.opened_at || trade.created_at ? new Date(trade.opened_at || trade.created_at).getTime() : 0;
+      case "closed":
+        return trade.closed_at ? new Date(trade.closed_at).getTime() : 0;
+      case "symbol":
+        return (trade.symbol || "").toLowerCase();
+      case "entry":
+        return toNumber(trade.actual_entry || trade.planned_entry) ?? -Infinity;
+      case "exit":
+        return toNumber(trade.exit_price) ?? -Infinity;
+      case "quantity":
+      case "qty":
+        return toNumber(trade.quantity) ?? -Infinity;
+      case "gross":
+        return toNumber(trade.gross_realized_pnl) ?? -Infinity;
+      case "fees":
+        return toNumber(trade.fees_paid) ?? -Infinity;
+      case "net":
+        return toNumber(trade.net_realized_pnl) ?? -Infinity;
+      case "reason":
+        return getTradeExitReasonText(trade).toLowerCase();
+      default:
+        return trade.opened_at || trade.created_at ? new Date(trade.opened_at || trade.created_at).getTime() : 0;
+    }
+  }
+
   async function refreshHistory() {
     const params = new URLSearchParams({ limit: String(state.historyLimit), offset: String(state.historyOffset), mode: state.historyMode });
     const data = await api(`/api/history?${params}`, { silent: true });
@@ -1212,9 +1446,39 @@
     }
 
     const body = $("#history-rows");
-    if (!state.history.length) { body.innerHTML = `<tr><td colspan="11" class="empty-cell">No trades recorded for ${esc(state.historyMode)} mode.</td></tr>`; }
-    else {
-      body.innerHTML = state.history.map((trade) => `
+    if (!state.history.length) {
+      body.innerHTML = `<tr><td colspan="11" class="empty-cell">No trades recorded for ${esc(state.historyMode)} mode.</td></tr>`;
+    } else {
+      const items = [...state.history];
+      if (state.historySort) {
+        items.sort((a, b) => {
+          let va = getHistorySortVal(a, state.historySort);
+          let vb = getHistorySortVal(b, state.historySort);
+
+          if (typeof va === "string" || typeof vb === "string") {
+            va = String(va).toLowerCase();
+            vb = String(vb).toLowerCase();
+            return state.historyOrder === "asc" ? va.localeCompare(vb) : vb.localeCompare(va);
+          }
+
+          if (va === null || va === undefined || isNaN(va)) va = -Infinity;
+          if (vb === null || vb === undefined || isNaN(vb)) vb = -Infinity;
+
+          return state.historyOrder === "asc" ? (va - vb) : (vb - va);
+        });
+      }
+
+      $$("#view-history table thead th[data-sort]").forEach((th) => {
+        const isSorted = th.dataset.sort === state.historySort;
+        th.classList.toggle("sorted-asc", isSorted && state.historyOrder === "asc");
+        th.classList.toggle("sorted-desc", isSorted && state.historyOrder === "desc");
+        const icon = th.querySelector(".sort-icon");
+        if (icon) {
+          icon.textContent = isSorted ? (state.historyOrder === "asc" ? "▲" : "▼") : "⇅";
+        }
+      });
+
+      body.innerHTML = items.map((trade) => `
         <tr>
           <td class="muted">${fmtDateTime(trade.created_at || trade.opened_at)}</td>
           <td class="muted">${isMissing(trade.closed_at) ? "Open" : fmtDateTime(trade.closed_at)}</td>
@@ -1225,7 +1489,7 @@
           <td class="${pnlClass(trade.gross_realized_pnl)}">${trade.gross_realized_pnl === null ? "Unavailable" : fmtMoney(trade.gross_realized_pnl, "USDT", true)}</td>
           <td class="mono muted">${fmtMoney(trade.fees_paid)}</td>
           <td class="${pnlClass(trade.net_realized_pnl)}">${trade.net_realized_pnl === null ? "Unavailable" : fmtMoney(trade.net_realized_pnl, "USDT", true)}</td>
-          <td>${pill(trade.exit_reason || trade.status, statusTone(trade.status))}</td>
+          <td>${renderHistoryExitReason(trade)}</td>
           <td><button class="button button-secondary button-small" data-action="details" data-id="${esc(trade.id)}">Details</button></td>
         </tr>`).join("");
     }
@@ -2024,11 +2288,13 @@
   function startClock() {
     const tick = () => {
       const now = new Date();
+      // Crypto market day starts at 05:30:00 AM IST (00:00:00 UTC) and ends at 05:29:59 AM IST next day
+      const marketDayDate = now.toISOString().slice(0, 10);
       const ist = new Date(now.getTime() + (330 + now.getTimezoneOffset()) * 60000);
       const clock = ist.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", second: "2-digit" }) + " IST";
       $("#market-clock").textContent = clock;
       const label = $("#market-clock-label");
-      if (label) label.textContent = `MARKET DAY ${ist.toISOString().slice(0, 10)}`;
+      if (label) label.textContent = `MARKET DAY ${marketDayDate}`;
       [["#last-updated"], ["#sidebar-market"]].forEach(() => {});
     };
     tick();
@@ -2126,7 +2392,11 @@
   function bindEvents() {
     document.body.addEventListener("click", (event) => {
       const navTarget = event.target.closest("[data-view]");
-      if (navTarget && !event.target.closest("[data-action]")) { setView(navTarget.dataset.view); return; }
+      if (navTarget && !event.target.closest("[data-action]")) {
+        event.preventDefault();
+        setView(navTarget.dataset.view);
+        return;
+      }
       const actionTarget = event.target.closest("[data-action]");
       if (actionTarget) {
         const { action, id, symbol, role, active, username } = actionTarget.dataset;
@@ -2142,13 +2412,36 @@
       if (event.target.closest("th.sortable")) {
         const th = event.target.closest("th.sortable");
         const sortKey = th.dataset.sort;
-        if (state.positionSort === sortKey) {
-          state.positionOrder = state.positionOrder === "asc" ? "desc" : "asc";
-        } else {
-          state.positionSort = sortKey;
-          state.positionOrder = ["symbol", "status", "protection"].includes(sortKey) ? "asc" : "desc";
+        if (th.closest("#view-signals")) {
+          if (state.signalSort === sortKey) {
+            state.signalOrder = state.signalOrder === "asc" ? "desc" : "asc";
+          } else {
+            state.signalSort = sortKey;
+            state.signalOrder = ["symbol", "direction", "timeframe", "status", "reason"].includes(sortKey) ? "asc" : "desc";
+          }
+          renderSignals();
+          return;
         }
-        renderPositions();
+        if (th.closest("#view-positions")) {
+          if (state.positionSort === sortKey) {
+            state.positionOrder = state.positionOrder === "asc" ? "desc" : "asc";
+          } else {
+            state.positionSort = sortKey;
+            state.positionOrder = ["symbol", "status", "protection"].includes(sortKey) ? "asc" : "desc";
+          }
+          renderPositions();
+          return;
+        }
+        if (th.closest("#view-history")) {
+          if (state.historySort === sortKey) {
+            state.historyOrder = state.historyOrder === "asc" ? "desc" : "asc";
+          } else {
+            state.historySort = sortKey;
+            state.historyOrder = ["symbol", "reason"].includes(sortKey) ? "asc" : "desc";
+          }
+          renderHistory();
+          return;
+        }
         return;
       }
       if (event.target.closest(".filter-chip")) {

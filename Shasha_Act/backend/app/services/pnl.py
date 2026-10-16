@@ -21,6 +21,33 @@ class DayPnlBreakdown(TypedDict):
     funding_record_count: int
 
 
+MARKET_DAY_ROLLOVER = time(5, 30)
+
+
+def market_day_bounds(
+    timezone_name: str = "Asia/Kolkata",
+    on_date: date | None = None,
+    *,
+    rollover_time: time = MARKET_DAY_ROLLOVER,
+) -> tuple[date, datetime, datetime]:
+    """Calculate 24-hour market day bounds (05:30:00 AM to Next Day 05:29:59.999999 AM IST).
+
+    Crypto market day rolls over at 00:00:00 UTC, which corresponds to 05:30:00 AM IST.
+    Any timestamp before 05:30:00 AM IST belongs to the previous calendar day's market day.
+    """
+    zone = ZoneInfo(timezone_name)
+    now_local = datetime.now(zone)
+    if on_date is not None:
+        local_date = on_date
+    elif now_local.time() < rollover_time:
+        local_date = now_local.date() - timedelta(days=1)
+    else:
+        local_date = now_local.date()
+    start_local = datetime.combine(local_date, rollover_time, tzinfo=zone)
+    end_local = start_local + timedelta(days=1)
+    return local_date, start_local.astimezone(UTC), end_local.astimezone(UTC)
+
+
 async def realized_pnl_for_day(
     session: AsyncSession,
     timezone_name: str = "Asia/Kolkata",
@@ -38,18 +65,13 @@ async def realized_pnl_breakdown_for_day(
     on_date: date | None = None,
     mode: str | None = None,
 ) -> DayPnlBreakdown:
-    """Return net P&L, gross P&L, trading fees and funding fees for the local calendar day.
+    """Return net P&L, gross P&L, trading fees and funding fees for the 24-hour market day (05:30 AM to 05:29 AM).
 
     Gross realized values and exchange/paper fees are read from persisted fills. Funding
     is reported separately because Shark's documented trade-history endpoint does not
     include funding; transaction-history synchronization is not silently assumed here.
     """
-    zone = ZoneInfo(timezone_name)
-    local_date = on_date or datetime.now(zone).date()
-    start_local = datetime.combine(local_date, time.min, tzinfo=zone)
-    end_local = start_local + timedelta(days=1)
-    start_utc = start_local.astimezone(UTC)
-    end_utc = end_local.astimezone(UTC)
+    local_date, start_utc, end_utc = market_day_bounds(timezone_name, on_date)
     criteria = [Fill.fill_time >= start_utc, Fill.fill_time < end_utc]
     if mode is not None:
         criteria.append(Fill.mode == mode.upper())
