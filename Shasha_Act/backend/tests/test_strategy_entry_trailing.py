@@ -21,7 +21,7 @@ from app.domain import (
     split_partial_quantity,
 )
 from app.market_data import TickerSnapshot
-from app.models import Order, SignalEvent, Trade
+from app.models import AuditEvent, Fill, Order, SignalEvent, Trade
 from app.services.paper import PaperExecutionAdapter
 
 
@@ -324,10 +324,23 @@ async def test_paper_stop_before_target_one_closes_the_full_position(tmp_path) -
         trade = await session.get(Trade, "trade-trailing-1")
         assert trade.status == "CLOSED"
         assert trade.remaining_quantity == Decimal("0")
-        assert trade.exit_price == Decimal("98.00")
+        # A price gap through the stop is a simulated market exit at the worse observed
+        # last price; the bot must not overstate P&L by pretending it filled at 98.00.
+        assert trade.exit_price == Decimal("97.90")
         assert trade.partial_closed is False
         assert trade.gross_realized_pnl < 0
         assert "SIMULATED_STOP" in trade.status_reason
+        stop_fill = await session.scalar(
+            select(Fill).join(Order).where(Order.trade_id == trade.id, Order.kind == "STOP_LOSS")
+        )
+        assert stop_fill is not None
+        assert stop_fill.price == Decimal("97.90")
+        stop_audit = await session.scalar(
+            select(AuditEvent).where(AuditEvent.entity_id == trade.id, AuditEvent.action == "PAPER_STOP_TRIGGERED")
+        )
+        assert stop_audit is not None
+        assert Decimal(stop_audit.details["trigger_price"]) == Decimal("98.00")
+        assert Decimal(stop_audit.details["fill_price"]) == Decimal("97.90")
 
 
 @pytest.mark.asyncio

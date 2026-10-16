@@ -12,7 +12,19 @@ class LoginRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     username: Annotated[str, Field(min_length=1, max_length=64)]
-    password: Annotated[str, Field(min_length=1, max_length=256)]
+    password: Annotated[str, Field(min_length=8, max_length=256)]
+    remember: bool = True
+
+
+class InitialOwnerSignupRequest(BaseModel):
+    """One-time first-owner setup, available only when explicitly enabled on the server."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    username: Annotated[str, Field(min_length=3, max_length=64)]
+    password: Annotated[str, Field(min_length=12, max_length=256)]
+    display_name: Annotated[str, Field(max_length=96)] | None = None
+    remember: bool = True
 
 
 class SubscriptionUpdate(BaseModel):

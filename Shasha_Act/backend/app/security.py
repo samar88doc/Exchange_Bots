@@ -14,8 +14,6 @@ from threading import Lock
 from typing import Any
 from urllib.parse import urlencode
 
-from fastapi import HTTPException, Request, status
-
 PASSWORD_ALGORITHM = "pbkdf2_sha256"
 _SENSITIVE_TEXT = re.compile(
     r"(?i)(token|secret|signature|api[_-]?key|authorization|password)\s*[:=]\s*(?:bearer\s+)?([^\s,;&\"']+)"
@@ -158,19 +156,3 @@ class SlidingWindowRateLimiter:
                 for name in stale:
                     self._hits.pop(name, None)
             return True
-
-
-async def require_dashboard_auth(request: Request) -> None:
-    settings = request.app.state.settings
-    if not getattr(settings, "dashboard_auth_enabled", True):
-        return
-    configured = settings.dashboard_api_token
-    candidate = request.headers.get("x-dashboard-token")
-    if not configured:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Dashboard API authentication is not configured",
-        )
-    if not constant_time_equals(candidate, configured):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Dashboard authentication required")
-

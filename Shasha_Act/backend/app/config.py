@@ -26,17 +26,21 @@ class Settings(BaseSettings):
     live_trading_enabled: bool = False
     shark_contract_rules_verified: bool = False
     shark_split_protection_verified: bool = False
-    dashboard_auth_enabled: bool = True
+    # Dashboard authentication is always enabled. `DASHBOARD_API_TOKEN` is retained only
+    # for non-browser automation; operators sign in with a username and password.
     dashboard_api_token: str = ""
     tradingview_webhook_token: str = ""
 
-    # Dashboard username/password sign-in (session cookie) ---------------------------------
+    # Dashboard username/password sign-in ---------------------------------------------------
     dashboard_username: str = "admin"
     dashboard_password: str = ""
     dashboard_session_hours: int = 12
-    dashboard_session_cookie: str = "shasha_act_session"
-    dashboard_csrf_cookie: str = "shasha_act_csrf"
-    dashboard_allow_framing: bool = True
+    dashboard_remember_session_days: int = 30
+    # A fresh deployment can opt in to one-time owner setup when it cannot inject a
+    # bootstrap password through its secret manager. It becomes unavailable after the
+    # first account exists, preventing public self-registration into the trading console.
+    initial_owner_signup_enabled: bool = False
+    dashboard_allow_framing: bool = False
     dashboard_frame_ancestors: str = ""
     password_hash_iterations: int = 240_000
     login_max_failures: int = 8
@@ -120,17 +124,13 @@ class Settings(BaseSettings):
     def frame_ancestors_policy(self) -> str:
         """CSP `frame-ancestors` source list.
 
-        Production defaults to `'none'` (dashboard cannot be framed). Development and test
-        permit framing so the console can be embedded in a trusted local preview surface.
-        `DASHBOARD_FRAME_ANCESTORS` overrides this explicitly.
+        The dashboard defaults to `'none'` (it cannot be framed). Set
+        `DASHBOARD_ALLOW_FRAMING=true` for a broad development-only exception, or prefer an
+        explicit `DASHBOARD_FRAME_ANCESTORS` allowlist for a trusted embedding integration.
         """
         if self.dashboard_frame_ancestors.strip():
             return self.dashboard_frame_ancestors.strip()
         return "*" if self.dashboard_allow_framing else "'none'"
-
-    @property
-    def dashboard_password_configured(self) -> bool:
-        return bool(self.dashboard_api_token or self.dashboard_password)
 
     @property
     def allow_symbols_list(self) -> list[str]:

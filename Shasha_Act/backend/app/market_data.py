@@ -223,18 +223,9 @@ class MarketDataService:
         existing_kline = self.day_klines.get(ticker.symbol)
         if existing_kline is not None:
             if existing_kline.start_time < day_start:
-                # Calendar day rollover
-                self.day_klines[ticker.symbol] = DayKlineSnapshot(
-                    symbol=ticker.symbol,
-                    open_price=ticker.last_price,
-                    high_price=ticker.last_price,
-                    low_price=ticker.last_price,
-                    close_price=ticker.last_price,
-                    volume=Decimal("0"),
-                    start_time=day_start,
-                    end_time=day_start.replace(hour=23, minute=59, second=59, microsecond=999000),
-                    received_at=now_utc,
-                )
+                # Never invent a new day-open from the first ticker after rollover. The
+                # next REST/stream kline must provide the exchange's actual daily open.
+                self.day_klines.pop(ticker.symbol, None)
             else:
                 existing_kline.close_price = ticker.last_price
                 if ticker.last_price > existing_kline.high_price:

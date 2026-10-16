@@ -1,15 +1,13 @@
-"""Operator accounts, header sessions, service subscription and disclaimer state.
+"""Operator accounts, authenticated sessions, service subscription and disclaimer state.
 
-Sign-in uses a username/password pair and issues an opaque session token that the browser
-holds and sends as `X-Session-Token`. No ambient cookie credential is used, so the API keeps
-a single, explicit authentication path that is safe against cross-site request forgery and
-still works when the console is embedded in a preview frame.
-
-The server-side `DASHBOARD_API_TOKEN` path is preserved for automation and for deployments
-that have not created an operator account yet.
+The browser signs in with a username and password. The resulting opaque session credential is
+stored only as a hash on the server and is sent by the first-party console in an explicit
+header. `DASHBOARD_API_TOKEN` remains an optional non-browser automation credential; it is not
+exposed as a dashboard sign-in method.
 """
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -178,8 +176,8 @@ async def ensure_bootstrap_user(session: AsyncSession, settings: Settings) -> Da
     """Create the first OWNER account from the environment when none exists yet.
 
     Password must come from the environment (`DASHBOARD_PASSWORD`); the plain value is never
-    stored and never logged. When no password is configured no account is created and the
-    legacy server token remains the only sign-in path.
+    stored and never logged. When no password is configured no account is created; an explicitly
+    enabled one-time initial-owner sign-up may then create the first account.
     """
     existing = int(await session.scalar(select(func.count()).select_from(DashboardUser)) or 0)
     if existing:
@@ -205,6 +203,59 @@ async def ensure_bootstrap_user(session: AsyncSession, settings: Settings) -> Da
     session.add(user)
     await session.flush()
     return user
+
+
+async def create_initial_owner(
+    session: AsyncSession,
+    settings: Settings,
+    *,
+    username: str,
+    password: str,
+    display_name: str | None = None,
+) -> DashboardUser:
+    """Create the first owner only when setup was explicitly enabled by the deployer.
+
+    This is intentionally not general public registration. All later operator accounts are
+    created by an authenticated administrator, because every account reaches one shared
+    trading-control plane.
+    """
+    if not settings.initial_owner_signup_enabled:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Initial owner signup is disabled")
+    normalized = (username or "").strip().lower()
+    if not re.fullmatch(r"[a-z0-9._-]{3,64}", normalized):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Username must be 3-64 characters [a-z0-9._-]")
+
+    # Lock a singleton row so two first-run requests cannot both become OWNER on PostgreSQL.
+    await ensure_subscription(session, settings)
+    await session.scalar(select(ServiceSubscription).where(ServiceSubscription.id == 1).with_for_update())
+    existing = int(await session.scalar(select(func.count()).select_from(DashboardUser)) or 0)
+    if existing:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="An owner account already exists; ask an administrator to create an operator account")
+    owner = DashboardUser(
+        id=str(uuid4()),
+        username=normalized,
+        display_name=(display_name or username).strip()[:96] or normalized,
+        password_hash=hash_password(password, settings.password_hash_iterations),
+        role="OWNER",
+        is_active=True,
+        subscription_plan=settings.subscription_plan_name,
+        subscription_fee=settings.subscription_fee,
+        subscription_currency=settings.subscription_currency,
+        subscription_cycle=settings.subscription_billing_cycle,
+        subscription_started_at=datetime.now(UTC),
+    )
+    session.add(owner)
+    session.add(
+        AuditEvent(
+            actor=normalized,
+            action="INITIAL_OWNER_CREATED",
+            entity_type="user",
+            entity_id=owner.id,
+            details={"role": "OWNER"},
+        )
+    )
+    await session.flush()
+    return owner
 
 
 async def get_user_by_username(session: AsyncSession, username: str) -> DashboardUser | None:
@@ -270,9 +321,19 @@ async def issue_session(
     user: DashboardUser,
     *,
     user_agent: str = "",
+    remember: bool = True,
 ) -> tuple[str, DashboardSession]:
+    """Issue a revocable session with a short or remembered lifetime.
+
+    The browser never asks an operator to copy a server token. A remembered session is still
+    finite, hashed at rest and invalidated immediately when it is revoked or the account is
+    disabled.
+    """
     token = new_session_token()
-    hours = max(int(settings.dashboard_session_hours), 1)
+    if remember:
+        hours = max(min(int(settings.dashboard_remember_session_days), 365), 1) * 24
+    else:
+        hours = max(min(int(settings.dashboard_session_hours), 24), 1)
     record = DashboardSession(
         id=str(uuid4()),
         user_id=user.id,
@@ -331,6 +392,42 @@ async def revoke_session(session: AsyncSession, token: str, *, actor: str = "das
     return True
 
 
+async def revoke_user_sessions(
+    session: AsyncSession,
+    user_id: str,
+    *,
+    actor: str,
+    reason: str,
+) -> int:
+    """Invalidate every active session after a password or account-access change."""
+    rows = list(
+        (
+            await session.scalars(
+                select(DashboardSession).where(
+                    DashboardSession.user_id == user_id,
+                    DashboardSession.revoked_at.is_(None),
+                )
+            )
+        ).all()
+    )
+    if not rows:
+        return 0
+    now = datetime.now(UTC)
+    for record in rows:
+        record.revoked_at = now
+    session.add(
+        AuditEvent(
+            actor=actor,
+            action="DASHBOARD_SESSIONS_REVOKED",
+            entity_type="user",
+            entity_id=user_id,
+            details={"count": len(rows), "reason": reason[:120]},
+        )
+    )
+    await session.flush()
+    return len(rows)
+
+
 def user_payload(user: DashboardUser) -> dict[str, Any]:
     return {
         "id": user.id,
@@ -374,15 +471,13 @@ async def require_dashboard_auth(request: Request) -> None:
     """Primary authentication dependency for every dashboard route.
 
     Order of acceptance:
-    1. `X-Session-Token` — an operator session issued by `/api/auth/login`.
-    2. `X-Dashboard-Token` — the server-configured automation token (owner-level access).
-    Disabled auth (`DASHBOARD_AUTH_ENABLED=false`) keeps the previous open behaviour.
+    1. `X-Session-Token` — an operator session issued by username/password sign-in.
+    2. `X-Dashboard-Token` — an optional server-side automation credential.
+
+    Dashboard authentication cannot be disabled at runtime. Leaving a shared trading console
+    unauthenticated would allow any same-origin caller to operate the bot.
     """
     settings: Settings = request.app.state.settings
-    if not getattr(settings, "dashboard_auth_enabled", True):
-        request.state.auth_method = "DISABLED"
-        return
-
     session_token = request.headers.get("x-session-token", "")
     if session_token:
         factory = request.app.state.session_factory
@@ -405,11 +500,6 @@ async def require_dashboard_auth(request: Request) -> None:
         request.state.auth_method = "SERVER_TOKEN"
         return None
 
-    if not configured and not settings.dashboard_password_configured:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Dashboard authentication is not configured on the server",
-        )
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Dashboard authentication required",

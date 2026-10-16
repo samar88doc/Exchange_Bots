@@ -55,8 +55,11 @@ def create_app(
     @asynccontextmanager
     async def lifespan(application: FastAPI):
         if app_settings.environment == "production":
-            if app_settings.dashboard_auth_enabled and not app_settings.dashboard_api_token:
-                raise RuntimeError("DASHBOARD_API_TOKEN must be configured in production when DASHBOARD_AUTH_ENABLED=true")
+            if not app_settings.dashboard_password and not app_settings.initial_owner_signup_enabled:
+                raise RuntimeError(
+                    "Configure DASHBOARD_USERNAME/DASHBOARD_PASSWORD or explicitly enable "
+                    "INITIAL_OWNER_SIGNUP_ENABLED for one-time first-owner setup"
+                )
             if not app_settings.tradingview_webhook_token:
                 raise RuntimeError("TRADINGVIEW_WEBHOOK_TOKEN must be configured in production")
             if app_settings.database_url.startswith("sqlite"):

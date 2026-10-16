@@ -270,6 +270,8 @@ async def test_realized_pnl_breakdown_deducts_trading_fees_and_funding(tmp_path)
         assert breakdown["gross"] == Decimal("10.00")
         assert breakdown["fees_paid"] == Decimal("0.11")
         assert breakdown["funding_paid"] == Decimal("0.02")
+        assert breakdown["fill_count"] == 2
+        assert breakdown["funding_record_count"] == 1
         # Net = Gross - Fees - Funding = 10.00 - 0.11 - 0.02 = 9.87
         assert breakdown["net"] == Decimal("9.87")
 
