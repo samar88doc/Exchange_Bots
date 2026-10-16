@@ -13,8 +13,18 @@ from app.config import Settings
 from app.domain import (
     ValidationProblem,
     align_to_tick,
+    direction_sign,
+    directional_pnl,
+    entry_side,
+    exit_side,
+    favorable_extreme,
+    is_entry_fillable,
+    is_stop_triggered,
+    is_target_reached,
     next_trailing_stop,
+    round_down_to_step,
     round_up_to_step,
+    simulated_liquidation_price,
 )
 from app.market_data import TickerSnapshot
 from app.models import AuditEvent, Fill, Order, SignalEvent, Trade
@@ -52,13 +62,18 @@ class PaperExecutionAdapter:
             trade_id=trade.id,
             client_order_id=f"paper-{uuid4().hex}",
             kind="ENTRY",
-            side="BUY",
+            side=entry_side(trade.direction),
             order_type="LIMIT",
             status="NEW",
             quantity=trade.quantity or Decimal("0"),
             price=trade.planned_entry,
             reduce_only=False,
-            request_summary={"paper": True, "type": "LIMIT", "price": str(trade.planned_entry)},
+            request_summary={
+                "paper": True,
+                "type": "LIMIT",
+                "price": str(trade.planned_entry),
+                "direction": trade.direction,
+            },
         )
         session.add(order)
         trade.entry_order_id = order.client_order_id
@@ -156,9 +171,10 @@ class PaperExecutionAdapter:
                 return
 
         limit_price = _aligned_price(trade.planned_entry, trade) or trade.planned_entry
-        # A long limit buy can only simulate a match at/below its limit. A ticker touch
-        # is a simulation criterion, not proof that a real exchange order would fill.
-        if ticker.last_price > limit_price:
+        # A LONG limit buy can only simulate a match at/below its limit; a SHORT limit sell
+        # only at/above it. A ticker touch is a simulation criterion, not proof that a real
+        # exchange order would fill.
+        if not is_entry_fillable(trade.direction, limit_price, ticker.last_price):
             return
         entry_price = limit_price
         quantity = trade.quantity or Decimal("0")
@@ -171,11 +187,10 @@ class PaperExecutionAdapter:
         trade.actual_entry = entry_price
         trade.remaining_quantity = quantity
         if trade.leverage and trade.leverage > 0:
-            lev = Decimal(str(trade.leverage))
             # Simplified isolated-margin estimate: maintenance buffer approximated, never
             # presented as an exchange liquidation price in PAPER mode.
-            trade.liquidation_price = max(
-                entry_price * (Decimal("1") - (Decimal("1") / lev)) * Decimal("0.995"), Decimal("0")
+            trade.liquidation_price = simulated_liquidation_price(
+                trade.direction, entry_price, trade.leverage
             )
         trade.status = "OPEN"
         trade.status_reason = "PAPER simulated limit fill; no exchange order was sent."
@@ -185,6 +200,7 @@ class PaperExecutionAdapter:
         trade.partial_closed = False
         trade.target_progress = 0
         trade.trailing_active = False
+        # For a LONG this is the highest price seen; for a SHORT the lowest (favourable extreme).
         trade.trailing_high_price = entry_price if trade.trailing_enabled else None
         if event is not None:
             event.status = "OPEN"
@@ -199,7 +215,7 @@ class PaperExecutionAdapter:
                 order_id=order.id,
                 mode="PAPER",
                 entry_exit="ENTRY",
-                side="BUY",
+                side=entry_side(trade.direction),
                 price=entry_price,
                 quantity=quantity,
                 fee=fee,
@@ -235,7 +251,7 @@ class PaperExecutionAdapter:
                 trade_id=trade.id,
                 client_order_id=f"paper-{uuid4().hex}",
                 kind="STOP_LOSS",
-                side="SELL",
+                side=exit_side(trade.direction),
                 order_type="LIMIT",
                 status="NEW",
                 quantity=trade.remaining_quantity or Decimal("0"),
@@ -265,7 +281,7 @@ class PaperExecutionAdapter:
                     trade_id=trade.id,
                     client_order_id=f"paper-{uuid4().hex}",
                     kind=kind,
-                    side="SELL",
+                    side=exit_side(trade.direction),
                     order_type="LIMIT",
                     status="NEW",
                     quantity=quantity,
@@ -295,9 +311,17 @@ class PaperExecutionAdapter:
         # This is modelled as a taker/market exit: when the observed last is below the stop,
         # it records the worse observed price rather than an optimistic fill at the stop.
         # Target fills advance only by creating persisted PAPER fill records below.
-        if trade.stop_price is not None and ticker.last_price <= trade.stop_price:
+        if trade.stop_price is not None and is_stop_triggered(
+            trade.direction, trade.stop_price, ticker.last_price
+        ):
             trigger_price = trade.stop_price
-            fill_price = min(ticker.last_price, trigger_price)
+            # Gap-through fills take the worse observed price: the lower last for a LONG stop,
+            # the higher last for a SHORT stop.
+            fill_price = (
+                min(ticker.last_price, trigger_price)
+                if trade.direction == "LONG"
+                else max(ticker.last_price, trigger_price)
+            )
             await self._close_paper_quantity(
                 session,
                 trade,
@@ -341,8 +365,11 @@ class PaperExecutionAdapter:
                 return
 
         if trade.status in {"OPEN", "PARTIALLY_CLOSED"} and trade.actual_entry is not None:
-            trade.unrealized_pnl = (ticker.last_price - trade.actual_entry) * (
-                trade.remaining_quantity or Decimal("0")
+            trade.unrealized_pnl = directional_pnl(
+                trade.direction,
+                trade.actual_entry,
+                ticker.last_price,
+                trade.remaining_quantity or Decimal("0"),
             )
 
     async def _process_target1(
@@ -356,7 +383,9 @@ class PaperExecutionAdapter:
         if trade.partial_closed or trade.target1_price is None:
             return
         slice_quantity = trade.target1_quantity or Decimal("0")
-        if slice_quantity <= 0 or ticker.last_price < trade.target1_price:
+        if slice_quantity <= 0 or not is_target_reached(
+            trade.direction, trade.target1_price, ticker.last_price
+        ):
             return
         if slice_quantity > (trade.remaining_quantity or Decimal("0")):
             raise RuntimeError("target 1 slice exceeds remaining paper position")
@@ -374,12 +403,21 @@ class PaperExecutionAdapter:
         trade.status = "PARTIALLY_CLOSED"
         stop_floor = trade.actual_entry or trade.planned_entry
         tick = trade.price_tick
-        break_even = round_up_to_step(stop_floor, tick) if tick and tick > 0 else stop_floor
-        if trade.stop_price is None or trade.stop_price < break_even:
-            trade.stop_price = break_even
+        # Break-even is the entry itself, rounded so the stop never sits on the adverse side of
+        # entry: up for a LONG (stop below price), down for a SHORT (stop above price).
+        if trade.direction == "LONG":
+            break_even = round_up_to_step(stop_floor, tick) if tick and tick > 0 else stop_floor
+            if trade.stop_price is None or trade.stop_price < break_even:
+                trade.stop_price = break_even
+        else:
+            break_even = round_down_to_step(stop_floor, tick) if tick and tick > 0 else stop_floor
+            if trade.stop_price is None or trade.stop_price > break_even:
+                trade.stop_price = break_even
         trade.stop_stage = "BREAK_EVEN"
         trade.trailing_active = bool(trade.trailing_enabled)
-        trade.trailing_high_price = max(trade.trailing_high_price or break_even, ticker.last_price)
+        trade.trailing_high_price = favorable_extreme(
+            trade.direction, trade.trailing_high_price or break_even, ticker.last_price
+        )
         await self._amend_paper_stop(session, trade)
         session.add(
             AuditEvent(
@@ -420,7 +458,11 @@ class PaperExecutionAdapter:
                 break
             target_price = target_prices[index]
             slice_quantity = target_quantities[index]
-            if target_price is None or slice_quantity is None or ticker.last_price < target_price:
+            if (
+                target_price is None
+                or slice_quantity is None
+                or not is_target_reached(trade.direction, target_price, ticker.last_price)
+            ):
                 break
             if slice_quantity > (trade.remaining_quantity or Decimal("0")):
                 raise RuntimeError("target slice exceeds remaining paper position")
@@ -474,7 +516,9 @@ class PaperExecutionAdapter:
         floor_price = trade.actual_entry or trade.planned_entry
         if percent is None or percent <= 0 or tick is None or tick <= 0:
             return
-        high_water = max(trade.trailing_high_price or floor_price, ticker.last_price)
+        high_water = favorable_extreme(
+            trade.direction, trade.trailing_high_price or floor_price, ticker.last_price
+        )
         trade.trailing_high_price = high_water
         try:
             candidate = next_trailing_stop(
@@ -484,10 +528,13 @@ class PaperExecutionAdapter:
                 trailing_percent=percent,
                 price_tick=tick,
                 reference_price=ticker.last_price,
+                direction=trade.direction,
             )
         except ValidationProblem:
             return
-        if trade.stop_price is not None and candidate <= trade.stop_price:
+        if trade.stop_price is not None and (
+            (candidate - trade.stop_price) * direction_sign(trade.direction) <= 0
+        ):
             return
         previous_stop = trade.stop_price
         trade.stop_price = candidate
@@ -551,7 +598,7 @@ class PaperExecutionAdapter:
             raise RuntimeError("paper exit would over-close position")
         fee_bps = self.settings.paper_taker_fee_bps if taker else self.settings.paper_maker_fee_bps
         fee = price * quantity * fee_bps / Decimal("10000")
-        gross = (price - entry) * quantity
+        gross = directional_pnl(trade.direction, entry, price, quantity)
         exit_order = await session.scalar(
             select(Order).where(
                 Order.trade_id == trade.id,
@@ -565,7 +612,7 @@ class PaperExecutionAdapter:
                 trade_id=trade.id,
                 client_order_id=f"paper-{uuid4().hex}",
                 kind=reason,
-                side="SELL",
+                side=exit_side(trade.direction),
                 order_type="LIMIT",
                 status="NEW",
                 quantity=quantity,
@@ -589,7 +636,7 @@ class PaperExecutionAdapter:
                 order_id=exit_order.id,
                 mode="PAPER",
                 entry_exit="EXIT",
-                side="SELL",
+                side=exit_side(trade.direction),
                 price=price,
                 quantity=quantity,
                 fee=fee,

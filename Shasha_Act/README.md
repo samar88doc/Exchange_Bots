@@ -12,6 +12,7 @@ exact price fraction (for example `0.00239`).
 
 - Tokenized TradingView webhook (`/api/webhooks/tradingview/{token}`), bounded request size, per-process rate limit, JSON plus constrained legacy-text parsing, stable deduplication, and durable event persistence.
 - Strict `.P`-suffix normalization only; no automatic `USDT` suffixing. Shark exchange metadata must match an active USDT-quoted perpetual contract. TradingView and Shark symbols are stored separately.
+- **LONG (BUY) and SHORT (SELL) signals.** Both sides use the same closed-candle entry, percentage levels, break-even step and trailing ratchet, mirrored for the short side. See [Strategy](#strategy-the-exact-rules).
 - Server-side risk gates: reserved position slots, one active exposure per contract, symbol allow/deny filters, notional limits, market-local day-loss check, emergency pause, and stale-entry handling.
 - Exact-Decimal order levels: stop at **2% below** the Shark entry price, **Target 1 at +2% closing 50%** of the position, then the stop moves to **break-even** and **trails 1% behind every new 1% high**. Optional fixed Target 2/3 ladder remains available but is off by default.
 - Entry provenance is stored per trade (`entry_price_source`, `entry_candle_time`, `price_tick`) so the dashboard can always show where the executed price came from.
@@ -26,11 +27,13 @@ exact price fraction (for example `0.00239`).
 | Step | Rule |
 |---|---|
 | 1. Trigger | A TradingView alert arrives (Binance-based price). The alert is only a trigger; its price is recorded as `signal_close`, never traded. |
-| 2. Entry | The bot immediately reads the last **completed** 5-minute candle for that contract on Shark and uses its close as the entry price, quantized to the contract's exact price fraction (e.g. `0.00239`). A stale or unavailable candle rejects the signal instead of guessing a price (`ENTRY_ALLOW_LIVE_TICKER_FALLBACK=false` by default). |
-| 3. Stop loss | 2% below the entry price, submitted reduce-only together with the entry and confirmed before the position is reported as protected. |
-| 4. Target 1 | 2% above the entry price, closing **50%** of the position. |
+| 2. Entry | The bot immediately reads the last **completed** 5-minute candle for that contract on Shark and uses its close as the entry price, quantized to the contract's exact price fraction (e.g. `0.00239`). A LONG limit buy is rounded down and a SHORT limit sell is rounded up, so neither is placed on the wrong side of the candle close. A stale or unavailable candle rejects the signal instead of guessing a price (`ENTRY_ALLOW_LIVE_TICKER_FALLBACK=false` by default). |
+| 3. Stop loss | **LONG:** 2% below entry. **SHORT:** 2% above entry. Submitted reduce-only together with the entry and confirmed before the position is reported as protected. |
+| 4. Target 1 | **LONG:** 2% above entry. **SHORT:** 2% below entry. Closes **50%** of the position. |
 | 5. Break-even | As soon as Target 1 is filled, the stop moves to the entry price, so the runner cannot lose money on the trade. |
-| 6. Trailing stop | Thereafter the stop trails **1% behind every new 1% high** (high-water mark stored per trade). The stop only ever ratchets upward and never moves down. |
+| 6. Trailing stop | Thereafter the stop trails **1% behind every new favourable extreme**: 1% behind the **highest** price for a LONG, 1% above the **lowest** price for a SHORT (extreme stored per trade). The stop only ever moves toward profit and never back. |
+
+**SHORT mirror:** a SHORT signal is a sell entry. It profits when price falls, so the stop sits above the entry, Target 1 sits below it, and the trailing stop ratchets **down** as price makes new lows. Stop-outs on a short are triggered by a price rise, and gap fills take the worse observed price for that side. Position P&L is `(entry − price) × quantity` for a SHORT and `(price − entry) × quantity` for a LONG.
 
 Secondary fixed Target 2 / Target 3 exits exist but are disabled by default, so the runner follows
 the trailing stop instead. Percentages apply to the underlying price, not to leveraged account ROI.
@@ -51,7 +54,7 @@ PostgreSQL: signal event + trade reservation + outbox jobs
                  dashboard + health API
 ```
 
-For PAPER, an accepted signal is queued as a limit entry at the **Shark 5-minute closed-candle close** (never the TradingView price). A simulated entry is created only when a fresh public last-price update is at or below that limit; this is a simulation rule, not proof that a real order would fill. After the fill, the 2% stop, the 50% Target 1 slice, the break-even step and the 1% trailing ratchet are all simulated from fresh public prices and recorded with audit events.
+For PAPER, an accepted signal is queued as a limit entry at the **Shark 5-minute closed-candle close** (never the TradingView price). A simulated LONG entry is created only when a fresh public last-price update is at or below that limit; a simulated SHORT entry only when it is at or above that limit. This is a simulation rule, not proof that a real order would fill. After the fill, the 2% stop, the 50% Target 1 slice, the break-even step and the 1% trailing ratchet are all simulated from fresh public prices and recorded with audit events.
 
 LIVE controls require all of the following: the server-side `LIVE_TRADING_ENABLED` gate, configured Shark private credentials, deliberate dashboard confirmation, verified Shark contract rules, verified split-protection semantics, and an exchange metadata match. **The current implementation fails those verification gates closed, and the dashboard LIVE action returns HTTP 409.** Do not bypass this by editing the database.
 
@@ -107,7 +110,7 @@ The alert block references the existing `shashaAlertConditionCurrent` variable a
 - `strategy`: `SHASHA`
 - `event_id`: stable for the same signal candle; the template derives it from ticker, timeframe and candle time
 - `symbol`: `syminfo.ticker`, such as `BTCUSDT.P` (not `syminfo.tickerid` with an exchange prefix)
-- `direction`: `LONG`
+- `direction`: `LONG` (buy signal) or `SHORT` (sell signal). `action` may be used instead: `BUY`/`LONG` or `SELL`/`SHORT`. An alert whose `direction` and `action` disagree is rejected, and so is any exit-style action such as `CLOSE`, which is never turned into a new SHORT entry.
 - `timeframe`, `bar_time`
 - `signal_close`: current signal candle close
 - `entry_price`: previous candle close (`close[1]`)

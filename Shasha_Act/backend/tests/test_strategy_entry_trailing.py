@@ -362,3 +362,54 @@ async def test_risk_control_defaults_express_the_requested_strategy(tmp_path) ->
         assert control.trailing_enabled is True
         assert control.enable_secondary_targets is False
         assert control.entry_candle_interval == "5m"
+
+
+def test_short_strategy_levels_mirror_long_and_round_adversely() -> None:
+    short = compute_strategy_levels(
+        Decimal("0.00239"), Decimal("0.00001"), Decimal("2"), Decimal("2"), direction="SHORT"
+    )
+    long = compute_strategy_levels(Decimal("0.00239"), Decimal("0.00001"), Decimal("2"), Decimal("2"))
+    # SHORT stop sits above entry (rounded up to the tick, away from the price); target 1 sits below.
+    assert short.stop == Decimal("0.00243")
+    assert short.target1 == Decimal("0.00234")
+    assert long.stop == Decimal("0.00235")
+    assert short.stop > Decimal("0.00239") > short.target1
+    assert short.target2 is None and short.target3 is None
+
+
+def test_short_trailing_stop_only_moves_down_and_never_above_the_floor() -> None:
+    # high_water is the lowest price reached since entry (the SHORT extreme).
+    first = next_trailing_stop(
+        high_water=Decimal("98"),
+        current_stop=Decimal("102"),
+        floor_price=Decimal("100"),
+        trailing_percent=Decimal("1"),
+        price_tick=Decimal("0.01"),
+        reference_price=Decimal("97.5"),
+        direction="SHORT",
+    )
+    assert first == Decimal("98.98")
+    # Price bouncing up must not raise the short stop back up.
+    assert (
+        next_trailing_stop(
+            high_water=Decimal("98"),
+            current_stop=first,
+            floor_price=Decimal("100"),
+            trailing_percent=Decimal("1"),
+            price_tick=Decimal("0.01"),
+            reference_price=Decimal("99.5"),
+            direction="SHORT",
+        )
+        == first
+    )
+    # The stop is never lowered beneath the break-even floor (entry).
+    floored = next_trailing_stop(
+        high_water=Decimal("99.9"),
+        current_stop=Decimal("100.5"),
+        floor_price=Decimal("100"),
+        trailing_percent=Decimal("1"),
+        price_tick=Decimal("0.01"),
+        reference_price=Decimal("99.9"),
+        direction="SHORT",
+    )
+    assert floored is not None and floored >= Decimal("100")

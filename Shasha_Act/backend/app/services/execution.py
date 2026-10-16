@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_DOWN, ROUND_UP, Decimal
 from typing import Any
 from uuid import uuid4
 
@@ -14,12 +14,15 @@ from app.domain import (
     Candle,
     ValidationProblem,
     compute_strategy_levels,
+    entry_side,
+    exit_side,
     last_closed_candle,
     normalize_interval,
     parse_candles,
     quantity_from_notional,
     quantize_price,
     round_down_to_step,
+    round_up_to_step,
     split_partial_quantity,
     split_quantity,
 )
@@ -202,11 +205,18 @@ class TradeExecutor:
                     interval=control.entry_candle_interval,
                 )
 
-                # A long limit buy is rounded down so the submitted limit does not exceed
-                # the resolved candle close, and the price always carries the contract's
-                # exact decimal fraction (for example 0.00239).
-                trade.planned_entry = quantize_price(resolved_entry, spec.price_precision)
-                trade.planned_entry = round_down_to_step(trade.planned_entry, tick)
+                # A LONG limit buy is rounded down so it never pays above the resolved candle
+                # close; a SHORT limit sell is rounded up so it never sells below that close.
+                # Either way the price carries the contract's exact decimal fraction.
+                is_short = trade.direction == "SHORT"
+                trade.planned_entry = quantize_price(
+                    resolved_entry, spec.price_precision, rounding=ROUND_UP if is_short else ROUND_DOWN
+                )
+                trade.planned_entry = (
+                    round_up_to_step(trade.planned_entry, tick)
+                    if is_short
+                    else round_down_to_step(trade.planned_entry, tick)
+                )
                 trade.entry_price_source = entry_source
                 trade.entry_candle_time = entry_candle.close_time if entry_candle else None
                 trade.price_tick = tick
@@ -231,6 +241,7 @@ class TradeExecutor:
                     control.target1_percent,
                     control.target2_percent if secondary_targets else None,
                     control.target3_percent if secondary_targets else None,
+                    direction=trade.direction,
                 )
                 target1_quantity: Decimal | None
                 target2_quantity: Decimal | None
@@ -368,13 +379,18 @@ class TradeExecutor:
             trade_id=trade.id,
             client_order_id=f"shasha-{trade.id}",
             kind="ENTRY",
-            side="BUY",
+            side=entry_side(trade.direction),
             order_type="LIMIT",
             status="SUBMITTING",
             quantity=trade.quantity or Decimal("0"),
             price=trade.planned_entry,
             reduce_only=False,
-            request_summary={"type": "LIMIT", "side": "BUY", "symbol": trade.symbol},
+            request_summary={
+                "type": "LIMIT",
+                "side": entry_side(trade.direction),
+                "symbol": trade.symbol,
+                "direction": trade.direction,
+            },
             submitted_at=datetime.now(UTC),
         )
         session.add(order)
@@ -404,8 +420,9 @@ class TradeExecutor:
             symbol = trade.symbol
             quantity = trade.quantity or Decimal("0")
             price = trade.planned_entry
+            side = entry_side(trade.direction)
         try:
-            response = _unwrap(await self.shark.place_limit_buy(symbol, quantity, price))
+            response = _unwrap(await self.shark.place_limit_order(symbol, quantity, price, side=side))
         except SharkOutcomeUnknown:
             async with self.session_factory() as session:
                 event = await session.get(SignalEvent, event_id)
@@ -513,7 +530,7 @@ class TradeExecutor:
             item for item in positions
             if isinstance(item, dict)
             and str(item.get("contractPair") or item.get("symbol") or "").upper() == trade.symbol
-            and str(item.get("positionType") or "LONG").upper() == "LONG"
+            and str(item.get("positionType") or trade.direction).upper() == trade.direction
         ]
         if len(matching) != 1:
             await self._protection_alarm(event_id, "SHARK_POSITION_ID_NOT_UNAMBIGUOUS_AFTER_FILL")
@@ -546,6 +563,7 @@ class TradeExecutor:
                     control.target1_percent,
                     control.target2_percent if secondary else None,
                     control.target3_percent if secondary else None,
+                    direction=trade.direction,
                 )
                 t1_qty: Decimal | None
                 t2_qty: Decimal | None
@@ -617,7 +635,7 @@ class TradeExecutor:
                         client_order_id=stop_id,
                         exchange_order_id=stop_id,
                         kind="STOP_LOSS",
-                        side="SELL",
+                        side=exit_side(trade.direction),
                         order_type="LIMIT",
                         status="PENDING_CONFIRMATION",
                         quantity=filled_qty,
@@ -697,7 +715,7 @@ class TradeExecutor:
                             client_order_id=order_id,
                             exchange_order_id=order_id,
                             kind=kind,
-                            side="SELL",
+                            side=exit_side(trade.direction),
                             order_type="LIMIT",
                             status="PENDING_CONFIRMATION",
                             quantity=quantity,
@@ -746,7 +764,7 @@ class TradeExecutor:
                             client_order_id=client_id,
                             exchange_order_id=client_id,
                             kind=kind,
-                            side="SELL",
+                            side=exit_side(trade.direction),
                             order_type="LIMIT",
                             status="NEW",
                             quantity=quantity,
@@ -843,17 +861,22 @@ class TradeExecutor:
             quantity = trade.remaining_quantity or Decimal("0")
             if quantity <= 0:
                 raise ValueError("NO_REMAINING_POSITION_QUANTITY")
+            close_side = exit_side(trade.direction)
             close_order = Order(
                 id=str(uuid4()),
                 trade_id=trade.id,
                 client_order_id=f"local-close-{uuid4().hex}",
                 kind="MANUAL_CLOSE",
-                side="SELL",
+                side=exit_side(trade.direction),
                 order_type="MARKET",
                 status="SUBMITTING",
                 quantity=quantity,
                 reduce_only=True,
-                request_summary={"type": "MARKET", "side": "SELL", "symbol": trade.symbol},
+                request_summary={
+                    "type": "MARKET",
+                    "side": exit_side(trade.direction),
+                    "symbol": trade.symbol,
+                },
                 submitted_at=datetime.now(UTC),
             )
             session.add(close_order)
@@ -874,7 +897,9 @@ class TradeExecutor:
             )
             await session.commit()
         try:
-            response = _unwrap(await self.shark.place_reduce_only_market_sell(symbol, quantity))
+            response = _unwrap(
+                await self.shark.place_reduce_only_market(symbol, quantity, side=close_side)
+            )
         except SharkOutcomeUnknown:
             async with self.session_factory() as session:
                 trade = await session.get(Trade, trade_id)

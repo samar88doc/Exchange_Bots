@@ -39,3 +39,7 @@ The dashboard's LIVE activation endpoint checks these conditions and currently r
 - Shark API availability, order acceptance, fill price, protection, liquidation price, fees, funding and profit are not guaranteed.
 - Exchange-reported fees/funding can be incomplete or unavailable; API/UI explicitly mark data availability.
 - PAPER uses a deterministic public-last-price simulation rule, not a recreation of the exchange matching engine.
+
+## SHORT (SELL) LIVE mapping — also unverified
+
+SHORT support mirrors LONG at the order-model level: the opening order is a non-reduce-only LIMIT with `side: SELL`; protective stop and targets are reduce-only with the closing side (`BUY`); a manual close is a reduce-only MARKET with `side: BUY`; and the position matched for reconciliation is the one whose `positionType` equals `SHORT`. The reviewed Shark material does not document the exact `positionType` string for short positions, nor how split TP/SL orders behave on a short. Those values are therefore unverified exactly like the LONG path. The same fail-closed gates apply to SHORT: LIVE stays disabled until both verification flags are set after independent confirmation.

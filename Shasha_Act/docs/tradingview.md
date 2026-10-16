@@ -43,6 +43,35 @@ Keep the token in your local deployment secrets and TradingView configuration. I
 
 The receiver removes only one trailing, case-insensitive `.P`. It does not strip exchange prefixes, append `USDT`, or infer a base/quote asset. The normalized candidate must exactly match Shark's public exchange metadata as a perpetual, with USDT quote and the configured margin asset. Unsupported or ambiguous symbols are rejected before order sizing.
 
+## Direction (LONG and SHORT)
+
+`direction` selects the side of the trade:
+
+| Alert value | Meaning | Entry | Stop | Target 1 |
+|---|---|---|---|---|
+| `"direction":"LONG"` or `"action":"BUY"` | buy signal | limit buy at the Shark candle close | entry −stop % | entry +target % |
+| `"direction":"SHORT"` or `"action":"SELL"` | sell signal | limit sell at the Shark candle close | entry +stop % | entry −target % |
+
+- Supply `direction` (preferred) or `action`. If both are present they must agree; a conflict is recorded as rejected (`DIRECTION_ACTION_CONFLICT`).
+- Exit-style actions (`CLOSE`, `EXIT`, `FLAT`, `REDUCE`, `COVER`) and unknown actions are rejected (`UNSUPPORTED_ACTION`). They never open or flip a position.
+- Only one open position per contract is allowed, whichever side it is on.
+- The stop, Target 1 and trailing percentages are shared by both sides; the trailing stop follows the favourable extreme (highest price for LONG, lowest for SHORT).
+
+Example SELL payload:
+
+```json
+{
+  "strategy": "SHASHA",
+  "event_id": "BTCUSDT|15|1792060500000|SHORT",
+  "symbol": "BTCUSDT.P",
+  "direction": "SHORT",
+  "timeframe": "15",
+  "bar_time": 1792060500000,
+  "signal_close": "101.25",
+  "entry_price": "101.50"
+}
+```
+
 ## Legacy text
 
 A constrained legacy text parser accepts explicit `symbol`, `close`, `entry`/`previous candle close`, `timeframe`, and `bar time` lines. It never guesses missing data. JSON is preferred because it supplies a stable `event_id` and separates `entry_price` from `signal_close` unambiguously.

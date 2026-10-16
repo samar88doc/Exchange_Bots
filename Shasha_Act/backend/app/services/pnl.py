@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.domain import directional_pnl
 from app.models import Fill
 
 
@@ -100,5 +101,13 @@ async def realized_pnl_breakdown_for_day(
     )
 
 
+def position_unrealized_pnl(
+    direction: str, entry_price: Decimal, mark_price: Decimal, remaining_quantity: Decimal
+) -> Decimal:
+    """Unrealized price P&L for a LONG (gains on rise) or SHORT (gains on fall) position."""
+    return directional_pnl(direction, entry_price, mark_price, remaining_quantity)
+
+
 def long_unrealized_pnl(entry_price: Decimal, mark_price: Decimal, remaining_quantity: Decimal) -> Decimal:
-    return (mark_price - entry_price) * remaining_quantity
+    """Backwards-compatible LONG-only helper; prefer `position_unrealized_pnl`."""
+    return position_unrealized_pnl("LONG", entry_price, mark_price, remaining_quantity)

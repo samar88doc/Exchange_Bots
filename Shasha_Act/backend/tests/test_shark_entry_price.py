@@ -334,3 +334,33 @@ async def test_process_signal_uses_shark_close_and_supervises_paper_trade(tmp_pa
         target_order = next(order for order in orders if order.kind == "TARGET_1")
         assert _approx(target_order.price, "82125.51")
         assert _approx(target_order.quantity, "0.006", "0.000001")
+
+
+
+async def test_shark_sell_side_maps_to_short_entry_and_buy_exit_for_shorts() -> None:
+    """A SHORT opens with SELL and closes reduce-only with BUY; LONG keeps BUY open / SELL close."""
+    from app.config import Settings as _Settings
+
+    sent: list[dict] = []
+
+    async def _fake_request(self, method, path, *, body=None, **_kwargs):
+        sent.append(dict(body or {}))
+        return {"ok": True}
+
+    settings = _Settings()
+    shark = SharkClient(settings, MagicMock(), clock_ms=lambda: 123)
+    shark._request = _fake_request.__get__(shark)  # type: ignore[method-assign]
+
+    await shark.place_limit_order("BTCUSDT", Decimal("1"), Decimal("100"), side="SELL")
+    await shark.place_reduce_only_market("BTCUSDT", Decimal("1"), side="BUY")
+    await shark.place_limit_buy("BTCUSDT", Decimal("1"), Decimal("100"))
+    await shark.place_reduce_only_market_sell("BTCUSDT", Decimal("1"))
+
+    assert [(b["type"], b["side"], b["reduceOnly"]) for b in sent] == [
+        ("LIMIT", "SELL", False),
+        ("MARKET", "BUY", True),
+        ("LIMIT", "BUY", False),
+        ("MARKET", "SELL", True),
+    ]
+    with pytest.raises(ValueError):
+        await shark.place_limit_order("BTCUSDT", Decimal("1"), Decimal("100"), side="HOLD")

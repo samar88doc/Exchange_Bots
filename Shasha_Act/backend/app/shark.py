@@ -227,13 +227,22 @@ class SharkClient:
         )
 
     async def place_limit_buy(self, symbol: str, quantity: Decimal, price: Decimal) -> Any:
+        """Backwards-compatible LONG entry; see `place_limit_order`."""
+        return await self.place_limit_order(symbol, quantity, price, side="BUY")
+
+    async def place_limit_order(
+        self, symbol: str, quantity: Decimal, price: Decimal, *, side: str = "BUY"
+    ) -> Any:
+        """Open a non-reduce-only LIMIT position: BUY for LONG, SELL for SHORT."""
+        if side not in ("BUY", "SELL"):
+            raise ValueError("order side must be BUY or SELL")
         return await self._request(
             "POST",
             "/v1/order/place-order",
             body={
                 "placeType": "ORDER_FORM",
                 "quantity": quantity,
-                "side": "BUY",
+                "side": side,
                 "symbol": symbol,
                 "reduceOnly": False,
                 "marginAsset": self.settings.shark_margin_asset.upper(),
@@ -291,13 +300,22 @@ class SharkClient:
         )
 
     async def place_reduce_only_market_sell(self, symbol: str, quantity: Decimal) -> Any:
+        """Backwards-compatible LONG close; see `place_reduce_only_market`."""
+        return await self.place_reduce_only_market(symbol, quantity, side="SELL")
+
+    async def place_reduce_only_market(
+        self, symbol: str, quantity: Decimal, *, side: str = "SELL"
+    ) -> Any:
+        """Close a position at market. A LONG closes with SELL; a SHORT closes with BUY."""
+        if side not in ("BUY", "SELL"):
+            raise ValueError("order side must be BUY or SELL")
         return await self._request(
             "POST",
             "/v1/order/place-order",
             body={
                 "placeType": "POSITION",
                 "quantity": quantity,
-                "side": "SELL",
+                "side": side,
                 "symbol": symbol,
                 "reduceOnly": True,
                 "marginAsset": self.settings.shark_margin_asset.upper(),

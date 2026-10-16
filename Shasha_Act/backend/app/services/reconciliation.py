@@ -12,7 +12,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import Settings
-from app.domain import ValidationProblem, next_trailing_stop
+from app.domain import (
+    ValidationProblem,
+    direction_sign,
+    entry_side,
+    favorable_extreme,
+    next_trailing_stop,
+)
 from app.market_data import MarketDataService, TickerSnapshot
 from app.models import AuditEvent, Fill, Order, SignalEvent, Trade
 from app.services.outbox import enqueue_unique_job
@@ -416,7 +422,7 @@ class ReconciliationService:
         symbol = str(item.get("symbol") or item.get("contractPair") or "").upper()
         if symbol != trade.symbol:
             return False
-        if str(item.get("side") or "").upper() != "BUY":
+        if str(item.get("side") or "").upper() != entry_side(trade.direction):
             return False
         if str(item.get("type") or "").upper() != "LIMIT":
             return False
@@ -523,10 +529,11 @@ class ReconciliationService:
     async def _apply_live_trailing_stop(
         self, session: AsyncSession, trade: Trade, protected_quantity: Decimal
     ) -> None:
-        """Ratchet the exchange stop upward after Target 1 (1% up move → 1% higher stop).
+        """Ratchet the exchange stop in the profitable direction after Target 1.
 
-        Only ever amends the stop upward and only after the exchange confirmed the current
-        stop. A failed amendment raises a protection alarm instead of being retried blindly.
+        LONG: each 1% up move lifts the stop 1%. SHORT: each 1% down move lowers the stop 1%.
+        Only ever amends the stop toward profit and only after the exchange confirmed the
+        current stop. A failed amendment raises a protection alarm instead of being retried.
         """
         percent = trade.trailing_stop_percent
         tick = trade.price_tick
@@ -536,7 +543,9 @@ class ReconciliationService:
         ticker = self.market.tickers.get(trade.symbol)
         if ticker is None or ticker.is_stale(self.settings.market_data_stale_seconds):
             return
-        high_water = max(trade.trailing_high_price or floor_price, ticker.last_price)
+        high_water = favorable_extreme(
+            trade.direction, trade.trailing_high_price or floor_price, ticker.last_price
+        )
         trade.trailing_high_price = high_water
         try:
             candidate = next_trailing_stop(
@@ -546,10 +555,13 @@ class ReconciliationService:
                 trailing_percent=percent,
                 price_tick=tick,
                 reference_price=ticker.last_price,
+                direction=trade.direction,
             )
         except ValidationProblem:
             return
-        if trade.stop_price is not None and candidate <= trade.stop_price:
+        if trade.stop_price is not None and (
+            (candidate - trade.stop_price) * direction_sign(trade.direction) <= 0
+        ):
             return
         previous_stop = trade.stop_price
         try:

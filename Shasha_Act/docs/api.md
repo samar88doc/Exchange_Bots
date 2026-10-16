@@ -30,7 +30,7 @@ by default and must be explicitly allowlisted if a trusted integration requires 
 
 ## Webhook
 
-`POST /api/webhooks/tradingview/{token}` accepts a JSON object or constrained legacy text. See [`tradingview.md`](tradingview.md) for the payload and Pine example.
+`POST /api/webhooks/tradingview/{token}` accepts a JSON object or constrained legacy text. See [`tradingview.md`](tradingview.md) for the payload and Pine example. Both `direction: "LONG" | "SHORT"` and `action: "BUY" | "SELL"` are accepted; `SELL` is a SHORT entry. A `direction` that conflicts with `action` returns `DIRECTION_ACTION_CONFLICT`, and exit/close or unknown actions return `UNSUPPORTED_ACTION`. Neither is silently mapped.
 
 Response example:
 
@@ -106,7 +106,7 @@ stale data into a current price. `unrealized_pnl` uses the most recent fresh pub
 | Method | Path | Purpose / guard |
 |---|---|---|
 | `PATCH` | `/api/settings` | Update future-entry risk **and strategy** controls (`stop_loss_percent`, `target1_percent`, `target1_close_percent`, `trailing_stop_percent`, `trailing_enabled`, `enable_secondary_targets`, `entry_candle_interval`, `limit_entry_expiry_seconds`, symbol filters). With secondary targets disabled only Target 1 must be above entry; with them enabled the fixed ladder must still satisfy T1 < T2 < T3. Margin × leverage cannot exceed the notional cap. Every change is audited. |
-| `PATCH` | `/api/trades/{trade_id}/risk` | PAPER-only open-position stop/target edit; requires `confirmation_phrase: "CONFIRM RISK CHANGE"`, fresh last price and monotonic targets. LIVE edits are blocked. |
+| `PATCH` | `/api/trades/{trade_id}/risk` | PAPER-only open-position stop/target edit; requires `confirmation_phrase: "CONFIRM RISK CHANGE"`, fresh last price and monotonic targets. For a SHORT the stop must be above the current last price, and Target 1 and any secondary targets must fall in the direction of the trade (below entry, then lower). LIVE edits are blocked. |
 | `POST` | `/api/control/pause` | Pause requires `PAUSE SHASHA ACT`; resume requires `RESUME SHASHA ACT`. A pause does not close positions or cancel orders. |
 | `POST` | `/api/control/cancel-pending` | Requires `CANCEL PENDING ENTRIES`; reports only exchange-confirmed cancellations. |
 | `POST` | `/api/trades/{trade_id}/cancel-entry` | Requires `CANCEL PENDING ENTRIES`; accepts only `ENTRY_PENDING` or `ENTRY_PARTIAL`, and reports only confirmed cancellation. It does not close any already-filled quantity. |

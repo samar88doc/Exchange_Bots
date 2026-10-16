@@ -63,7 +63,7 @@ from app.schemas import (
     UserUpdateRequest,
 )
 from app.security import hash_password, redact_text
-from app.services.pnl import long_unrealized_pnl, market_day_bounds, realized_pnl_breakdown_for_day
+from app.services.pnl import market_day_bounds, position_unrealized_pnl, realized_pnl_breakdown_for_day
 from app.services.risk import ACTIVE_TRADE_STATES, ensure_risk_control
 
 public_router = APIRouter(prefix="/api", tags=["Status"])
@@ -174,11 +174,28 @@ def _risk_reward(trade: Trade) -> str | None:
     target = trade.target1_price
     if entry is None or stop is None or target is None:
         return None
-    risk = entry - stop
-    reward = target - entry
+    # Risk is the distance to the stop on the adverse side; reward is the distance to Target 1
+    # on the favourable side. Both are positive for a valid LONG or SHORT plan.
+    sign = Decimal("-1") if trade.direction == "SHORT" else Decimal("1")
+    risk = (entry - stop) * sign
+    reward = (target - entry) * sign
     if risk <= 0 or reward <= 0:
         return None
     return _str((reward / risk).quantize(Decimal("0.01")))
+
+
+def _fallback_liquidation_price(trade: Trade) -> Decimal | None:
+    """Display-only isolated-margin estimate when no stored liquidation price exists.
+
+    LONG liquidates as price falls by ~1/leverage; SHORT as price rises by ~1/leverage. A 0.5%
+    maintenance buffer is applied toward the position (closer to entry) in both cases.
+    """
+    if trade.actual_entry is None or (trade.leverage or 0) <= 0:
+        return None
+    sign = Decimal("-1") if trade.direction == "SHORT" else Decimal("1")
+    move = Decimal("1") / Decimal(str(trade.leverage))
+    buffer = Decimal("0.005")
+    return max(trade.actual_entry * (Decimal("1") - sign * move + sign * buffer), Decimal("0"))
 
 
 def _trade_payload(trade: Trade, ticker: Any | None, stale_after: int) -> dict[str, Any]:
@@ -189,7 +206,9 @@ def _trade_payload(trade: Trade, ticker: Any | None, stale_after: int) -> dict[s
     roi = None
     realized = trade.net_realized_pnl or Decimal("0")
     if last_price is not None and trade.actual_entry is not None and trade.remaining_quantity is not None:
-        unrealized = long_unrealized_pnl(trade.actual_entry, last_price, trade.remaining_quantity)
+        unrealized = position_unrealized_pnl(
+            trade.direction, trade.actual_entry, last_price, trade.remaining_quantity
+        )
         if trade.margin > 0:
             roi = unrealized / trade.margin * Decimal("100")
     net_profit = (realized + unrealized) if unrealized is not None else realized
@@ -241,6 +260,8 @@ def _trade_payload(trade: Trade, ticker: Any | None, stale_after: int) -> dict[s
         "trailing_active": trade.trailing_active,
         "trailing_stop_percent": _str(trade.trailing_stop_percent),
         "trailing_high_price": _str(trade.trailing_high_price),
+        # Favourable extreme: highest price for a LONG, lowest price for a SHORT.
+        "trail_high_water_price": _str(trade.trailing_high_price),
         "secondary_targets_enabled": trade.secondary_targets_enabled,
         "entry_price_source": trade.entry_price_source or "",
         "entry_candle_time": _iso(trade.entry_candle_time),
@@ -251,14 +272,7 @@ def _trade_payload(trade: Trade, ticker: Any | None, stale_after: int) -> dict[s
         "liquidation_price": _str(
             trade.liquidation_price
             if trade.liquidation_price is not None
-            else (
-                max(
-                    trade.actual_entry * (Decimal("1") - (Decimal("1") / Decimal(str(trade.leverage))) + Decimal("0.005")),
-                    Decimal("0"),
-                )
-                if trade.actual_entry is not None and (trade.leverage or 0) > 0
-                else None
-            )
+            else _fallback_liquidation_price(trade)
         ),
         "liquidation_price_source": (
             "Shark position response"
@@ -844,13 +858,18 @@ async def read_settings(
             "trailing_stop_percent": _str(control.trailing_stop_percent),
             "trailing_enabled": control.trailing_enabled,
             "enable_secondary_targets": control.enable_secondary_targets,
+            "supported_directions": ["LONG", "SHORT"],
             "description": (
                 "TradingView alert is only a trigger. Entry = close of the last completed Shark "
-                f"{control.entry_candle_interval} candle. Stop = entry -{_plain(control.stop_loss_percent)}%. "
-                f"Target 1 = entry +{_plain(control.target1_percent)}% closing "
-                f"{_plain(control.target1_close_percent)}% of the position, then the stop moves to "
+                f"{control.entry_candle_interval} candle. "
+                f"LONG (BUY): stop = entry -{_plain(control.stop_loss_percent)}%, "
+                f"Target 1 = entry +{_plain(control.target1_percent)}%. "
+                f"SHORT (SELL): stop = entry +{_plain(control.stop_loss_percent)}%, "
+                f"Target 1 = entry -{_plain(control.target1_percent)}%. "
+                f"Target 1 closes {_plain(control.target1_close_percent)}% of the position, then the stop moves to "
                 "break-even and trails "
-                f"{_plain(control.trailing_stop_percent)}% behind every new high."
+                f"{_plain(control.trailing_stop_percent)}% behind every new favourable extreme "
+                "(high for LONG, low for SHORT)."
             ),
         },
         "market_day_timezone": settings.timezone,
@@ -1079,8 +1098,8 @@ async def overview(
         if ticker is None or ticker.is_stale(settings.market_data_stale_seconds):
             active_prices_available = False
         elif trade.actual_entry is not None and trade.remaining_quantity is not None:
-            active_unrealized += long_unrealized_pnl(
-                trade.actual_entry, ticker.last_price, trade.remaining_quantity
+            active_unrealized += position_unrealized_pnl(
+                trade.direction, trade.actual_entry, ticker.last_price, trade.remaining_quantity
             )
     status_counts = await session.execute(
         select(Trade.status, func.count()).where(Trade.mode == mode).group_by(Trade.status)
@@ -1426,7 +1445,7 @@ async def history_csv(
     output = io.StringIO(newline="")
     writer = csv.writer(output)
     columns = [
-        "created_at", "mode", "symbol", "status", "planned_entry", "signal_close", "actual_entry",
+        "created_at", "mode", "symbol", "direction", "status", "planned_entry", "signal_close", "actual_entry",
         "quantity", "remaining_quantity", "stop_price", "target1_price", "target2_price", "target3_price",
         "gross_realized_pnl", "fees_paid", "funding_paid", "net_realized_pnl", "fee_data_available", "funding_data_available",
         "exit_reason",
@@ -1620,13 +1639,32 @@ async def update_trade_risk(
     ticker = request.app.state.context.market.tickers.get(trade.symbol)
     if ticker is None or ticker.is_stale(request.app.state.settings.market_data_stale_seconds):
         raise HTTPException(status_code=409, detail="A fresh Shark last price is required; no risk edit was applied")
-    if new_stop is None or new_stop >= ticker.last_price:
-        raise HTTPException(status_code=422, detail="For a long position, the stop must be below the current last price")
-    if t1 is None or t1 <= entry:
-        raise HTTPException(status_code=422, detail="Target 1 must be above the entry price")
+    # Position-side validation: a LONG stop sits below the last price and targets above entry;
+    # a SHORT stop sits above the last price and targets below entry. `sign` is +1 / -1.
+    is_short = trade.direction == "SHORT"
+    sign = Decimal("-1") if is_short else Decimal("1")
+    if new_stop is None or (new_stop - ticker.last_price) * sign >= 0:
+        side_word = "above" if is_short else "below"
+        raise HTTPException(
+            status_code=422,
+            detail=f"For a {trade.direction.lower()} position, the stop must be {side_word} the current last price",
+        )
+    if t1 is None or (t1 - entry) * sign <= 0:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Target 1 must be {'below' if is_short else 'above'} the entry price",
+        )
     if trade.secondary_targets_enabled:
-        if t2 is None or t3 is None or t2 <= entry or t3 <= entry or not t1 < t2 < t3:
-            raise HTTPException(status_code=422, detail="Secondary targets must be above entry and satisfy T1 < T2 < T3")
+        if t2 is None or t3 is None or (t2 - entry) * sign <= 0 or (t3 - entry) * sign <= 0:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Secondary targets must be {'below' if is_short else 'above'} entry",
+            )
+        if (t2 - t1) * sign <= 0 or (t3 - t2) * sign <= 0:
+            raise HTTPException(
+                status_code=422,
+                detail="Secondary targets must move further in the favourable direction (T1 < T2 < T3 for LONG, T1 > T2 > T3 for SHORT)",
+            )
     elif any(value is not None for value in (t2, t3)):
         raise HTTPException(status_code=422, detail="Target 2 and Target 3 are disabled for this position")
     old = {

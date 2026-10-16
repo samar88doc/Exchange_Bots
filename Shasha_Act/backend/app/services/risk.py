@@ -11,10 +11,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.accounts import ensure_subscription, subscription_state
 from app.config import Settings
-from app.domain import ParsedSignal
+from app.domain import SUPPORTED_DIRECTIONS, ParsedSignal
 from app.market_data import MarketDataService
 from app.models import AuditEvent, RiskControl, SignalEvent, Trade
-from app.services.pnl import long_unrealized_pnl, realized_pnl_for_day
+from app.services.pnl import position_unrealized_pnl, realized_pnl_for_day
 
 ACTIVE_TRADE_STATES = (
     "QUEUED",
@@ -82,6 +82,8 @@ async def reserve_trade_slot(
     """
     if not parsed.symbol or not parsed.entry_price or not parsed.signal_close:
         return None
+    if parsed.direction not in SUPPORTED_DIRECTIONS:
+        raise RiskRejected("UNSUPPORTED_DIRECTION")
     async with local_lock:
         control = await session.scalar(select(RiskControl).where(RiskControl.id == 1).with_for_update())
         if control is None:
@@ -133,8 +135,11 @@ async def reserve_trade_slot(
                 or open_trade.remaining_quantity is None
             ):
                 raise RiskRejected("DAILY_LOSS_CHECK_MARKET_DATA_UNAVAILABLE")
-            current_daily += long_unrealized_pnl(
-                open_trade.actual_entry, ticker.last_price, open_trade.remaining_quantity
+            current_daily += position_unrealized_pnl(
+                open_trade.direction,
+                open_trade.actual_entry,
+                ticker.last_price,
+                open_trade.remaining_quantity,
             )
         if current_daily <= -control.max_daily_loss:
             raise RiskRejected("MAX_DAILY_LOSS_REACHED")
@@ -168,7 +173,7 @@ async def reserve_trade_slot(
             mode=effective_mode,
             tradingview_symbol=parsed.tradingview_symbol,
             symbol=parsed.symbol,
-            direction="LONG",
+            direction=parsed.direction,
             status="QUEUED",
             planned_entry=parsed.entry_price,
             signal_close=parsed.signal_close,

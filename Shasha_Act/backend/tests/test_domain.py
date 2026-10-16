@@ -121,3 +121,13 @@ def test_invalid_target_order_and_tiny_splits_fail_closed() -> None:
         )
     with pytest.raises(ValidationProblem, match="TARGET_SLICE_BELOW_MINIMUM_QUANTITY"):
         split_quantity(Decimal("0.02"), Decimal("0.01"), Decimal("0.01"))
+
+
+def test_short_direction_alert_is_parsed_and_direction_conflicts_fail_closed() -> None:
+    parsed = parse_alert(alert_body(direction="SHORT", entry_price="100.50"))
+    assert parsed.errors == ()
+    assert parsed.direction == "SHORT"
+
+    conflict = parse_alert(alert_body(direction="SHORT", action="BUY"))
+    # A SHORT direction paired with a BUY action is rejected, never silently flipped to LONG.
+    assert "DIRECTION_ACTION_CONFLICT" in conflict.errors
