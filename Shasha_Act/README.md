@@ -132,6 +132,23 @@ Operator controls include:
 
 A status such as `ENTRY_PENDING` is not an open position. `UNKNOWN`, `PROTECTION_ERROR`, stale prices, missing fee/funding data and failed outbox work remain visible rather than being replaced with fabricated values.
 
+### Navigation, live values and session behaviour
+
+- **Every page has its own URL.** The open view is mirrored into the URL fragment (`/`, `#positions`,
+  `#markets`, `#signals`, `#history`, `#strategy`, `#account`, `#settings`, `#users`). A refresh, a
+  bookmark or a shared link reopens exactly that page instead of dropping the operator on the
+  Overview, and the fragment is updated as the operator navigates.
+- **Live values move on their own.** Last price, unrealized P/L, the position KPIs and the pending
+  entries are refreshed about once per second, next to the slower full refresh. The Positions page
+  shows a `LIVE PRICES 1s` marker and a timestamp of the last update.
+- **A refresh never signs the operator out.** A saved session survives a browser reload, and a
+  rendering, data or network failure is reported in place. The credential is dropped only when the
+  server itself rejects the presented session, and the console warns shortly before a session
+  expires so an expiry is never a surprise.
+- **Every control answers its click.** Pause, cancel-pending, cancel-entry, close, mode switches and
+  the refresh buttons show progress while the request is in flight and then report the server's
+  answer.
+
 ## Risk defaults
 
 Initial database settings are PAPER, 100 USDT margin/trade, 10x leverage, 3 open slots, a **2% stop**, **Target 1 at +2% closing 50%**, break-even then a **1% trailing stop**, secondary Target 2/3 exits disabled, 1,000 USDT notional/trade cap, 200 USDT daily loss cap, and a 15-minute pending-entry expiry. These are editable from the authenticated dashboard. They are guardrails, not a promise of execution or P&L. Percentages apply to the underlying price, not leveraged account ROI; fees, funding and slippage are excluded from strategy illustrations.
