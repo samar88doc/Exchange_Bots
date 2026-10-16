@@ -173,24 +173,42 @@ def user_subscription_state(user: DashboardUser, *, now: datetime | None = None)
 
 
 async def ensure_bootstrap_user(session: AsyncSession, settings: Settings) -> DashboardUser | None:
-    """Create the first OWNER account from the environment when none exists yet.
-
-    Password must come from the environment (`DASHBOARD_PASSWORD`); the plain value is never
-    stored and never logged. When no password is configured no account is created; an explicitly
-    enabled one-time initial-owner sign-up may then create the first account.
-    """
-    existing = int(await session.scalar(select(func.count()).select_from(DashboardUser)) or 0)
-    if existing:
-        return None
+    """Create or sync the primary operator account configured in the environment."""
     username = (settings.dashboard_username or "").strip().lower()
     if not settings.dashboard_password or not username:
         return None
+
+    user = await get_user_by_username(session, username)
+    if user is not None:
+        if not verify_password(settings.dashboard_password, user.password_hash):
+            user.password_hash = hash_password(settings.dashboard_password, settings.password_hash_iterations)
+            user.failed_login_count = 0
+            user.locked_until = None
+            session.add(user)
+            await session.flush()
+        return user
+
+    existing = int(await session.scalar(select(func.count()).select_from(DashboardUser)) or 0)
+    # If the only existing account is the default 'admin' placeholder, update it to the configured username
+    if existing == 1:
+        admin_user = await get_user_by_username(session, "admin")
+        if admin_user is not None and admin_user.role == "OWNER":
+            admin_user.username = username
+            admin_user.display_name = settings.dashboard_username
+            admin_user.password_hash = hash_password(settings.dashboard_password, settings.password_hash_iterations)
+            admin_user.failed_login_count = 0
+            admin_user.locked_until = None
+            session.add(admin_user)
+            await session.flush()
+            return admin_user
+
+    role = "OWNER" if existing == 0 else "OPERATOR"
     user = DashboardUser(
         id=str(uuid4()),
         username=username,
         display_name=settings.dashboard_username,
         password_hash=hash_password(settings.dashboard_password, settings.password_hash_iterations),
-        role="OWNER",
+        role=role,
         is_active=True,
         subscription_plan=settings.subscription_plan_name,
         subscription_fee=settings.subscription_fee,

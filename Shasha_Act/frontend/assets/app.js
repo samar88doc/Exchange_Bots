@@ -14,6 +14,7 @@
 (() => {
   const SESSION_STORAGE_KEY = "shasha_session_token";
   const PREF_STORAGE_KEY = "shasha_console_prefs";
+  const FAST_POLL_MS = 1000;
   const POLL_MS = 15000;
 
   const $ = (selector) => document.querySelector(selector);
@@ -178,6 +179,9 @@
     marketOrder: "desc",
     liveFeed: false,
     polling: null,
+    fastPolling: null,
+    isFastPolling: false,
+    schemaAnimated: false,
     online: true,
     lastUpdate: null,
     firstPaint: true,
@@ -223,10 +227,10 @@
       throw error;
     }
     state.online = true;
-    if (response.status === 401) {
+    if (response.status === 401 && !path.startsWith("/api/auth/login") && !path.startsWith("/api/auth/signup")) {
       clearCredentials();
       showAuth("Your session expired. Sign in again.");
-      throw new Error("Session expired");
+      throw new Error("Your session expired. Sign in again.");
     }
     let payload = null;
     const text = await response.text();
@@ -686,8 +690,10 @@
   }
 
   function animateSchema() {
+    if (state.schemaAnimated) return;
     const packet = $("#schema-packet");
     if (!packet) return;
+    state.schemaAnimated = true;
     const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     const combined = ["#schema-path-1", "#schema-path-2", "#schema-path-3"]
       .map((selector) => $(selector))
@@ -1865,8 +1871,62 @@
   }
 
   /* -------------------------------------------------------------------- polling ---- */
+  async function refreshPositionsFast() {
+    if (document.hidden || !state.sessionToken || !state.online || state.isFastPolling) return;
+    state.isFastPolling = true;
+    try {
+      const [posData, overviewData, pendingData] = await Promise.all([
+        api("/api/positions", { silent: true }),
+        api("/api/overview", { silent: true }),
+        api("/api/pending-entries", { silent: true }),
+      ]);
+      if (posData && Array.isArray(posData.items)) {
+        state.positions = posData.items;
+      }
+      if (overviewData) {
+        state.overview = overviewData;
+      }
+      if (pendingData && Array.isArray(pendingData.items)) {
+        state.pendingEntries = pendingData.items;
+      }
+      state.lastUpdate = new Date().toISOString();
+      if ($("#last-updated")) $("#last-updated").textContent = fmtDateTime(state.lastUpdate);
+
+      renderPositions();
+      renderDashboardPositions();
+      if (state.overview) {
+        const overview = state.overview;
+        const day = overview.day_pnl || {};
+        const realized = toNumber(day.realized_net);
+        const pnlNode = $("#kpi-day-pnl");
+        if (pnlNode) {
+          const text = realized === null ? "Unavailable" : `${realized > 0 ? "+" : ""}${realized.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+          pnlNode.textContent = text;
+          pnlNode.classList.toggle("positive", realized !== null && realized > 0);
+          pnlNode.classList.toggle("negative", realized !== null && realized < 0);
+        }
+        const noteNode = $("#kpi-day-pnl-note");
+        if (noteNode) {
+          noteNode.textContent = day.unrealized_status === "AVAILABLE"
+            ? `Unrealized ${fmtMoney(day.unrealized, day.currency, true)} · ${day.fees_included ? "fees included" : "fees excluded"}`
+            : `${esc(overview.market_day || "")} market day · unrealized Unavailable (stale market data)`;
+        }
+        renderDailyPnlLedger(overview);
+      }
+    } catch {
+      /* fast-poll errors remain silent to avoid spam */
+    } finally {
+      state.isFastPolling = false;
+    }
+  }
+
   function startPolling() {
     stopPolling();
+    state.fastPolling = setInterval(async () => {
+      if (document.hidden) return;
+      await refreshPositionsFast();
+    }, FAST_POLL_MS);
+
     state.polling = setInterval(async () => {
       if (document.hidden) return;
       try {
@@ -1879,6 +1939,7 @@
 
   function stopPolling() {
     if (state.polling) { clearInterval(state.polling); state.polling = null; }
+    if (state.fastPolling) { clearInterval(state.fastPolling); state.fastPolling = null; }
   }
 
   /* --------------------------------------------------------------------- events ---- */

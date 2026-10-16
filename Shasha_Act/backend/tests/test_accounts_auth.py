@@ -426,3 +426,81 @@ def test_server_token_keeps_owner_level_access_for_automation(auth_client: TestC
     assert (
         auth_client.patch("/api/subscription", json={"fee": "1499"}, headers=token_headers).status_code == 200
     )
+
+
+def test_ensure_bootstrap_user_syncs_credentials_and_migrates_admin(tmp_path) -> None:
+    from app.accounts import ensure_bootstrap_user, get_user_by_username
+    from app.db import make_session_factory
+
+    database_path = tmp_path / "sync-test.sqlite3"
+    settings = Settings(
+        _env_file=None,
+        environment="test",
+        database_url=f"sqlite+aiosqlite:///{database_path}",
+        dashboard_username="admin",
+        dashboard_password="InitialPassword123!",
+        require_disclaimer_ack=False,
+        run_workers=False,
+        run_market_stream=False,
+        run_market_poll=False,
+    )
+    engine = make_engine(settings.database_url)
+
+    async def run_scenario() -> None:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+        factory = make_session_factory(engine)
+        # 1. First boot: admin created
+        async with factory() as session:
+            user = await ensure_bootstrap_user(session, settings)
+            await session.commit()
+            assert user is not None
+            assert user.username == "admin"
+
+        # 2. Second boot: settings updated to new username and password
+        updated_settings = Settings(
+            _env_file=None,
+            environment="test",
+            database_url=f"sqlite+aiosqlite:///{database_path}",
+            dashboard_username="samar88doc",
+            dashboard_password="NewSecurePassword456!",
+            require_disclaimer_ack=False,
+            run_workers=False,
+            run_market_stream=False,
+            run_market_poll=False,
+        )
+        async with factory() as session:
+            user2 = await ensure_bootstrap_user(session, updated_settings)
+            await session.commit()
+            assert user2 is not None
+            assert user2.username == "samar88doc"
+            assert user2.role == "OWNER"
+
+            # Check that old admin was migrated
+            old_admin = await get_user_by_username(session, "admin")
+            assert old_admin is None
+            current = await get_user_by_username(session, "samar88doc")
+            assert current is not None
+
+        # 3. Third boot: password updated in settings
+        pwd_settings = Settings(
+            _env_file=None,
+            environment="test",
+            database_url=f"sqlite+aiosqlite:///{database_path}",
+            dashboard_username="samar88doc",
+            dashboard_password="AnotherPassword789!",
+            require_disclaimer_ack=False,
+            run_workers=False,
+            run_market_stream=False,
+            run_market_poll=False,
+        )
+        async with factory() as session:
+            user3 = await ensure_bootstrap_user(session, pwd_settings)
+            await session.commit()
+            assert user3 is not None
+            from app.security import verify_password
+            assert verify_password("AnotherPassword789!", user3.password_hash)
+
+    asyncio.run(run_scenario())
+
