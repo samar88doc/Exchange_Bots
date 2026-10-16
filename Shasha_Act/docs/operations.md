@@ -53,7 +53,9 @@
 | `CLOSED` | Exit/position state is confirmed or PAPER simulation completed. |
 | `REJECTED` / `CANCELLED` / `FAILED` | Request did not become an open position; inspect the reason and audit trail. |
 
-PAPER protection is simulated and is not an exchange-side stop. LIVE remains blocked until official contract/protection semantics are verified.
+PAPER protection is simulated and is not an exchange-side stop.
+
+SHORT positions (from `SELL` alerts) follow the mirrored rules: the stop sits above entry, Target 1 below entry closes 50%, the stop moves to break-even after Target 1, and the 1% trailing stop only moves down. Each active trade is still one exposure per symbol, whatever its direction. The Shark SHORT `positionType` and reduce-only BUY exit are **unverified**, so LIVE SHORT stays blocked along with LIVE LONG. See [`shark-api-verification.md`](shark-api-verification.md). LIVE remains blocked until official contract/protection semantics are verified.
 
 ## Routine monitoring
 

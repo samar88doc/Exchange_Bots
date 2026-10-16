@@ -704,7 +704,8 @@
   function trailingCell(item) {
     if (!item.trailing_enabled) return `<span class="muted">Off</span>`;
     if (isMissing(item.trail_high_water_price)) return `<span class="muted">Armed</span>`;
-    return `<span class="mono">${fmtPrice(item.trail_high_water_price)}</span><small class="muted"> high water</small>`;
+    const label = item.direction === "SHORT" ? "low water" : "high water";
+    return `<span class="mono">${fmtPrice(item.trail_high_water_price)}</span><small class="muted"> ${label}</small>`;
   }
 
   function renderStrategySnapshot(settings) {
@@ -714,19 +715,20 @@
     const risk = settings.risk || {};
     list.innerHTML = [
       `<li><b>${esc(strategy.entry_candle_interval || "5m")}</b> Shark closed-candle entry price</li>`,
-      `<li><b>-${esc(strategy.stop_loss_percent)}%</b> protective stop from entry</li>`,
-      `<li><b>+${esc(strategy.target1_percent)}%</b> closes <b>${esc(strategy.target1_close_percent)}%</b> of the position</li>`,
+      `<li><b>LONG</b> stop −${esc(strategy.stop_loss_percent)}% · Target 1 +${esc(strategy.target1_percent)}% from entry</li>`,
+      `<li><b>SHORT</b> stop +${esc(strategy.stop_loss_percent)}% · Target 1 −${esc(strategy.target1_percent)}% from entry</li>`,
+      `<li>Target 1 closes <b>${esc(strategy.target1_close_percent)}%</b> of the position</li>`,
       `<li><b>${strategy.trailing_enabled ? `${esc(strategy.trailing_stop_percent)}% trailing` : "Trailing disabled"}</b> after break-even</li>`,
       `<li>Margin <b>${fmtMoney(risk.margin_per_trade)}</b> at <b>${esc(risk.leverage)}×</b> · max ${esc(risk.max_open_positions)} open</li>`,
     ].join("");
     ["schema-interval", "flow-interval", "auth-interval"].forEach((id) => { const node = $(`#${id}`); if (node) node.textContent = strategy.entry_candle_interval || "5m"; });
-    ["schema-levels", "flow-stop"].forEach((id) => { const node = $(`#${id}`); if (node) node.textContent = `-${strategy.stop_loss_percent}% stop · +${strategy.target1_percent}% target 1`; });
-    if ($("#flow-target")) $("#flow-target").textContent = `+${strategy.target1_percent}%`;
+    ["schema-levels", "flow-stop"].forEach((id) => { const node = $(`#${id}`); if (node) node.textContent = `LONG −${strategy.stop_loss_percent}% stop · +${strategy.target1_percent}% T1 | SHORT mirrored`; });
+    if ($("#flow-target")) $("#flow-target").textContent = `${strategy.target1_percent}% with the trade`;
     if ($("#flow-partial")) $("#flow-partial").textContent = `${strategy.target1_close_percent}%`;
     if ($("#flow-trail")) $("#flow-trail").textContent = `${strategy.trailing_stop_percent}%`;
     if ($("#flow-trail-2")) $("#flow-trail-2").textContent = `${strategy.trailing_stop_percent}%`;
     if ($("#schema-partial")) $("#schema-partial").textContent = `Close ${strategy.target1_close_percent}% at +${strategy.target1_percent}%`;
-    if ($("#schema-trail")) $("#schema-trail").textContent = `Stop to entry, then ${strategy.trailing_stop_percent}% trail`;
+    if ($("#schema-trail")) $("#schema-trail").textContent = `Stop to entry, then ${strategy.trailing_stop_percent}% trail (LONG high · SHORT low)`;
     if ($("#auth-stop")) $("#auth-stop").textContent = `${strategy.stop_loss_percent}%`;
     if ($("#auth-trail")) $("#auth-trail").textContent = `${strategy.trailing_stop_percent}%`;
     if ($("#auth-partial")) $("#auth-partial").textContent = `${strategy.target1_close_percent}%`;
@@ -734,10 +736,10 @@
     if ($("#protection-ladder")) {
       $("#protection-ladder").innerHTML = [
         `<li><b>Entry</b> — last completed ${esc(strategy.entry_candle_interval || "5m")} Shark candle close</li>`,
-        `<li><b>-${esc(strategy.stop_loss_percent)}%</b> — initial reduce-only stop with the entry</li>`,
-        `<li><b>+${esc(strategy.target1_percent)}%</b> — close ${esc(strategy.target1_close_percent)}% and arm break-even</li>`,
+        `<li><b>LONG −${esc(strategy.stop_loss_percent)}% / SHORT +${esc(strategy.stop_loss_percent)}%</b> — initial reduce-only stop with the entry</li>`,
+        `<li><b>LONG +${esc(strategy.target1_percent)}% / SHORT −${esc(strategy.target1_percent)}%</b> — close ${esc(strategy.target1_close_percent)}% and arm break-even</li>`,
         `<li><b>Break-even</b> — stop moves to the entry price</li>`,
-        `<li><b>Trail</b> — each ${esc(strategy.trailing_stop_percent)}% advance lifts the stop ${esc(strategy.trailing_stop_percent)}%</li>`,
+        `<li><b>Trail</b> — each ${esc(strategy.trailing_stop_percent)}% favourable move lifts (LONG) or lowers (SHORT) the stop ${esc(strategy.trailing_stop_percent)}%</li>`,
       ].join("");
     }
     if ($("#entry-provenance")) {
@@ -852,7 +854,7 @@
       case "rail": {
         const entry = toNumber(item.actual_entry || item.planned_entry) || 0;
         const stop = toNumber(item.stop_price || item.initial_stop_price) || 0;
-        return entry && stop ? ((entry - stop) / entry) : 0;
+        return entry && stop ? (Math.abs(entry - stop) / entry) : 0;
       }
       case "entry":
         return toNumber(item.actual_entry || item.planned_entry) || 0;
@@ -1523,11 +1525,14 @@
     const partialPercent = toNumber(strategy.target1_close_percent) ?? 50;
     $("#strategy-example").innerHTML = [
       ["Entry (example)", fmtPrice(entry)],
-      ["Stop loss", fmtPrice(entry * (1 - stopPercent / 100))],
-      ["Target 1", fmtPrice(entry * (1 + targetPercent / 100))],
+      ["LONG stop loss", fmtPrice(entry * (1 - stopPercent / 100))],
+      ["LONG target 1", fmtPrice(entry * (1 + targetPercent / 100))],
+      ["SHORT stop loss", fmtPrice(entry * (1 + stopPercent / 100))],
+      ["SHORT target 1", fmtPrice(entry * (1 - targetPercent / 100))],
       ["Closed at Target 1", `${partialPercent}% of size`],
       ["Break-even stop", fmtPrice(entry)],
-      ["Trail after +3%", fmtPrice(entry * 1.03 * (1 - trailPercent / 100))],
+      ["LONG trail after +3%", fmtPrice(entry * 1.03 * (1 - trailPercent / 100))],
+      ["SHORT trail after −3%", fmtPrice(entry * 0.97 * (1 + trailPercent / 100))],
     ].map(([label, value]) => `<div class="example-item"><span>${esc(label)}</span><strong>${esc(value)}</strong></div>`).join("") + (step ? "" : "");
     renderStrategyAudit();
   }
@@ -1767,7 +1772,7 @@
           ${row("Price tick", esc(trade.price_tick || "Unavailable"))}
           ${row("Stop loss", `${fmtPrice(trade.stop_price)} ${trade.stop_stage ? `· ${esc(trade.stop_stage)}` : ""}`)}
           ${row("Target 1", `${fmtPrice(trade.target1_price)} ${trade.target1_quantity ? `· qty ${fmtNum(trade.target1_quantity)}` : ""}`)}
-          ${row("Trailing", trade.trailing_enabled ? `${esc(trade.trailing_stop_percent || "—")}% · high ${fmtPrice(trade.trail_high_water_price)}` : "Disabled")}
+          ${row("Trailing", trade.trailing_enabled ? `${esc(trade.trailing_stop_percent || "—")}% · ${trade.direction === "SHORT" ? "low" : "high"} ${fmtPrice(trade.trail_high_water_price)}` : "Disabled")}
           ${row("Quantity", `${fmtNum(trade.remaining_quantity)} of ${fmtNum(trade.quantity)}`)}
           ${row("Partial closed", trade.partial_closed ? `Yes · ${esc(trade.partial_close_percent)}%` : "No")}
           ${row("Net realized", trade.net_realized_pnl === null ? "Unavailable" : fmtMoney(trade.net_realized_pnl, "USDT", true))}

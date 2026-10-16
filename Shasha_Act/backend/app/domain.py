@@ -70,6 +70,88 @@ class PartialSplit:
         return self.partial + self.runner
 
 
+SUPPORTED_DIRECTIONS: tuple[str, ...] = ("LONG", "SHORT")
+# Action words are matched as whole tokens so `BUY_4H`, `OPEN_LONG` or `SELL` are understood,
+# while exit-style actions are never mistaken for an entry.
+_LONG_ACTION_TOKENS = frozenset({"BUY", "LONG"})
+_SHORT_ACTION_TOKENS = frozenset({"SELL", "SHORT"})
+_NON_ENTRY_ACTION_TOKENS = frozenset({"CLOSE", "EXIT", "FLAT", "REDUCE", "COVER"})
+
+
+def normalize_direction(value: str) -> str | None:
+    """Return LONG/SHORT for a direction word, or None when the word is not a supported side."""
+    text = str(value or "").strip().upper()
+    if text in ("LONG", "BUY", "BUY_LONG"):
+        return "LONG"
+    if text in ("SHORT", "SELL", "SELL_SHORT"):
+        return "SHORT"
+    return None
+
+
+def direction_from_action(action: str) -> str | None:
+    """Infer the entry side from a TradingView action word; None when it is not an entry."""
+    tokens = {token for token in re.split(r"[^A-Z]+", action.upper()) if token}
+    if tokens & _NON_ENTRY_ACTION_TOKENS:
+        return None
+    longs = bool(tokens & _LONG_ACTION_TOKENS)
+    shorts = bool(tokens & _SHORT_ACTION_TOKENS)
+    if longs == shorts:
+        return None
+    return "LONG" if longs else "SHORT"
+
+
+def direction_sign(direction: str) -> Decimal:
+    """+1 for a LONG (profit when price rises), -1 for a SHORT (profit when price falls)."""
+    if direction == "LONG":
+        return Decimal("1")
+    if direction == "SHORT":
+        return Decimal("-1")
+    raise ValidationProblem("UNSUPPORTED_DIRECTION")
+
+
+def entry_side(direction: str) -> str:
+    """Exchange side of the opening order: BUY for LONG, SELL for SHORT."""
+    return "BUY" if direction_sign(direction) > 0 else "SELL"
+
+
+def exit_side(direction: str) -> str:
+    """Exchange side that closes the position: SELL for LONG, BUY for SHORT."""
+    return "SELL" if direction_sign(direction) > 0 else "BUY"
+
+
+def directional_pnl(direction: str, entry: Decimal, price: Decimal, quantity: Decimal) -> Decimal:
+    """Price P&L of `quantity` units; a SHORT gains when the price falls below entry."""
+    return (price - entry) * quantity * direction_sign(direction)
+
+
+def is_entry_fillable(direction: str, limit_price: Decimal, last_price: Decimal) -> bool:
+    """A LONG buy limit fills at or below its price; a SHORT sell limit at or above it."""
+    return last_price <= limit_price if direction_sign(direction) > 0 else last_price >= limit_price
+
+
+def is_stop_triggered(direction: str, stop_price: Decimal, last_price: Decimal) -> bool:
+    """A LONG stop sits below price and triggers when price falls to it; a SHORT stop is above."""
+    return last_price <= stop_price if direction_sign(direction) > 0 else last_price >= stop_price
+
+
+def is_target_reached(direction: str, target_price: Decimal, last_price: Decimal) -> bool:
+    """A LONG target sits above entry; a SHORT target sits below entry."""
+    return last_price >= target_price if direction_sign(direction) > 0 else last_price <= target_price
+
+
+def favorable_extreme(direction: str, reference: Decimal, price: Decimal) -> Decimal:
+    """The most favourable price seen so far: the highest for a LONG, the lowest for a SHORT."""
+    return max(reference, price) if direction_sign(direction) > 0 else min(reference, price)
+
+
+def simulated_liquidation_price(direction: str, entry: Decimal, leverage: int) -> Decimal:
+    """Simplified isolated-margin estimate used only for PAPER display (never an exchange value)."""
+    sign = direction_sign(direction)
+    lev = Decimal(str(leverage))
+    raw = entry * (Decimal("1") - sign / lev) * (Decimal("1") - sign * Decimal("0.005"))
+    return max(raw, Decimal("0"))
+
+
 @dataclass(frozen=True)
 class Candle:
     """One exchange candlestick, normalised regardless of source ordering."""
@@ -296,12 +378,17 @@ def compute_strategy_levels(
     target1_percent: Decimal,
     target2_percent: Decimal | None = None,
     target3_percent: Decimal | None = None,
+    direction: str = "LONG",
 ) -> PriceLevels:
-    """SHASHA levels: stop below entry, Target 1 above entry, optional later targets.
+    """SHASHA levels for either side.
+
+    LONG: stop below entry, targets above. SHORT: mirror image — stop above entry, targets
+    below. The same percentages apply to both sides; percentages are underlying-price moves.
 
     Targets are optional because the shipped strategy closes 50% at Target 1 and then
     protects the runner with a trailing stop instead of fixed Target 2/3 exits.
     """
+    sign = direction_sign(direction)
     if entry <= 0 or min(price_tick, stop_loss_percent, target1_percent) <= 0:
         raise ValidationProblem("INVALID_LEVEL_PARAMETERS")
     for later in (target2_percent, target3_percent):
@@ -313,27 +400,51 @@ def compute_strategy_levels(
         target2_percent is None or target3_percent <= target2_percent
     ):
         raise ValidationProblem("TARGETS_MUST_BE_STRICTLY_INCREASING")
-    # For a long, rounding the stop up avoids increasing intended downside; targets round up
-    # so they do not trigger at a price movement smaller than the configured threshold.
-    stop = round_up_to_step(entry * (Decimal("1") - stop_loss_percent / Decimal("100")), price_tick)
-    t1 = round_up_to_step(entry * (Decimal("1") + target1_percent / Decimal("100")), price_tick)
+    # Both sides round every level in the same direction: a LONG level rounds up (stop closer
+    # to entry, target not reached early), a SHORT level rounds down for the same reasons.
+    round_level = round_up_to_step if sign > 0 else round_down_to_step
+    stop = round_level(entry * (Decimal("1") - sign * stop_loss_percent / Decimal("100")), price_tick)
+    t1 = round_level(entry * (Decimal("1") + sign * target1_percent / Decimal("100")), price_tick)
     t2 = (
-        round_up_to_step(entry * (Decimal("1") + target2_percent / Decimal("100")), price_tick)
+        round_level(entry * (Decimal("1") + sign * target2_percent / Decimal("100")), price_tick)
         if target2_percent is not None
         else None
     )
     t3 = (
-        round_up_to_step(entry * (Decimal("1") + target3_percent / Decimal("100")), price_tick)
+        round_level(entry * (Decimal("1") + sign * target3_percent / Decimal("100")), price_tick)
         if target3_percent is not None
         else None
     )
-    if stop >= entry or t1 <= entry:
+    # (level - entry) * sign must be negative for the stop (adverse side) and positive for targets.
+    if (stop - entry) * sign >= 0 or (t1 - entry) * sign <= 0:
         raise ValidationProblem("TICK_SIZE_COLLAPSES_RISK_LEVELS")
-    if t2 is not None and t2 <= t1:
+    if t2 is not None and (t2 - t1) * sign <= 0:
         raise ValidationProblem("TICK_SIZE_COLLAPSES_RISK_LEVELS")
-    if t3 is not None and (t2 is None or t3 <= t2):
+    if t3 is not None and (t2 is None or (t3 - t2) * sign <= 0):
         raise ValidationProblem("TICK_SIZE_COLLAPSES_RISK_LEVELS")
     return PriceLevels(stop=stop, target1=t1, target2=t2, target3=t3)
+
+
+def compute_long_levels(
+    entry: Decimal,
+    price_tick: Decimal,
+    stop_loss_percent: Decimal,
+    target1_percent: Decimal,
+    target2_percent: Decimal,
+    target3_percent: Decimal,
+) -> PriceLevels:
+    """Backwards-compatible LONG-only wrapper with mandatory fixed targets."""
+    if not target1_percent < target2_percent < target3_percent:
+        raise ValidationProblem("TARGETS_MUST_BE_STRICTLY_INCREASING")
+    return compute_strategy_levels(
+        entry,
+        price_tick,
+        stop_loss_percent,
+        target1_percent,
+        target2_percent,
+        target3_percent,
+        direction="LONG",
+    )
 
 
 def split_partial_quantity(
@@ -371,29 +482,40 @@ def next_trailing_stop(
     trailing_percent: Decimal,
     price_tick: Decimal,
     reference_price: Decimal | None = None,
+    direction: str = "LONG",
 ) -> Decimal:
-    """Ratchet a long-position stop upward, one step per upward percent move.
+    """Ratchet a protective stop toward profit, one step per favourable percent move.
 
-    `high_water` is the highest price seen since trailing protection was armed. The stop is
-    never allowed below `floor_price` (the break-even entry after Target 1) and never allowed
-    to move down, so protection can only improve.
+    `high_water` is the most favourable price seen since trailing protection was armed: the
+    highest price for a LONG, the lowest price for a SHORT. The stop is never allowed beyond
+    `floor_price` (the break-even entry after Target 1) on the adverse side, and never moves
+    back against the position, so protection can only improve.
     """
+    sign = direction_sign(direction)
     if high_water <= 0 or trailing_percent <= 0 or price_tick <= 0:
         raise ValidationProblem("INVALID_TRAILING_PARAMETERS")
     if floor_price <= 0:
         raise ValidationProblem("INVALID_TRAILING_FLOOR")
-    candidate = round_down_to_step(
-        high_water * (Decimal("1") - trailing_percent / Decimal("100")), price_tick
-    )
-    stop = max(candidate, floor_price)
-    if reference_price is not None and stop >= reference_price:
-        # Never arm a stop at or above the live price; it would exit immediately at a
-        # price the market has not traded.
-        stop = max(floor_price, min(stop, reference_price))
-    if current_stop is not None and stop <= current_stop:
+    factor = Decimal("1") - sign * trailing_percent / Decimal("100")
+    if sign > 0:
+        # LONG: stop trails below the high, never below break-even.
+        candidate = round_down_to_step(high_water * factor, price_tick)
+        stop = max(candidate, floor_price)
+        if reference_price is not None and stop >= reference_price:
+            # Never arm a stop at or above the live price; it would exit at an unseen price.
+            stop = max(floor_price, min(stop, reference_price))
+    else:
+        # SHORT: stop trails above the low, never above break-even.
+        candidate = round_up_to_step(high_water * factor, price_tick)
+        stop = min(candidate, floor_price)
+        if reference_price is not None and stop <= reference_price:
+            stop = min(floor_price, max(stop, reference_price))
+    if current_stop is not None and (stop - current_stop) * sign <= 0:
         return current_stop
-    if stop >= high_water:
-        raise ValidationProblem("TRAILING_STOP_NOT_BELOW_PRICE")
+    if (stop - high_water) * sign >= 0:
+        raise ValidationProblem(
+            "TRAILING_STOP_NOT_BELOW_PRICE" if sign > 0 else "TRAILING_STOP_NOT_ABOVE_PRICE"
+        )
     return stop
 
 
@@ -528,7 +650,13 @@ def parse_alert(body: bytes) -> ParsedSignal:
     if any(k in strat_name.upper() or k in strat_id.upper() for k in ("VIP", "JEMAL")):
         errors.append("THIRD_PARTY_VIP_PROHIBITED")
 
-    strategy = str(fields.get("strategy") or (raw_action if raw_action not in ("BUY", "LONG") else "") or "SHASHA").strip().upper()
+    action_direction = direction_from_action(raw_action) if raw_action else None
+    if raw_action and action_direction is None:
+        # Exit/close words and unknown actions must never be guessed into a new entry.
+        errors.append("UNSUPPORTED_ACTION")
+    # Entry-side words are not strategy names: a SELL alert is still the SHASHA strategy.
+    strategy_default = "SHASHA" if (action_direction or not raw_action) else raw_action
+    strategy = str(fields.get("strategy") or strategy_default or "SHASHA").strip().upper()
     if not strategy:
         strategy = "SHASHA"
     elif any(k in strategy for k in ("VIP", "JEMAL", "TELEGRAM")):
@@ -544,19 +672,23 @@ def parse_alert(body: bytes) -> ParsedSignal:
     else:
         errors.append("MISSING_SYMBOL")
 
-    direction = str(fields.get("direction") or "").strip().upper()
-    if not direction:
-        if raw_action in ("BUY", "LONG", "OPEN_LONG", "BUY_LONG") or "BUY" in raw_action or "LONG" in raw_action:
-            direction = "LONG"
-        elif raw_action in ("SELL", "SHORT", "OPEN_SHORT", "CLOSE"):
-            direction = "SHORT"
-        else:
-            direction = "LONG"
-    elif direction in ("BUY", "BUY_LONG"):
+    # Direction: an explicit `direction` field and an `action` word must agree when both are
+    # present. An alert with neither keeps the historical LONG default, because the shipped
+    # TradingView template always sends `direction`.
+    explicit_raw = str(fields.get("direction") or "").strip()
+    explicit_direction = normalize_direction(explicit_raw) if explicit_raw else None
+    if explicit_raw and explicit_direction is None:
+        errors.append("UNSUPPORTED_DIRECTION")
+    if explicit_direction and action_direction and explicit_direction != action_direction:
+        errors.append("DIRECTION_ACTION_CONFLICT")
+    if explicit_direction is not None:
+        direction = explicit_direction
+    elif action_direction is not None:
+        direction = action_direction
+    elif raw_action:
+        direction = "UNKNOWN"
+    else:
         direction = "LONG"
-
-    if direction != "LONG":
-        errors.append("ONLY_LONG_SIGNALS_SUPPORTED")
 
     timeframe = str(fields.get("timeframe") or fields.get("interval") or "").strip()
     if not timeframe:
@@ -657,29 +789,6 @@ def align_to_tick(value: Decimal, tick: Decimal | None) -> Decimal:
     if tick <= 0:
         raise ValidationProblem("INVALID_PRICE_TICK")
     return (value / tick).to_integral_value(rounding=ROUND_HALF_UP) * tick
-
-
-def compute_long_levels(
-    entry: Decimal,
-    price_tick: Decimal,
-    stop_loss_percent: Decimal,
-    target1_percent: Decimal,
-    target2_percent: Decimal,
-    target3_percent: Decimal,
-) -> PriceLevels:
-    if entry <= 0 or min(price_tick, stop_loss_percent, target1_percent, target2_percent, target3_percent) <= 0:
-        raise ValidationProblem("INVALID_LEVEL_PARAMETERS")
-    if not target1_percent < target2_percent < target3_percent:
-        raise ValidationProblem("TARGETS_MUST_BE_STRICTLY_INCREASING")
-    # For a long, rounding a stop up avoids increasing intended downside; targets round up
-    # so they do not trigger at a price movement smaller than the configured threshold.
-    stop = round_up_to_step(entry * (Decimal("1") - stop_loss_percent / Decimal("100")), price_tick)
-    t1 = round_up_to_step(entry * (Decimal("1") + target1_percent / Decimal("100")), price_tick)
-    t2 = round_up_to_step(entry * (Decimal("1") + target2_percent / Decimal("100")), price_tick)
-    t3 = round_up_to_step(entry * (Decimal("1") + target3_percent / Decimal("100")), price_tick)
-    if stop >= entry or t1 <= entry or t2 <= t1 or t3 <= t2:
-        raise ValidationProblem("TICK_SIZE_COLLAPSES_RISK_LEVELS")
-    return PriceLevels(stop=stop, target1=t1, target2=t2, target3=t3)
 
 
 def split_quantity(quantity: Decimal, quantity_step: Decimal, minimum_quantity: Decimal) -> QuantitySplit:

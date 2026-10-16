@@ -5,3 +5,13 @@
 if shashaAlertConditionCurrent
     string shashaJson = '{"strategy":"SHASHA","event_id":"' + syminfo.ticker + '|' + timeframe.period + '|' + str.tostring(time) + '","symbol":"' + syminfo.ticker + '","direction":"LONG","timeframe":"' + timeframe.period + '","bar_time":' + str.tostring(time) + ',"signal_close":"' + str.tostring(close, format.mintick) + '","entry_price":"' + str.tostring(close[1], format.mintick) + '"}'
     alert(shashaJson, alert.freq_once_per_bar_close)
+
+// ── Optional SELL (SHORT) alert ─────────────────────────────────────────────
+// Only add this if your indicator defines a short condition. The variable below is a
+// placeholder: replace `shashaShortAlertConditionCurrent` with YOUR existing short-side
+// boolean. Do not invent a condition here; the receiver never guesses direction or price.
+// Use a separate TradingView alert (Any alert() function call) with the same webhook URL.
+//
+// if shashaShortAlertConditionCurrent
+//     string shashaShortJson = '{"strategy":"SHASHA","event_id":"' + syminfo.ticker + '|' + timeframe.period + '|' + str.tostring(time) + '|SHORT","symbol":"' + syminfo.ticker + '","direction":"SHORT","timeframe":"' + timeframe.period + '","bar_time":' + str.tostring(time) + ',"signal_close":"' + str.tostring(close, format.mintick) + '","entry_price":"' + str.tostring(close[1], format.mintick) + '"}'
+//     alert(shashaShortJson, alert.freq_once_per_bar_close)

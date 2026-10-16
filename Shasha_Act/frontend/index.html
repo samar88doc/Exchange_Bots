@@ -84,7 +84,7 @@
           <div>
             <div class="eyebrow">SHASHA STRATEGY · NEURAL OPERATIONS</div>
             <h1>Signal to protection, <span class="heading-accent">fully supervised.</span></h1>
-            <p class="subheading">TradingView triggers · Shark 5m closed-candle entry · 2% stop · 50% at +2% · break-even then 1% trailing protection.</p>
+            <p class="subheading">TradingView triggers · LONG (BUY) and SHORT (SELL) · Shark 5m closed-candle entry · 2% stop · 50% at +2% · break-even then 1% trailing protection.</p>
           </div>
           <div class="heading-actions">
             <span class="updated-label">UPDATED <strong id="last-updated">—</strong></span>
@@ -204,7 +204,7 @@
               <div class="schema-node-card" data-node="entry">
                 <span class="node-icon">⌖</span>
                 <strong>Entry + stop</strong>
-                <small id="schema-levels">−2% stop · +2% target 1</small>
+                <small id="schema-levels">LONG −2% stop · +2% target 1 · SHORT mirrored</small>
               </div>
               <div class="schema-node-card" data-node="partial">
                 <span class="node-icon">◐</span>
@@ -519,13 +519,13 @@
           <div class="flow-arrow">→</div>
           <div class="flow-step"><span>2</span><strong>Entry</strong><small>Last completed Shark <b id="flow-interval">5m</b> candle close, rounded to the contract tick</small></div>
           <div class="flow-arrow">→</div>
-          <div class="flow-step"><span>3</span><strong>Stop</strong><small><b id="flow-stop">2%</b> below entry, submitted reduce-only with the entry</small></div>
+          <div class="flow-step"><span>3</span><strong>Stop</strong><small><b id="flow-stop">2%</b> against entry (below for LONG, above for SHORT), submitted reduce-only with the entry</small></div>
           <div class="flow-arrow">→</div>
-          <div class="flow-step"><span>4</span><strong>Target 1</strong><small><b id="flow-target">2%</b> above entry closes <b id="flow-partial">50%</b></small></div>
+          <div class="flow-step"><span>4</span><strong>Target 1</strong><small><b id="flow-target">2%</b> with the trade (above entry for LONG, below for SHORT) closes <b id="flow-partial">50%</b></small></div>
           <div class="flow-arrow">→</div>
           <div class="flow-step"><span>5</span><strong>Break-even</strong><small>Stop moves to the entry price after the partial</small></div>
           <div class="flow-arrow">→</div>
-          <div class="flow-step"><span>6</span><strong>Trail</strong><small>Every <b id="flow-trail">1%</b> up move lifts the stop <b id="flow-trail-2">1%</b>; never downwards</small></div>
+          <div class="flow-step"><span>6</span><strong>Trail</strong><small>Every <b id="flow-trail">1%</b> favourable move lifts (LONG) or lowers (SHORT) the stop <b id="flow-trail-2">1%</b>; never backwards</small></div>
         </div>
         <div class="settings-layout">
           <div class="settings-main">
@@ -534,13 +534,13 @@
               <form id="strategy-form" class="settings-form">
                 <div class="form-grid">
                   <label>Entry candle interval <span>Shark</span><input name="entry_candle_interval" type="text" list="interval-options" autocomplete="off" required></label>
-                  <label>Stop loss <span>% below entry</span><input name="stop_loss_percent" type="number" min="0.1" max="99" step="0.1" required></label>
-                  <label>Target 1 <span>% above entry</span><input name="target1_percent" type="number" min="0.1" max="100" step="0.1" required></label>
+                  <label>Stop loss <span>% against entry</span><input name="stop_loss_percent" type="number" min="0.1" max="99" step="0.1" required></label>
+                  <label>Target 1 <span>% with the trade</span><input name="target1_percent" type="number" min="0.1" max="100" step="0.1" required></label>
                   <label>Target 1 close <span>% of position</span><input name="target1_close_percent" type="number" min="1" max="99" step="1" required></label>
-                  <label>Trailing step <span>% behind high</span><input name="trailing_stop_percent" type="number" min="0.1" max="50" step="0.1" required></label>
+                  <label>Trailing step <span>% behind the favourable extreme</span><input name="trailing_stop_percent" type="number" min="0.1" max="50" step="0.1" required></label>
                 </div>
                 <datalist id="interval-options"><option value="1m"></option><option value="5m"></option><option value="15m"></option><option value="30m"></option><option value="1h"></option><option value="4h"></option><option value="1d"></option></datalist>
-                <label class="checkbox-row"><input type="checkbox" name="trailing_enabled"><span>Trail the protective stop after Target 1 (1% up move lifts the stop 1%)</span></label>
+                <label class="checkbox-row"><input type="checkbox" name="trailing_enabled"><span>Trail the protective stop after Target 1 (1% favourable move moves the stop 1%)</span></label>
                 <label class="checkbox-row"><input type="checkbox" name="enable_secondary_targets"><span>Enable fixed Target 2 / Target 3 exits in addition to the trailing runner</span></label>
                 <p class="micro-copy">With secondary targets enabled, sizing splits equally across Target 1/2/3 and each slice must satisfy the contract minimum notional.</p>
                 <div class="form-actions"><button type="submit" class="button button-primary">Save strategy rules <span>→</span></button><span id="strategy-save-status" class="form-status"></span></div>
