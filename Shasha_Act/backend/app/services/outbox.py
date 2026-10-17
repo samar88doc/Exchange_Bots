@@ -112,7 +112,7 @@ class OutboxWorker:
                 await asyncio.sleep(min(2.0, self.settings.worker_poll_seconds * 4))
 
     async def run_once(self) -> bool:
-        job_data: tuple[str, str, str | None, dict[str, Any]] | None = None
+        job_data: tuple[str, str, str | None, dict[str, Any], str] | None = None
         now = datetime.now(UTC)
         async with self.session_factory() as session:
             dependency = aliased(OutboxJob)
@@ -145,13 +145,13 @@ class OutboxWorker:
             job.status = "PROCESSING"
             job.attempts += 1
             job.locked_until = now + timedelta(seconds=self.settings.outbox_lease_seconds)
-            job_data = (job.id, job.kind, job.event_id, dict(job.payload or {}))
+            job_data = (job.id, job.kind, job.event_id, dict(job.payload or {}), job.idempotency_key)
             await session.commit()
 
         assert job_data is not None
-        job_id, kind, event_id, payload = job_data
+        job_id, kind, event_id, payload, idempotency_key = job_data
         try:
-            await self._dispatch(kind, event_id, payload)
+            await self._dispatch(kind, event_id, payload, idempotency_key=idempotency_key)
         except TelegramRetryableError as exc:
             await self._retry(job_id, str(exc), exc.retry_after)
         except TelegramPermanentError as exc:
@@ -166,7 +166,14 @@ class OutboxWorker:
             await self._delivered(job_id)
         return True
 
-    async def _dispatch(self, kind: str, event_id: str | None, payload: dict[str, Any]) -> None:
+    async def _dispatch(
+        self,
+        kind: str,
+        event_id: str | None,
+        payload: dict[str, Any],
+        *,
+        idempotency_key: str = "",
+    ) -> None:
         if kind == "EXECUTE_SIGNAL":
             if event_id is None:
                 raise ValueError("outbox event is missing")
@@ -180,7 +187,12 @@ class OutboxWorker:
                 trade = await session.scalar(select(Trade).where(Trade.event_id == event_id))
                 if event is None:
                     raise ValueError("signal event not found")
-                message = format_signal_message(event, trade)
+                action = payload.get("action")
+                if not action and idempotency_key:
+                    parts = idempotency_key.split(":")
+                    if len(parts) >= 3 and parts[0] == "notify":
+                        action = ":".join(parts[2:])
+                message = format_signal_message(event, trade, action=action, payload=payload)
             await self.context.notifier.send_message(message)
             return
         if kind == "RECONCILE_TRADE":

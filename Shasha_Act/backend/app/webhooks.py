@@ -174,6 +174,7 @@ async def receive_tradingview(request: Request, token: str | None = None) -> dic
                             kind="TELEGRAM_SIGNAL",
                             event_id=event.id,
                             idempotency_key=f"notify:{event.id}:accepted",
+                            payload={"action": "accepted"},
                             priority=20,
                             depends_on_id=execute_job.id if execute_job else None,
                         )

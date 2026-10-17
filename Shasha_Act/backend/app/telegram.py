@@ -42,7 +42,13 @@ def _price_percent(base: Decimal | None, price: Decimal | None, *, above: bool) 
     return _money(delta)
 
 
-def format_signal_message(event: Any, trade: Any | None) -> str:
+def format_signal_message(
+    event: Any,
+    trade: Any | None,
+    *,
+    action: str | None = None,
+    payload: dict[str, Any] | None = None,
+) -> str:
     """Return an HTML-formatted Telegram message (use parse_mode=HTML when sending)."""
     symbol = (trade.symbol if trade else event.symbol) or event.tradingview_symbol or "unresolved"
 
@@ -59,25 +65,121 @@ def format_signal_message(event: Any, trade: Any | None) -> str:
             "<i>📚 For educational purposes only.</i>"
         )
 
-    # ── Direction banner ──────────────────────────────────────────────────────
     direction = (trade.direction or "LONG").upper()
     is_long = direction == "LONG"
     dir_emoji = "🟢" if is_long else "🔴"
     dir_label = "LONG  📈" if is_long else "SHORT  📉"
+    mode_line = "\n🧪 <i>PAPER — simulated, no real order sent.</i>" if trade.mode == "PAPER" else ""
 
-    # Alert / attention header for bad statuses
+    act = (action or "accepted").upper()
+
+    # ── Distinct Lifecycle Event: Position Opened / Order Filled ──────────────
+    if act == "OPEN":
+        entry = _money(trade.actual_entry or trade.planned_entry)
+        qty = _money(trade.quantity or trade.remaining_quantity)
+        sl = _money(trade.stop_price or trade.initial_stop_price)
+        t1 = _money(trade.target1_price)
+        return (
+            f"⚡ <b>SHASHA — POSITION OPEN ({direction})</b>{mode_line}\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"📌 <b>Symbol</b>     :  <code>{symbol}</code>\n"
+            f"📊 <b>Direction</b>  :  <b>{dir_label}</b>\n"
+            f"💰 <b>Fill Price</b> :  <code>{entry}</code>\n"
+            f"📦 <b>Quantity</b>   :  <code>{qty}</code>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"🎯 <b>Target 1</b>   :  <code>{t1}</code>\n"
+            f"🛑 <b>Stop Loss</b>  :  <code>{sl}</code>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "<i>📚 For educational purposes only.</i>"
+        )
+
+    # ── Distinct Lifecycle Event: Target Hit ──────────────────────────────────
+    if act.startswith("TARGET_HIT") or act.startswith("TARGET_"):
+        target_num = "1"
+        if ":" in act:
+            try:
+                target_num = str(int(act.split(":")[1]) + 1)
+            except (ValueError, IndexError):
+                target_num = act.split(":")[1]
+        elif "_" in act:
+            target_num = act.split("_")[1]
+        target_attr = f"target{target_num}_price"
+        target_price = _money(getattr(trade, target_attr, None) or trade.target1_price)
+        current_sl = _money(trade.stop_price or trade.initial_stop_price)
+        return (
+            f"🎯 <b>SHASHA — TARGET {target_num} HIT! 🚀</b>{mode_line}\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"📌 <b>Symbol</b>     :  <code>{symbol}</code>\n"
+            f"📊 <b>Direction</b>  :  <b>{dir_label}</b>\n"
+            f"🎯 <b>Target {target_num}</b> :  <code>{target_price}</code>\n"
+            f"🛑 <b>Active SL</b>  :  <code>{current_sl}</code>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "<i>📚 For educational purposes only.</i>"
+        )
+
+    # ── Distinct Lifecycle Event: Stop Loss Hit ───────────────────────────────
+    if act == "STOP_LOSS":
+        exit_price = _money(trade.stop_price or trade.initial_stop_price)
+        return (
+            f"🛑 <b>SHASHA — STOP LOSS HIT</b>{mode_line}\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"📌 <b>Symbol</b>     :  <code>{symbol}</code>\n"
+            f"📊 <b>Direction</b>  :  <b>{dir_label}</b>\n"
+            f"🛑 <b>Exit Price</b> :  <code>{exit_price}</code>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "<i>📚 For educational purposes only.</i>"
+        )
+
+    # ── Distinct Lifecycle Event: Trailing Stop Updated ───────────────────────
+    if act.startswith("TRAILING"):
+        current_sl = _money(trade.stop_price)
+        return (
+            f"🛡️ <b>SHASHA — TRAILING STOP UPDATED</b>{mode_line}\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"📌 <b>Symbol</b>     :  <code>{symbol}</code>\n"
+            f"📊 <b>Direction</b>  :  <b>{dir_label}</b>\n"
+            f"🛑 <b>New SL</b>     :  <code>{current_sl}</code>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "<i>📚 For educational purposes only.</i>"
+        )
+
+    # ── Distinct Lifecycle Event: Cancelled / Expired ─────────────────────────
+    if act in ("CANCELLED", "QUEUED_ENTRY_EXPIRED", "MANUAL_CANCEL"):
+        reason = trade.status_reason or event.status_reason or "Order cancelled."
+        return (
+            f"⚠️ <b>SHASHA — Order Cancelled</b>{mode_line}\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"📌 <b>Symbol</b>     :  <code>{symbol}</code>\n"
+            f"❌ <b>Status</b>     :  CANCELLED\n"
+            f"📋 <b>Reason</b>     :  {reason}\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "<i>📚 For educational purposes only.</i>"
+        )
+
+    # ── Distinct Lifecycle Event: Closed ──────────────────────────────────────
+    if act == "CLOSED":
+        pnl = _money(trade.net_realized_pnl)
+        pnl_prefix = "+" if trade.net_realized_pnl and trade.net_realized_pnl > 0 else ""
+        return (
+            f"🏁 <b>SHASHA — TRADE CLOSED</b>{mode_line}\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"📌 <b>Symbol</b>     :  <code>{symbol}</code>\n"
+            f"📊 <b>Direction</b>  :  <b>{dir_label}</b>\n"
+            f"💵 <b>Net PnL</b>    :  <code>{pnl_prefix}{pnl} USDT</code>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "<i>📚 For educational purposes only.</i>"
+        )
+
+    # ── Default: Signal Card (accepted / retry / initial alert) ───────────────
     is_bad = trade.status in {"REJECTED", "FAILED", "CANCELLED", "UNKNOWN", "PROTECTION_ERROR"}
     header_emoji = "⚠️" if is_bad else dir_emoji
     header_label = "Needs Attention" if is_bad else f"{direction} SIGNAL"
 
-    # ── Price fields ──────────────────────────────────────────────────────────
     entry = _money(trade.actual_entry or trade.planned_entry)
     sl    = _money(trade.stop_price or trade.initial_stop_price)
     t1    = _money(trade.target1_price)
     t2    = _money(trade.target2_price)
     t3    = _money(trade.target3_price)
-
-    mode_line = "\n🧪 <i>PAPER — simulated, no real order sent.</i>" if trade.mode == "PAPER" else ""
 
     return (
         f"{header_emoji} <b>SHASHA — {header_label}</b>{mode_line}\n"

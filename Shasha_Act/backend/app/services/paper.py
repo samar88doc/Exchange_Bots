@@ -239,6 +239,7 @@ class PaperExecutionAdapter:
             kind="TELEGRAM_SIGNAL",
             event_id=trade.event_id,
             idempotency_key=f"notify:{trade.event_id}:OPEN",
+            payload={"action": "OPEN"},
             priority=20,
         )
 
